@@ -35,14 +35,17 @@ def resolve_customer_prices(
 
     rows = db.execute(sql, {"account": account, "codes": codes}).mappings().all()
 
+    # The view returns one row per (customer, stock, warehouse). Collapse to the
+    # cheapest row per stock so warehouse never influences which price wins.
     out: Dict[str, schemas.CustomerPrice] = {}
     for r in rows:
         code = r["StockCode"]
-        if code in out:
+        excl = float(r["ExclPrice"] or 0)
+        if code in out and out[code].excl_price <= excl:
             continue
         out[code] = schemas.CustomerPrice(
             stock_code=code,
-            excl_price=float(r["ExclPrice"] or 0),
+            excl_price=excl,
             incl_price=float(r["InclPrice"] or 0),
             source=r["PriceSource"] or "Price List",
         )
