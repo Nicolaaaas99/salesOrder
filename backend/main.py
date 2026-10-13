@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, APIRouter
 from fastapi.middleware.cors import CORSMiddleware
 
 from routers import auth, lookups, sales_orders, debug, history
@@ -14,11 +14,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.include_router(auth.router)
-app.include_router(lookups.router)
-app.include_router(sales_orders.router)
-app.include_router(debug.router)
-app.include_router(history.router)
+api = APIRouter(prefix="/api")
+api.include_router(auth.router)
+api.include_router(lookups.router)
+api.include_router(sales_orders.router)
+api.include_router(debug.router)
+api.include_router(history.router)
+app.include_router(api)
 
 
 @app.on_event("startup")
@@ -29,6 +31,6 @@ def startup_event():
         print(f"WARNING: Evolution SDK failed to connect on startup: {e}")
 
 
-@app.get("/health")
+@app.get("/api/health")
 def health():
     return {"status": "ok"}
