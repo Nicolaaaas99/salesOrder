@@ -64,6 +64,7 @@ def list_orders(customer_id: str = Query(...), db: Session = Depends(get_db)):
             TxDate, Order_No, Quantity, ExclAmount, VAT, InclAmount, OnOrder
         FROM dbo._vw_SOCustomerInvoiceHistory
         WHERE CustomerAccount = :account
+          AND TxDate >= DATEADD(month, -3, CAST(GETDATE() AS DATE))
     """
     rows = db.execute(text(sql), {"account": customer_id}).mappings().all()
 
