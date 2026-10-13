@@ -69,9 +69,10 @@ function detailToLines(detail: SalesOrderDetail, cust: CustomerDetail): LineRow[
     // fUnitPriceIncl), so no re-derivation is needed on the frontend.
     unit_price: l.unit_price,
     unit_price_incl: l.unit_price_incl,
-    // Loaded orders keep their saved price — rep may still edit it (unlocked).
-    price_source: "",
-    price_locked: false,
+    // Loaded orders (edit or template) keep their saved price locked so the
+    // rep can't override it in the grid.
+    price_source: "Loaded Order",
+    price_locked: true,
     tax_type_id: l.tax_type_id,
     discount_percent: l.discount_percent || 0,
     project_code: l.project_code || "",
