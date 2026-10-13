@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { api } from "../api/client";
 import type { SalesOrderSearchResult } from "../api/types";
 import { CustomerPicker } from "./CustomerPicker";
@@ -10,6 +10,44 @@ type Props = {
   onSelect: (order: SalesOrderSearchResult) => void;
 };
 
+const FILTERS_STORAGE_KEY = "salesOrderSearchFilters";
+
+type StoredFilters = {
+  account: string;
+  orderNo: string;
+  extOrder: string;
+  description: string;
+  dateFrom: string;
+  dateTo: string;
+};
+
+const EMPTY_FILTERS: StoredFilters = {
+  account: "",
+  orderNo: "",
+  extOrder: "",
+  description: "",
+  dateFrom: "",
+  dateTo: "",
+};
+
+function loadStoredFilters(): StoredFilters {
+  try {
+    const raw = localStorage.getItem(FILTERS_STORAGE_KEY);
+    if (!raw) return EMPTY_FILTERS;
+    const parsed = JSON.parse(raw);
+    return {
+      account: typeof parsed.account === "string" ? parsed.account : "",
+      orderNo: typeof parsed.orderNo === "string" ? parsed.orderNo : "",
+      extOrder: typeof parsed.extOrder === "string" ? parsed.extOrder : "",
+      description: typeof parsed.description === "string" ? parsed.description : "",
+      dateFrom: typeof parsed.dateFrom === "string" ? parsed.dateFrom : "",
+      dateTo: typeof parsed.dateTo === "string" ? parsed.dateTo : "",
+    };
+  } catch {
+    return EMPTY_FILTERS;
+  }
+}
+
 function fmtDmy(iso: string | null): string {
   if (!iso) return "";
   const m = iso.match(/^(\d{4})-(\d{2})-(\d{2})/);
@@ -17,12 +55,22 @@ function fmtDmy(iso: string | null): string {
 }
 
 export function SalesOrderSearchModal({ onClose, onSelect }: Props) {
-  const [account, setAccount] = useState("");
-  const [orderNo, setOrderNo] = useState("");
-  const [extOrder, setExtOrder] = useState("");
-  const [description, setDescription] = useState("");
-  const [dateFrom, setDateFrom] = useState("");
-  const [dateTo, setDateTo] = useState("");
+  const initial = loadStoredFilters();
+  const [account, setAccount] = useState(initial.account);
+  const [orderNo, setOrderNo] = useState(initial.orderNo);
+  const [extOrder, setExtOrder] = useState(initial.extOrder);
+  const [description, setDescription] = useState(initial.description);
+  const [dateFrom, setDateFrom] = useState(initial.dateFrom);
+  const [dateTo, setDateTo] = useState(initial.dateTo);
+
+  useEffect(() => {
+    const filters: StoredFilters = { account, orderNo, extOrder, description, dateFrom, dateTo };
+    try {
+      localStorage.setItem(FILTERS_STORAGE_KEY, JSON.stringify(filters));
+    } catch {
+      // ignore storage errors (quota, private mode)
+    }
+  }, [account, orderNo, extOrder, description, dateFrom, dateTo]);
 
   const [results, setResults] = useState<SalesOrderSearchResult[] | null>(null);
   const [selected, setSelected] = useState<SalesOrderSearchResult | null>(null);
