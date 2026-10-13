@@ -4,13 +4,19 @@ import type { SalesOrderSearchResult } from "../api/types";
 import { CustomerPicker } from "./CustomerPicker";
 import { DateInput } from "./DateInput";
 import { fmtCurrency } from "../utils/format";
+import { useAuth } from "../context/AuthContext";
 
 type Props = {
   onClose: () => void;
   onSelect: (order: SalesOrderSearchResult) => void;
 };
 
-const FILTERS_STORAGE_KEY = "salesOrderSearchFilters";
+const FILTERS_STORAGE_PREFIX = "salesOrderSearchFilters:";
+const ANON_USER_KEY = "__anon__";
+
+function storageKeyFor(username: string | null): string {
+  return FILTERS_STORAGE_PREFIX + (username && username.trim() ? username : ANON_USER_KEY);
+}
 
 type StoredFilters = {
   account: string;
@@ -30,9 +36,9 @@ const EMPTY_FILTERS: StoredFilters = {
   dateTo: "",
 };
 
-function loadStoredFilters(): StoredFilters {
+function loadStoredFilters(username: string | null): StoredFilters {
   try {
-    const raw = localStorage.getItem(FILTERS_STORAGE_KEY);
+    const raw = localStorage.getItem(storageKeyFor(username));
     if (!raw) return EMPTY_FILTERS;
     const parsed = JSON.parse(raw);
     return {
@@ -55,7 +61,8 @@ function fmtDmy(iso: string | null): string {
 }
 
 export function SalesOrderSearchModal({ onClose, onSelect }: Props) {
-  const initial = loadStoredFilters();
+  const { username } = useAuth();
+  const initial = loadStoredFilters(username);
   const [account, setAccount] = useState(initial.account);
   const [orderNo, setOrderNo] = useState(initial.orderNo);
   const [extOrder, setExtOrder] = useState(initial.extOrder);
@@ -66,11 +73,11 @@ export function SalesOrderSearchModal({ onClose, onSelect }: Props) {
   useEffect(() => {
     const filters: StoredFilters = { account, orderNo, extOrder, description, dateFrom, dateTo };
     try {
-      localStorage.setItem(FILTERS_STORAGE_KEY, JSON.stringify(filters));
+      localStorage.setItem(storageKeyFor(username), JSON.stringify(filters));
     } catch {
       // ignore storage errors (quota, private mode)
     }
-  }, [account, orderNo, extOrder, description, dateFrom, dateTo]);
+  }, [username, account, orderNo, extOrder, description, dateFrom, dateTo]);
 
   const [results, setResults] = useState<SalesOrderSearchResult[] | null>(null);
   const [selected, setSelected] = useState<SalesOrderSearchResult | null>(null);
