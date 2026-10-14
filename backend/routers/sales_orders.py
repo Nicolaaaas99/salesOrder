@@ -95,36 +95,40 @@ def place_order(
 
     customer = _build_customer_detail(row)
 
-    if customer.over_terms:
-        term_desc = f"{customer.terms_days} days" if customer.terms_days > 0 else "current period"
-        raise HTTPException(
-            400,
-            f"{customer.name} is over their payment terms "
-            f"({term_desc}) with {_fmt_money(customer.overdue_amount)} in overdue invoices. "
-            f"Sales order cannot be created.",
-        )
-
-    if customer.credit_limit > 0:
-        order_total = _compute_order_incl_total(payload, db)
-        breakdown = (
-            f"Outstanding invoices: {_fmt_money(customer.total_outstanding)}. "
-            f"Existing sales orders: {_fmt_money(customer.total_ordered)}. "
-            f"Credit limit: {_fmt_money(customer.credit_limit)}."
-        )
-        if customer.over_credit_limit:
+    # Only hard-block when the customer is flagged with CheckTerms = 1. For
+    # CheckTerms = 0 customers the UI still shows the OVER LIMIT / OVER TERMS
+    # badges so the rep sees the warning, but we let the order through.
+    if customer.check_terms:
+        if customer.over_terms:
+            term_desc = f"{customer.terms_days} days" if customer.terms_days > 0 else "current period"
             raise HTTPException(
                 400,
-                f"{customer.name} is already over their credit limit "
-                f"by {_fmt_money(-customer.available_credit)}. {breakdown} "
+                f"{customer.name} is over their payment terms "
+                f"({term_desc}) with {_fmt_money(customer.overdue_amount)} in overdue invoices. "
                 f"Sales order cannot be created.",
             )
-        if order_total > customer.available_credit:
-            raise HTTPException(
-                400,
-                f"This order ({_fmt_money(order_total)}) would push {customer.name} "
-                f"over their credit limit. Available credit: {_fmt_money(customer.available_credit)}. "
-                f"{breakdown}",
+
+        if customer.credit_limit > 0:
+            order_total = _compute_order_incl_total(payload, db)
+            breakdown = (
+                f"Outstanding invoices: {_fmt_money(customer.total_outstanding)}. "
+                f"Existing sales orders: {_fmt_money(customer.total_ordered)}. "
+                f"Credit limit: {_fmt_money(customer.credit_limit)}."
             )
+            if customer.over_credit_limit:
+                raise HTTPException(
+                    400,
+                    f"{customer.name} is already over their credit limit "
+                    f"by {_fmt_money(-customer.available_credit)}. {breakdown} "
+                    f"Sales order cannot be created.",
+                )
+            if order_total > customer.available_credit:
+                raise HTTPException(
+                    400,
+                    f"This order ({_fmt_money(order_total)}) would push {customer.name} "
+                    f"over their credit limit. Available credit: {_fmt_money(customer.available_credit)}. "
+                    f"{breakdown}",
+                )
 
     try:
         return create_sales_order(payload, agent_username=username)
