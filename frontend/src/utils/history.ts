@@ -65,6 +65,13 @@ export const formatQty = (quantity: number) => {
   return Number.isNaN(num) ? "0" : num.toFixed(0);
 };
 
+/** YYYY-MM-DD in LOCAL time (not UTC). Used as the week key so that keys match
+ *  regardless of whether the source date was midnight-UTC or midnight-local. */
+const toLocalDateStr = (d: Date) =>
+  `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(
+    d.getDate()
+  ).padStart(2, "0")}`;
+
 export const getWeekRange = (dateString: string): WeekRange => {
   const date = new Date(dateString);
   const startOfWeek = new Date(date);
@@ -74,7 +81,7 @@ export const getWeekRange = (dateString: string): WeekRange => {
   return {
     start: startOfWeek,
     end: endOfWeek,
-    key: startOfWeek.toISOString().split("T")[0],
+    key: toLocalDateStr(startOfWeek),
     display: `${formatDate(startOfWeek)} to ${formatDate(endOfWeek)}`,
   };
 };
@@ -90,31 +97,17 @@ export function aggregateOrders(orders: HistoricalOrder[]): {
   if (!orders.length) return { categories: {}, weeks: [] };
 
   const categoriesData: Record<string, CategoryData> = {};
-  const weekSet = new Set<string>();
 
-  orders.forEach((order) => {
-    if (!order.orderDate) return;
-    weekSet.add(JSON.stringify(getWeekRange(order.orderDate)));
-  });
-
-  const weeks: WeekRange[] = Array.from(weekSet)
-    .map((str) => JSON.parse(str) as WeekRange)
-    .sort((a, b) => new Date(a.start).getTime() - new Date(b.start).getTime());
-
-  // Extend the grid forward to "this week" so any recent silent gap is visible.
-  // Without this, the last N of the shown columns wouldn't match the suggestion
-  // window (which is last 6 *calendar* weeks from today), causing the freq
-  // badge to appear "off" by the number of missing weeks.
-  if (weeks.length > 0) {
-    const todayWeekStart = new Date(getWeekRange(new Date().toISOString()).start).getTime();
-    const cursor = new Date(weeks[weeks.length - 1].start);
+  // Always render exactly 12 weeks ending with the current (partial) week:
+  // 11 completed weeks of history + this week. Keys are local-date-based
+  // (see getWeekRange) so they match the per-order keys regardless of whether
+  // orderDate is parsed as midnight-local or midnight-UTC.
+  const weeks: WeekRange[] = [];
+  const cursor = new Date(getWeekRange(new Date().toISOString()).start);
+  cursor.setDate(cursor.getDate() - 7 * 11);
+  for (let i = 0; i < 12; i++) {
+    weeks.push(getWeekRange(cursor.toISOString()));
     cursor.setDate(cursor.getDate() + 7);
-    let added = 0;
-    while (cursor.getTime() <= todayWeekStart && added < 12) {
-      weeks.push(getWeekRange(cursor.toISOString()));
-      cursor.setDate(cursor.getDate() + 7);
-      added++;
-    }
   }
 
   const productBuckets: Record<string, Record<string, CategoryProduct>> = {};

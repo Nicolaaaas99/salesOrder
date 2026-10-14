@@ -118,6 +118,7 @@ export function OrderAssistantScreen() {
   const [orders, setOrders] = useState<HistoricalOrder[]>([]);
   const [suggestions, setSuggestions] = useState<OrderSuggestion[]>([]);
   const [packSizes, setPackSizes] = useState<Map<string, number>>(new Map());
+  const [priceSources, setPriceSources] = useState<Map<string, string>>(new Map());
   const [taxTypes, setTaxTypes] = useState<TaxType[]>([]);
 
   const [isLoadingRoutes, setIsLoadingRoutes] = useState(false);
@@ -182,6 +183,7 @@ export function OrderAssistantScreen() {
       setOrders([]);
       setSuggestions([]);
       setPackSizes(new Map());
+      setPriceSources(new Map());
       setCustomerDetail(null);
       setDraftLines([]);
       return;
@@ -216,8 +218,22 @@ export function OrderAssistantScreen() {
           } catch {
             setPackSizes(new Map());
           }
+          try {
+            const priceMap = await api.getCustomerPrices(
+              selectedCustomer.value,
+              [...codes]
+            );
+            const srcMap = new Map<string, string>();
+            Object.entries(priceMap).forEach(([code, p]) => {
+              if (p.source) srcMap.set(code, p.source);
+            });
+            setPriceSources(srcMap);
+          } catch {
+            setPriceSources(new Map());
+          }
         } else {
           setPackSizes(new Map());
+          setPriceSources(new Map());
         }
       } catch {
         setError("Failed to load history / suggestions.");
@@ -472,6 +488,7 @@ export function OrderAssistantScreen() {
                 : "Select a route to begin"
             }
             suggestions={suggestionsMap}
+            priceSources={priceSources}
             onAddToOrder={handleAddToOrder}
             onAddAllSuggested={handleAddAllSuggested}
             heightStyle="100%"

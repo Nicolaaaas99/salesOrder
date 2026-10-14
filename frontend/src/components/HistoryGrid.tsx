@@ -15,6 +15,7 @@ import {
   detectProblemItems,
   formatQty,
   formatWeekLabel,
+  getProblemSeverity,
   productKey,
   type CategoryData,
   type CategoryProduct,
@@ -28,6 +29,9 @@ type Props = {
   emptyMessage?: string;
   /** If provided, adds a "Sug" + "Freq" column and shows Add buttons where a suggestion exists. */
   suggestions?: Map<string, OrderSuggestion>;
+  /** Map of stock_code → price source ('Customer Deal' | 'Group Deal' | 'Price List' | 'None').
+   *  When present, products with an active deal get a visible badge next to their name. */
+  priceSources?: Map<string, string>;
   /** Called when user clicks Add on a product row. */
   onAddToOrder?: (
     product: CategoryProduct,
@@ -45,6 +49,7 @@ export function HistoryGrid({
   isLoading = false,
   emptyMessage = "No data",
   suggestions,
+  priceSources,
   onAddToOrder,
   onAddAllSuggested,
   heightStyle = "calc(100vh - 240px)",
@@ -234,6 +239,7 @@ export function HistoryGrid({
                     onToggle={toggleCategory}
                     problemItems={problemItems}
                     suggestions={suggestions}
+                    priceSources={priceSources}
                     onAddToOrder={onAddToOrder}
                     showAddButton={showAddButton}
                     stickyLeftWidth={stickyLeftWidth}
@@ -267,6 +273,7 @@ type CategoryRowProps = {
   onToggle: (category: string) => void;
   problemItems: Map<string, ProblemInfo>;
   suggestions?: Map<string, OrderSuggestion>;
+  priceSources?: Map<string, string>;
   onAddToOrder?: Props["onAddToOrder"];
   showAddButton: boolean;
   stickyLeftWidth: string;
@@ -280,6 +287,7 @@ function CategoryRow({
   onToggle,
   problemItems,
   suggestions,
+  priceSources,
   onAddToOrder,
   showAddButton,
   stickyLeftWidth,
@@ -369,11 +377,40 @@ function CategoryRow({
           const isProblem = !!problemData;
           const isSuggested = !!suggestion;
           const weeksSince = problemData?.weeksSinceLastPurchase;
+          const severity = problemData
+            ? getProblemSeverity(problemData.weeksSinceLastPurchase)
+            : null;
+          const problemRowBg =
+            severity === "red"
+              ? "bg-red-50 border-l-4 border-l-red-500"
+              : severity === "orange"
+              ? "bg-orange-50 border-l-4 border-l-orange-400"
+              : "bg-yellow-50 border-l-4 border-l-yellow-400";
+          const problemIconClass =
+            severity === "red"
+              ? "text-red-600"
+              : severity === "orange"
+              ? "text-orange-500"
+              : "text-yellow-500";
+          const problemBadgeClass =
+            severity === "red"
+              ? "bg-red-100 text-red-700"
+              : severity === "orange"
+              ? "bg-orange-100 text-orange-700"
+              : "bg-yellow-100 text-yellow-700";
+
+          const priceSource = priceSources?.get(product.stockCode);
+          const dealBadge =
+            priceSource === "Customer Deal"
+              ? { label: "Cust Deal", cls: "bg-emerald-100 text-emerald-700" }
+              : priceSource === "Group Deal"
+              ? { label: "Grp Deal", cls: "bg-sky-100 text-sky-700" }
+              : null;
 
           const rowBg = isSuggested
             ? "bg-blue-50 border-l-4 border-l-blue-500"
             : isProblem
-            ? "bg-yellow-50 border-l-4 border-l-yellow-400"
+            ? problemRowBg
             : "bg-white";
 
           return (
@@ -410,9 +447,9 @@ function CategoryRow({
                   )}
                   {isProblem && (
                     <div className="flex items-center gap-0.5">
-                      <AlertTriangle className="w-3 h-3 text-yellow-500 flex-shrink-0" />
-                      {weeksSince !== undefined && weeksSince > 2 && (
-                        <span className="text-xs bg-red-100 text-red-700 px-1 py-0.5 rounded">
+                      <AlertTriangle className={`w-3 h-3 flex-shrink-0 ${problemIconClass}`} />
+                      {weeksSince !== undefined && (
+                        <span className={`text-xs px-1 py-0.5 rounded ${problemBadgeClass}`}>
                           {weeksSince}w
                         </span>
                       )}
@@ -420,10 +457,19 @@ function CategoryRow({
                   )}
                   <div
                     className="min-w-0"
-                    title={`${product.stockCode} — ${product.description}`}
+                    title={`${product.stockCode} — ${product.description}${
+                      priceSource ? ` · ${priceSource}` : ""
+                    }`}
                   >
-                    <div className="font-medium text-sm leading-tight truncate">
-                      {product.stockCode}
+                    <div className="font-medium text-sm leading-tight truncate flex items-center gap-1">
+                      <span className="truncate">{product.stockCode}</span>
+                      {dealBadge && (
+                        <span
+                          className={`text-[9px] font-bold uppercase px-1 py-0.5 rounded whitespace-nowrap ${dealBadge.cls}`}
+                        >
+                          {dealBadge.label}
+                        </span>
+                      )}
                     </div>
                     <div className="text-gray-500 text-xs leading-tight truncate">
                       {product.description}
