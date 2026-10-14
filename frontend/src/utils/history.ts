@@ -31,6 +31,14 @@ export type ProblemInfo = {
   weeksSinceLastPurchase: number;
 };
 
+export type ProblemSeverity = "yellow" | "orange" | "red";
+
+export function getProblemSeverity(weeksSince: number): ProblemSeverity {
+  if (weeksSince > 4) return "red";
+  if (weeksSince > 2) return "orange";
+  return "yellow";
+}
+
 export const formatDate = (dateInput: Date | string | null | undefined) => {
   if (!dateInput) return "N/A";
   const d = dateInput instanceof Date ? dateInput : new Date(dateInput);
@@ -89,24 +97,39 @@ export function aggregateOrders(orders: HistoricalOrder[]): {
     weekSet.add(JSON.stringify(getWeekRange(order.orderDate)));
   });
 
-  const weeks: WeekRange[] = Array.from(weekSet)
+  // Seed the week list from the orders themselves so keys match the per-order
+  // keys used for bucketing below (otherwise naive-datetime parsing shifts
+  // generated keys by a day and the grid shows all zeros).
+  let weeks: WeekRange[] = Array.from(weekSet)
     .map((str) => JSON.parse(str) as WeekRange)
     .sort((a, b) => new Date(a.start).getTime() - new Date(b.start).getTime());
 
-  // Extend the grid forward to "this week" so any recent silent gap is visible.
-  // Without this, the last N of the shown columns wouldn't match the suggestion
-  // window (which is last 6 *calendar* weeks from today), causing the freq
-  // badge to appear "off" by the number of missing weeks.
+  // Extend forward to the current week so a recent silent gap stays visible.
   if (weeks.length > 0) {
     const todayWeekStart = new Date(getWeekRange(new Date().toISOString()).start).getTime();
     const cursor = new Date(weeks[weeks.length - 1].start);
     cursor.setDate(cursor.getDate() + 7);
-    let added = 0;
-    while (cursor.getTime() <= todayWeekStart && added < 12) {
+    let safety = 0;
+    while (cursor.getTime() <= todayWeekStart && safety < 24) {
       weeks.push(getWeekRange(cursor.toISOString()));
       cursor.setDate(cursor.getDate() + 7);
-      added++;
+      safety++;
     }
+  }
+
+  // Pad backward so the grid always has 12 columns, even for customers with
+  // only a handful of recent weeks of history.
+  if (weeks.length > 0 && weeks.length < 12) {
+    const cursor = new Date(weeks[0].start);
+    while (weeks.length < 12) {
+      cursor.setDate(cursor.getDate() - 7);
+      weeks.unshift(getWeekRange(cursor.toISOString()));
+    }
+  }
+
+  // Cap at the most-recent 12 weeks (11 completed + current).
+  if (weeks.length > 12) {
+    weeks = weeks.slice(-12);
   }
 
   const productBuckets: Record<string, Record<string, CategoryProduct>> = {};
