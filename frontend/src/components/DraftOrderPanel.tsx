@@ -113,8 +113,9 @@ export function DraftOrderPanel({
                 <th className="text-left py-1 px-1 font-medium">Item</th>
                 <th className="text-center py-1 px-1 font-medium w-[55px]">Pack</th>
                 <th className="text-center py-1 px-1 font-medium w-[37px]">Qty</th>
-                <th className="text-center py-1 px-1 font-medium w-[70px] whitespace-nowrap">
-                  Price (excl)
+                <th className="text-center py-0.5 px-1 font-medium w-[40px] leading-tight">
+                  <div>Price</div>
+                  <div className="text-[9px] font-normal text-gray-500">(excl)</div>
                 </th>
                 <th className="text-right py-1 px-1 font-medium w-16">Total</th>
                 <th className="w-6"></th>
