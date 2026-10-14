@@ -290,7 +290,7 @@ def create_sales_order(
     apply_agent_to_context(SDK, agent_username)
 
     branch_code, branch_id = _get_customer_branch(payload.customer_account)
-    print(f"[branch] customer {payload.customer_account!r} → code={branch_code!r} id={branch_id!r}")
+    print(f"[branch] customer {payload.customer_account!r} -> code={branch_code!r} id={branch_id!r}")
     branch_switched = _set_context_branch(branch_code, SDK)
 
     try:
@@ -349,7 +349,7 @@ def update_sales_order(
     apply_agent_to_context(SDK, agent_username)
 
     branch_code, branch_id = _get_customer_branch(payload.customer_account)
-    print(f"[branch] customer {payload.customer_account!r} → code={branch_code!r} id={branch_id!r}")
+    print(f"[branch] customer {payload.customer_account!r} -> code={branch_code!r} id={branch_id!r}")
     branch_switched = _set_context_branch(branch_code, SDK)
 
     try:
