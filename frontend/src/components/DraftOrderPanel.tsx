@@ -113,8 +113,8 @@ export function DraftOrderPanel({
                 <th className="text-left py-1 px-1 font-medium">Item</th>
                 <th className="text-center py-1 px-1 font-medium w-[55px]">Pack</th>
                 <th className="text-center py-1 px-1 font-medium w-[37px]">Qty</th>
-                <th className="text-center py-1 px-1 font-medium w-[40px]">
-                  Price
+                <th className="text-center py-1 px-1 font-medium w-[70px] whitespace-nowrap">
+                  Price (excl)
                 </th>
                 <th className="text-right py-1 px-1 font-medium w-16">Total</th>
                 <th className="w-6"></th>
@@ -198,7 +198,7 @@ export function DraftOrderPanel({
                         snapStep={line.pack_size > 1 ? line.pack_size : undefined}
                         cursorToEnd
                         onChange={(v) => onUpdateLine(i, { quantity: v })}
-                        className="w-full text-right border border-gray-200 rounded px-1 py-0.5 text-xs focus:border-blue-500 focus:outline-none bg-white"
+                        className="w-full text-right border border-gray-200 rounded px-1 py-0.5 text-sm font-semibold focus:border-blue-500 focus:outline-none bg-white"
                         placeholder=""
                       />
                     </td>
