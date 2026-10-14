@@ -237,6 +237,9 @@ def _apply_header(so, payload: schemas.SalesOrderCreate, SDK):
     so.OrderDate   = _to_dotnet_date(payload.order_date)   if payload.order_date   else DateTime.Now
     so.DueDate     = _to_dotnet_date(payload.due_date)     if payload.due_date     else so.OrderDate
     so.InvoiceDate = _to_dotnet_date(payload.invoice_date) if payload.invoice_date else so.OrderDate
+    # Delivery defaults to the order date — the SDK otherwise stamps it with
+    # today's wall-clock, which is wrong for back-dated or future-dated orders.
+    _set_first(so, ("DeliveryDate",), so.OrderDate, "delivery date")
 
     if payload.external_order:
         so.ExternalOrderNo = payload.external_order
