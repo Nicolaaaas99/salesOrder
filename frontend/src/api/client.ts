@@ -20,7 +20,23 @@ import type {
   OrderSuggestion,
 } from "./types";
 
-const http = axios.create({ baseURL: "/api" });
+// Serialize array params as repeated keys (`states=1&states=3`) rather than
+// axios's default `states[]=…` form, so FastAPI's `List[int]` reads them.
+const http = axios.create({
+  baseURL: "/api",
+  paramsSerializer: (params) => {
+    const sp = new URLSearchParams();
+    Object.entries(params).forEach(([key, value]) => {
+      if (value === undefined || value === null) return;
+      if (Array.isArray(value)) {
+        value.forEach((v) => sp.append(key, String(v)));
+      } else {
+        sp.append(key, String(value));
+      }
+    });
+    return sp.toString();
+  },
+});
 
 // Attach the current session token to every outbound request. We read from
 // sessionStorage on each call rather than closing over the token so that

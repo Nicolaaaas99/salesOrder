@@ -140,15 +140,15 @@ def place_order(
 
 SEARCH_SQL = """
     SELECT TOP (:limit)
-        inv.OrderNum      AS order_no,
-        inv.ExtOrderNum   AS external_order,
-        inv.Description   AS description,
-        inv.InvDate       AS invoice_date,
-        inv.OrderDate     AS order_date,
-        inv.DocState      AS doc_state,
-        inv.OrdTotIncl    AS total_incl,
-        c.Account         AS customer_account,
-        c.Name            AS customer_name
+        inv.OrderNum           AS order_no,
+        inv.DocState           AS doc_state,
+        MAX(inv.ExtOrderNum)   AS external_order,
+        MAX(inv.Description)   AS description,
+        MAX(inv.InvDate)       AS invoice_date,
+        MAX(inv.OrderDate)     AS order_date,
+        MAX(inv.OrdTotIncl)    AS total_incl,
+        MAX(c.Account)         AS customer_account,
+        MAX(c.Name)            AS customer_name
     FROM InvNum inv
     LEFT JOIN Client c ON c.DCLink = inv.AccountID
     WHERE inv.DocType = 4
@@ -160,6 +160,7 @@ SEARCH_SQL = """
       AND (:description IS NULL OR inv.Description LIKE :description)
       AND (:date_from IS NULL OR CAST(inv.OrderDate AS DATE) >= :date_from)
       AND (:date_to   IS NULL OR CAST(inv.OrderDate AS DATE) <= :date_to)
+    GROUP BY inv.OrderNum, inv.DocState
     ORDER BY inv.OrderNum DESC
 """
 

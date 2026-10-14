@@ -200,7 +200,7 @@ export function SalesOrderSearchModal({ onClose, onSelect }: Props) {
             value={state}
             onChange={(e) => setState(e.target.value as StateFilter)}
           >
-            <option value="all">All (Unprocessed + Partial + Archived)</option>
+            <option value="all">All</option>
             <option value="unprocessed">Unprocessed only</option>
             <option value="partial">Partially Processed only</option>
             <option value="archived">Archived only</option>
