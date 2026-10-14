@@ -111,6 +111,7 @@ class SalesOrderCreate(BaseModel):
     order_date: Optional[date] = None
     due_date: Optional[date] = None
     invoice_date: Optional[date] = None
+    delivery_date: Optional[date] = None
     external_order: Optional[str] = None
     default_project_code: Optional[str] = None
     discount_percent: float = 0.0
@@ -164,6 +165,7 @@ class SalesOrderDetail(BaseModel):
     order_date: Optional[date] = None
     due_date: Optional[date] = None
     invoice_date: Optional[date] = None
+    delivery_date: Optional[date] = None
     external_order: str = ""
     default_project_code: str = ""
     discount_percent: float = 0.0

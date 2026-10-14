@@ -63,6 +63,7 @@ export type SalesOrderCreate = {
   order_date?: string | null;
   due_date?: string | null;
   invoice_date?: string | null;
+  delivery_date?: string | null;
   external_order?: string | null;
   default_project_code?: string | null;
   discount_percent?: number;
@@ -121,6 +122,7 @@ export type SalesOrderDetail = {
   order_date: string | null;
   due_date: string | null;
   invoice_date: string | null;
+  delivery_date: string | null;
   external_order: string;
   default_project_code: string;
   discount_percent: number;

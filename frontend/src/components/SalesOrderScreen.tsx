@@ -18,7 +18,7 @@ import { NumberCell } from "./NumberCell";
 import { SalesOrderSearchModal } from "./SalesOrderSearchModal";
 import { CreditStatus } from "./CreditStatus";
 import { useAuth } from "../context/AuthContext";
-import { nextBusinessDay } from "../utils/date";
+import { nextBusinessDay, today } from "../utils/date";
 import { fmtCurrency } from "../utils/format";
 
 type EditingState = {
@@ -100,26 +100,27 @@ export function SalesOrderScreen({
   const seedCustomer = initialLoadedOrder?.customer ?? initialCustomer;
   const seed = initialLoadedOrder?.detail ?? null;
 
-  // Session date was picked at login and applies to every new sales order
-  // placed in this session. Falls back to next-business-day for safety if
-  // SalesOrderScreen is somehow mounted outside the AuthProvider gate.
+  // Session date was picked at login and applies to the Invoice/Delivery date
+  // of every new sales order placed in this session (typically the next day).
+  // Order Date and Due Date default to today — those are "when was this placed"
+  // fields, not "when does it ship". Falls back to next-business-day for safety
+  // if SalesOrderScreen is somehow mounted outside the AuthProvider gate.
   const { sessionDate } = useAuth();
-  const defaultDate = sessionDate ?? nextBusinessDay();
+  const sessionDateDefault = sessionDate ?? nextBusinessDay();
+  const todayDefault = today();
 
   const [customer, setCustomer] = useState<CustomerDetail | null>(seedCustomer);
 
   const [warehouses, setWarehouses] = useState<Warehouse[]>([]);
   const [taxTypes, setTaxTypes] = useState<TaxType[]>([]);
 
-  // Dates ALWAYS default to the session date — even when loading an existing
-  // order. Rep can still edit per-order on the preview if they really want
-  // the saved value. Rationale: an order loaded for editing is treated as
-  // a fresh document for this session; the saved OrderDate was itself the
-  // "next business day at the time of placement", which is stale by the
-  // time anyone's loading it.
-  const [orderDate, setOrderDate] = useState(defaultDate);
-  const [dueDate, setDueDate] = useState(defaultDate);
-  const [invoiceDate, setInvoiceDate] = useState(defaultDate);
+  // Order/Due default to today; Invoice/Delivery default to the session date.
+  // Dates reset on every mount — the rep can still override on the preview if
+  // they want the exact saved values of a loaded order.
+  const [orderDate, setOrderDate] = useState(todayDefault);
+  const [dueDate, setDueDate] = useState(todayDefault);
+  const [invoiceDate, setInvoiceDate] = useState(sessionDateDefault);
+  const [deliveryDate, setDeliveryDate] = useState(sessionDateDefault);
   const [externalOrder, setExternalOrder] = useState(seed?.external_order ?? "");
   const [defaultProject, setDefaultProject] = useState(seed?.default_project_code ?? "");
   const [documentDiscount, setDocumentDiscount] = useState(seed?.discount_percent ?? 0);
@@ -220,9 +221,10 @@ export function SalesOrderScreen({
 
   function resetForm() {
     setCustomer(null);
-    setOrderDate(defaultDate);
-    setDueDate(defaultDate);
-    setInvoiceDate(defaultDate);
+    setOrderDate(todayDefault);
+    setDueDate(todayDefault);
+    setInvoiceDate(sessionDateDefault);
+    setDeliveryDate(sessionDateDefault);
     setExternalOrder("");
     setDefaultProject("");
     setDocumentDiscount(0);
@@ -253,12 +255,12 @@ export function SalesOrderScreen({
   function applyLoadedOrder(detail: SalesOrderDetail, cust: CustomerDetail) {
     const mode: "edit" | "template" = detail.is_archived ? "template" : "edit";
     setCustomer(cust);
-    // Load an existing order → the three date fields reset to the session
-    // date, not to the saved order's dates. Rep can override per-order on
-    // the preview if needed.
-    setOrderDate(defaultDate);
-    setDueDate(defaultDate);
-    setInvoiceDate(defaultDate);
+    // Load an existing order → dates reset per the normal defaults (not the
+    // saved values). Rep can override per-order on the preview if needed.
+    setOrderDate(todayDefault);
+    setDueDate(todayDefault);
+    setInvoiceDate(sessionDateDefault);
+    setDeliveryDate(sessionDateDefault);
     setExternalOrder(detail.external_order || "");
     setDefaultProject(detail.default_project_code || "");
     setDocumentDiscount(detail.discount_percent || 0);
@@ -331,6 +333,7 @@ export function SalesOrderScreen({
       order_date: orderDate,
       due_date: dueDate,
       invoice_date: invoiceDate,
+      delivery_date: deliveryDate,
       external_order: externalOrder || null,
       default_project_code: defaultProject || null,
       discount_percent: documentDiscount,
@@ -480,9 +483,11 @@ export function SalesOrderScreen({
           />
           <DocumentInfoPanel
             invoiceDate={invoiceDate}
+            deliveryDate={deliveryDate}
             defaultProject={defaultProject}
             onChange={(p) => {
               if (p.invoiceDate !== undefined) setInvoiceDate(p.invoiceDate);
+              if (p.deliveryDate !== undefined) setDeliveryDate(p.deliveryDate);
               if (p.defaultProject !== undefined) setDefaultProject(p.defaultProject);
             }}
           />

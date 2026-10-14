@@ -14,6 +14,11 @@ export function nextBusinessDay(): string {
   return formatLocalDate(d);
 }
 
+/** Today's date as `YYYY-MM-DD` in the user's LOCAL calendar. */
+export function today(): string {
+  return formatLocalDate(new Date());
+}
+
 /** Format a Date as `YYYY-MM-DD` in local calendar (no UTC conversion). */
 export function formatLocalDate(d: Date): string {
   const y = d.getFullYear();

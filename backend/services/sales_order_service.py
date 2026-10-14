@@ -237,9 +237,15 @@ def _apply_header(so, payload: schemas.SalesOrderCreate, SDK):
     so.OrderDate   = _to_dotnet_date(payload.order_date)   if payload.order_date   else DateTime.Now
     so.DueDate     = _to_dotnet_date(payload.due_date)     if payload.due_date     else so.OrderDate
     so.InvoiceDate = _to_dotnet_date(payload.invoice_date) if payload.invoice_date else so.OrderDate
-    # Delivery defaults to the order date — the SDK otherwise stamps it with
-    # today's wall-clock, which is wrong for back-dated or future-dated orders.
-    _set_first(so, ("DeliveryDate",), so.OrderDate, "delivery date")
+    # Delivery follows the frontend's session-date input. Falls back to the
+    # invoice date (also typically the session date) and finally the order
+    # date so the field is always populated even for older/edited orders.
+    delivery = (
+        _to_dotnet_date(payload.delivery_date) if payload.delivery_date
+        else so.InvoiceDate if payload.invoice_date
+        else so.OrderDate
+    )
+    _set_first(so, ("DeliveryDate",), delivery, "delivery date")
 
     if payload.external_order:
         so.ExternalOrderNo = payload.external_order
