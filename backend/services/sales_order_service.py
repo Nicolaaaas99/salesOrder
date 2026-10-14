@@ -104,6 +104,26 @@ def _get_customer_branch(account: str) -> tuple[Optional[str], Optional[int]]:
     return row["code"].strip(), int(row["id"])
 
 
+def _branch_from_lines(payload: schemas.SalesOrderCreate, SDK) -> Optional[str]:
+    """When the customer isn't branch-linked, infer the branch from the first
+    line whose warehouse is branch-scoped. The SDK's Warehouse object exposes
+    the branch it belongs to, so we can read it without hitting the DB."""
+    for line in payload.lines:
+        code = (line.warehouse_code or "").strip()
+        if not code:
+            continue
+        try:
+            wh = SDK.Warehouse(code)
+            br = getattr(wh, "Branch", None)
+            br_code = getattr(br, "Code", None) if br is not None else None
+            if br_code:
+                print(f"[branch] inferred {br_code!r} from warehouse {code!r}")
+                return str(br_code).strip()
+        except Exception as e:
+            print(f"[branch] could not read branch from warehouse {code!r}: {e}")
+    return None
+
+
 def _set_context_branch(branch_code: Optional[str], SDK) -> bool:
     """
     Switch the DatabaseContext's current branch. This is what
@@ -291,6 +311,8 @@ def create_sales_order(
 
     branch_code, branch_id = _get_customer_branch(payload.customer_account)
     print(f"[branch] customer {payload.customer_account!r} -> code={branch_code!r} id={branch_id!r}")
+    if not branch_code:
+        branch_code = _branch_from_lines(payload, SDK)
     branch_switched = _set_context_branch(branch_code, SDK)
 
     try:
@@ -350,6 +372,8 @@ def update_sales_order(
 
     branch_code, branch_id = _get_customer_branch(payload.customer_account)
     print(f"[branch] customer {payload.customer_account!r} -> code={branch_code!r} id={branch_id!r}")
+    if not branch_code:
+        branch_code = _branch_from_lines(payload, SDK)
     branch_switched = _set_context_branch(branch_code, SDK)
 
     try:
