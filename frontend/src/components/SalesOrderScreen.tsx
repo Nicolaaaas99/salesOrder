@@ -280,23 +280,28 @@ export function SalesOrderScreen({
 
     const isUpdate = editing?.mode === "edit" && !!editing?.order_no;
 
-    if (!isUpdate && customer.over_terms) {
-      const termDesc = customer.terms_days > 0 ? `${customer.terms_days} days` : "current period";
-      setErrorMsg(
-        `${customer.name} is over their payment terms (${termDesc}) with ` +
-        `${fmtCurrency(customer.overdue_amount)} in overdue invoices. ` +
-        `Sales order cannot be created.`
-      );
-      return;
-    }
+    // Only hard-block when the customer is flagged CheckTerms = 1. CheckTerms = 0
+    // customers can place orders even if over credit/terms — the OVER LIMIT and
+    // OVER TERMS badges in the UI already warn the rep.
+    if (customer.check_terms) {
+      if (!isUpdate && customer.over_terms) {
+        const termDesc = customer.terms_days > 0 ? `${customer.terms_days} days` : "current period";
+        setErrorMsg(
+          `${customer.name} is over their payment terms (${termDesc}) with ` +
+          `${fmtCurrency(customer.overdue_amount)} in overdue invoices. ` +
+          `Sales order cannot be created.`
+        );
+        return;
+      }
 
-    if (customer.over_credit_limit) {
-      setErrorMsg(
-        `${customer.name} is already over their credit limit by ` +
-        `${fmtCurrency(-customer.available_credit)}. ${breakdown} ` +
-        `Sales order cannot be created.`
-      );
-      return;
+      if (customer.over_credit_limit) {
+        setErrorMsg(
+          `${customer.name} is already over their credit limit by ` +
+          `${fmtCurrency(-customer.available_credit)}. ${breakdown} ` +
+          `Sales order cannot be created.`
+        );
+        return;
+      }
     }
 
     const filledLines = lines.filter((l) => l.stock_code);
@@ -310,7 +315,7 @@ export function SalesOrderScreen({
       return;
     }
 
-    if (customer.credit_limit > 0) {
+    if (customer.check_terms && customer.credit_limit > 0) {
       const { incl: orderIncl } = orderTotals(filledLines, taxTypes, taxMode, documentDiscount);
       if (orderIncl > customer.available_credit) {
         setErrorMsg(

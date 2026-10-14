@@ -1,6 +1,6 @@
 from typing import Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 from sqlalchemy.orm import Session
 
 from auth import get_current_user
@@ -55,7 +55,10 @@ def _build_customer_detail(row) -> schemas.CustomerDetail:
     available_credit = credit_limit - total_outstanding - total_ordered
     over_credit_limit = credit_limit > 0 and available_credit < 0
 
-    check_terms = bool(g("CheckTerms", 0))
+    # Treat only truthy numeric values as "check enabled". bool("0") is True,
+    # which was wrongly blocking CheckTerms=0 customers when the SQL driver
+    # returned the column as a string.
+    check_terms = int(g("CheckTerms", 0) or 0) == 1
     terms_days = int(g("TermsDays", 0) or 0)
     terms_code = g("TermsCode", "") or ""
     terms_age_type = int(g("AgeTypeOption", 0) or 0)

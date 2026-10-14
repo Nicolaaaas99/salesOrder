@@ -245,13 +245,33 @@ export function OrderAssistantScreen() {
     setDraftLines([]);
   }, [selectedCustomer]);
 
+  // Suggestion quantities tick down live as the user drafts lines for the
+  // same stock code. When the remaining suggestion reaches 0, the item drops
+  // out of the map entirely so the row loses its blue "suggested" treatment —
+  // visually signalling it's been fulfilled.
   const suggestionsMap = useMemo(() => {
+    const draftQtyByStock = new Map<string, number>();
+    draftLines.forEach((l) => {
+      if (!l.stock_code) return;
+      draftQtyByStock.set(
+        l.stock_code,
+        (draftQtyByStock.get(l.stock_code) || 0) + (l.quantity || 0)
+      );
+    });
+
     const m = new Map<string, OrderSuggestion>();
     suggestions.forEach((s) => {
-      m.set(productKey(s.stock_code, s.description), s);
+      const drafted = draftQtyByStock.get(s.stock_code) || 0;
+      const remaining = s.suggested_quantity - drafted;
+      if (remaining > 0) {
+        m.set(productKey(s.stock_code, s.description), {
+          ...s,
+          suggested_quantity: remaining,
+        });
+      }
     });
     return m;
-  }, [suggestions]);
+  }, [suggestions, draftLines]);
 
   const defaultTaxTypeId = customerDetail?.default_tax_type_id ?? null;
 
@@ -376,10 +396,12 @@ export function OrderAssistantScreen() {
   );
 
   const handleAddAllSuggested = useCallback(() => {
-    suggestions.forEach((s) => {
+    // Iterate the live map (which has already subtracted drafted qty) so this
+    // button only tops up the remaining suggestion instead of double-adding.
+    suggestionsMap.forEach((s) => {
       addLine(draftFromSuggestion(s, defaultTaxTypeId));
     });
-  }, [suggestions, addLine, defaultTaxTypeId]);
+  }, [suggestionsMap, addLine, defaultTaxTypeId]);
 
   const handleUpdateLine = useCallback(
     (index: number, patch: Partial<DraftLine>) => {
