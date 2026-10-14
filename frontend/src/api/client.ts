@@ -15,6 +15,7 @@ import type {
   SalesOrderDetail,
   HistoryRoute,
   HistoryCustomer,
+  CustomerOrderCount,
   HistoricalOrder,
   OrderSuggestion,
 } from "./types";
@@ -98,6 +99,13 @@ export const api = {
       .get<SalesOrderSearchResult[]>("/sales-orders", { params: filters })
       .then((r) => r.data),
 
+  listOrdersByOrderDate: (account: string, date: string) =>
+    http
+      .get<SalesOrderSearchResult[]>("/sales-orders/by-order-date", {
+        params: { account, date },
+      })
+      .then((r) => r.data),
+
   getSalesOrder: (orderNo: string) =>
     http
       .get<SalesOrderDetail>(`/sales-orders/${encodeURIComponent(orderNo)}`)
@@ -115,6 +123,13 @@ export const api = {
   listHistoryCustomers: (route: string) =>
     http
       .get<HistoryCustomer[]>("/history/customers", { params: { route } })
+      .then((r) => r.data),
+
+  listCustomerOrdersToday: (route: string, date?: string) =>
+    http
+      .get<CustomerOrderCount[]>("/history/orders-today", {
+        params: { route, ...(date ? { date } : {}) },
+      })
       .then((r) => r.data),
 
   listHistoryOrders: (customerId: string) =>

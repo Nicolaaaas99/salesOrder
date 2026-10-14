@@ -55,6 +55,34 @@ def list_customers(route: str = Query(...), db: Session = Depends(get_db)):
     ]
 
 
+@router.get("/orders-today", response_model=List[schemas.CustomerOrderCount])
+def list_orders_today(
+    route: str = Query(...),
+    on_date: date = Query(default_factory=date.today, alias="date"),
+    db: Session = Depends(get_db),
+):
+    """Order counts per customer on the given route for a single calendar day.
+    Defaults to today. Used by the Order Assistant to flag customers that have
+    already had orders placed today."""
+    sql = """
+        SELECT Account AS account, SUM(NoOfOrders) AS order_count
+        FROM dbo._vw_SOCustomerOrdersPerDay
+        WHERE LTRIM(RTRIM(Route)) = :route
+          AND CAST(OrderDate AS DATE) = :on_date
+        GROUP BY Account
+    """
+    rows = db.execute(
+        text(sql), {"route": route.strip(), "on_date": on_date}
+    ).mappings().all()
+    return [
+        schemas.CustomerOrderCount(
+            account=(r["account"] or "").strip(),
+            order_count=int(r["order_count"] or 0),
+        )
+        for r in rows
+    ]
+
+
 @router.get("/orders", response_model=List[schemas.HistoricalOrder])
 def list_orders(customer_id: str = Query(...), db: Session = Depends(get_db)):
     sql = """

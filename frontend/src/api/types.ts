@@ -98,6 +98,8 @@ export type SalesOrderSearchFilters = {
   description?: string;
   date_from?: string;
   date_to?: string;
+  /** DocState integers to include. Backend defaults to [1,3,4] when omitted. */
+  states?: number[];
 };
 
 export type SalesOrderLineDetail = {
@@ -138,6 +140,7 @@ export type SalesOrderDetail = {
 
 export type HistoryRoute = { id: string; display: string };
 export type HistoryCustomer = { id: string; display: string };
+export type CustomerOrderCount = { account: string; order_count: number };
 
 export type HistoricalOrderLine = {
   stockCode: string;

@@ -18,6 +18,15 @@ function storageKeyFor(username: string | null): string {
   return FILTERS_STORAGE_PREFIX + (username && username.trim() ? username : ANON_USER_KEY);
 }
 
+type StateFilter = "all" | "unprocessed" | "partial" | "archived";
+
+const STATE_FILTER_TO_IDS: Record<StateFilter, number[] | undefined> = {
+  all:          undefined,  // backend default: Unprocessed + Partial + Archived
+  unprocessed:  [1],
+  partial:      [3],
+  archived:     [4],
+};
+
 type StoredFilters = {
   account: string;
   orderNo: string;
@@ -25,6 +34,7 @@ type StoredFilters = {
   description: string;
   dateFrom: string;
   dateTo: string;
+  state: StateFilter;
 };
 
 const EMPTY_FILTERS: StoredFilters = {
@@ -34,6 +44,7 @@ const EMPTY_FILTERS: StoredFilters = {
   description: "",
   dateFrom: "",
   dateTo: "",
+  state: "all",
 };
 
 function loadStoredFilters(username: string | null): StoredFilters {
@@ -41,6 +52,12 @@ function loadStoredFilters(username: string | null): StoredFilters {
     const raw = localStorage.getItem(storageKeyFor(username));
     if (!raw) return EMPTY_FILTERS;
     const parsed = JSON.parse(raw);
+    const state: StateFilter =
+      parsed.state === "unprocessed" ||
+      parsed.state === "partial" ||
+      parsed.state === "archived"
+        ? parsed.state
+        : "all";
     return {
       account: typeof parsed.account === "string" ? parsed.account : "",
       orderNo: typeof parsed.orderNo === "string" ? parsed.orderNo : "",
@@ -48,6 +65,7 @@ function loadStoredFilters(username: string | null): StoredFilters {
       description: typeof parsed.description === "string" ? parsed.description : "",
       dateFrom: typeof parsed.dateFrom === "string" ? parsed.dateFrom : "",
       dateTo: typeof parsed.dateTo === "string" ? parsed.dateTo : "",
+      state,
     };
   } catch {
     return EMPTY_FILTERS;
@@ -69,15 +87,16 @@ export function SalesOrderSearchModal({ onClose, onSelect }: Props) {
   const [description, setDescription] = useState(initial.description);
   const [dateFrom, setDateFrom] = useState(initial.dateFrom);
   const [dateTo, setDateTo] = useState(initial.dateTo);
+  const [state, setState] = useState<StateFilter>(initial.state);
 
   useEffect(() => {
-    const filters: StoredFilters = { account, orderNo, extOrder, description, dateFrom, dateTo };
+    const filters: StoredFilters = { account, orderNo, extOrder, description, dateFrom, dateTo, state };
     try {
       localStorage.setItem(storageKeyFor(username), JSON.stringify(filters));
     } catch {
       // ignore storage errors (quota, private mode)
     }
-  }, [username, account, orderNo, extOrder, description, dateFrom, dateTo]);
+  }, [username, account, orderNo, extOrder, description, dateFrom, dateTo, state]);
 
   const [results, setResults] = useState<SalesOrderSearchResult[] | null>(null);
   const [selected, setSelected] = useState<SalesOrderSearchResult | null>(null);
@@ -95,6 +114,7 @@ export function SalesOrderSearchModal({ onClose, onSelect }: Props) {
         description: description || undefined,
         date_from: dateFrom || undefined,
         date_to: dateTo || undefined,
+        states: STATE_FILTER_TO_IDS[state],
       });
       setResults(data);
       setSelected(null);
@@ -113,6 +133,7 @@ export function SalesOrderSearchModal({ onClose, onSelect }: Props) {
     setDescription("");
     setDateFrom("");
     setDateTo("");
+    setState("all");
     setResults(null);
     setSelected(null);
     setErrorMsg(null);
@@ -167,11 +188,23 @@ export function SalesOrderSearchModal({ onClose, onSelect }: Props) {
             onKeyDown={(e) => { if (e.key === "Enter") runSearch(); }}
           />
 
-          <label>Date From</label>
+          <label>Order Date From</label>
           <DateInput value={dateFrom} onChange={setDateFrom} />
 
-          <label>Date To</label>
+          <label>Order Date To</label>
           <DateInput value={dateTo} onChange={setDateTo} />
+
+          <label>Status</label>
+          <select
+            className="input"
+            value={state}
+            onChange={(e) => setState(e.target.value as StateFilter)}
+          >
+            <option value="all">All (Unprocessed + Partial + Archived)</option>
+            <option value="unprocessed">Unprocessed only</option>
+            <option value="partial">Partially Processed only</option>
+            <option value="archived">Archived only</option>
+          </select>
         </div>
 
         <div className="search-actions">
@@ -195,7 +228,7 @@ export function SalesOrderSearchModal({ onClose, onSelect }: Props) {
                 <tr>
                   <th>Account</th>
                   <th>Customer</th>
-                  <th>Date</th>
+                  <th>Order Date</th>
                   <th>Order Number</th>
                   <th>External Order</th>
                   <th>Description</th>
@@ -215,7 +248,7 @@ export function SalesOrderSearchModal({ onClose, onSelect }: Props) {
                   >
                     <td>{r.customer_account}</td>
                     <td className="ellipsis" title={r.customer_name}>{r.customer_name}</td>
-                    <td>{fmtDmy(r.invoice_date)}</td>
+                    <td>{fmtDmy(r.order_date)}</td>
                     <td>{r.order_no}</td>
                     <td>{r.external_order}</td>
                     <td className="ellipsis" title={r.description}>{r.description}</td>
@@ -224,7 +257,11 @@ export function SalesOrderSearchModal({ onClose, onSelect }: Props) {
                       <span
                         className={
                           "state-badge " +
-                          (r.is_archived ? "state-badge--archived" : "state-badge--unprocessed")
+                          (r.doc_state === 4
+                            ? "state-badge--archived"
+                            : r.doc_state === 3
+                            ? "state-badge--partial"
+                            : "state-badge--unprocessed")
                         }
                       >
                         {r.doc_state_label}

@@ -1,8 +1,8 @@
-import { useState } from "react";
+import { useCallback, useState } from "react";
 import { LogOut, UserCircle } from "lucide-react";
 import { SalesOrderTab } from "./components/SalesOrderTab";
 import { OrderAssistantScreen } from "./components/OrderAssistantScreen";
-import { CustomerOverviewScreen } from "./components/CustomerOverviewScreen";
+import { RouteOverviewScreen } from "./components/RouteOverviewScreen";
 import { LoginScreen } from "./components/LoginScreen";
 import { SessionDateModal } from "./components/SessionDateModal";
 import { AuthProvider, useAuth } from "./context/AuthContext";
@@ -27,6 +27,16 @@ function AppShell() {
 function AuthenticatedApp() {
   const { username, logout } = useAuth();
   const [view, setView] = useState<View>("assistant");
+  // When another tab (e.g. Route Overview) wants to open an existing order
+  // for editing, it drops the order number here and switches us to the
+  // Sales Order Entry tab. SalesOrderTab's effect picks it up and loads it.
+  const [pendingOrderNo, setPendingOrderNo] = useState<string | null>(null);
+
+  const openOrderInEntryTab = useCallback((orderNo: string) => {
+    setPendingOrderNo(orderNo);
+    setView("order");
+  }, []);
+  const clearPendingOrder = useCallback(() => setPendingOrderNo(null), []);
 
   return (
     <div className="h-screen flex flex-col">
@@ -48,7 +58,7 @@ function AuthenticatedApp() {
             className={`app-tab ${view === "overview" ? "app-tab--active" : ""}`}
             onClick={() => setView("overview")}
           >
-            Customer Overview
+            Route Overview
           </button>
         </div>
 
@@ -81,13 +91,16 @@ function AuthenticatedApp() {
           className="h-full overflow-y-auto"
           style={{ display: view === "order" ? "block" : "none" }}
         >
-          <SalesOrderTab />
+          <SalesOrderTab
+            pendingOrderNo={pendingOrderNo}
+            clearPendingOrder={clearPendingOrder}
+          />
         </div>
         <div
           className="h-full"
           style={{ display: view === "overview" ? "block" : "none" }}
         >
-          <CustomerOverviewScreen />
+          <RouteOverviewScreen onOpenOrder={openOrderInEntryTab} />
         </div>
       </main>
     </div>

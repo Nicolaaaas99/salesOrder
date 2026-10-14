@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { FilePlus, FolderOpen } from "lucide-react";
 import { api } from "../api/client";
 import type {
@@ -19,13 +19,46 @@ type Mode =
       customer: CustomerDetail;
     };
 
-export function SalesOrderTab() {
+type Props = {
+  /** When another tab asks us to open an order, its number lands here. */
+  pendingOrderNo?: string | null;
+  /** Clear the pending order once we've consumed it so it won't re-fire. */
+  clearPendingOrder?: () => void;
+};
+
+export function SalesOrderTab({ pendingOrderNo, clearPendingOrder }: Props = {}) {
   const [mode, setMode] = useState<Mode>({ kind: "landing" });
   const [loading, setLoading] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [formSessionKey, setFormSessionKey] = useState(0);
 
   const backToLanding = () => setMode({ kind: "landing" });
+
+  // Load the pending order when another tab (e.g. Route Overview) hands us one.
+  useEffect(() => {
+    if (!pendingOrderNo) return;
+    const orderNo = pendingOrderNo;
+    (async () => {
+      setLoading(true);
+      setErrorMsg(null);
+      try {
+        const detail = await api.getSalesOrder(orderNo);
+        const customer = await api.getCustomer(detail.customer_account);
+        setFormSessionKey((k) => k + 1);
+        setMode({ kind: "loaded", detail, customer });
+      } catch (e: any) {
+        setErrorMsg(
+          e?.response?.data?.detail ??
+            e?.message ??
+            "Failed to load sales order"
+        );
+        setMode({ kind: "landing" });
+      } finally {
+        setLoading(false);
+        clearPendingOrder?.();
+      }
+    })();
+  }, [pendingOrderNo, clearPendingOrder]);
 
   async function handleSelectOrder(result: SalesOrderSearchResult) {
     setLoading(true);

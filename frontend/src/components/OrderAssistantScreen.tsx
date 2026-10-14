@@ -111,6 +111,13 @@ export function OrderAssistantScreen() {
   const [customers, setCustomers] = useState<Option[]>([]);
   const [selectedRoute, setSelectedRoute] = useState<Option | null>(null);
   const [selectedCustomer, setSelectedCustomer] = useState<Option | null>(null);
+  // Customer → number of orders already placed TODAY on this route. Fetched
+  // whenever the route changes and after every successful order placement so
+  // the badges and confirmation modal stay accurate.
+  const [ordersTodayMap, setOrdersTodayMap] = useState<Map<string, number>>(new Map());
+  // When the user clicks a customer that already has orders today, we hold the
+  // pending pick here while asking for confirmation.
+  const [pendingCustomerPick, setPendingCustomerPick] = useState<Option | null>(null);
 
   const [customerDetail, setCustomerDetail] = useState<CustomerDetail | null>(
     null
@@ -156,10 +163,24 @@ export function OrderAssistantScreen() {
     })();
   }, []);
 
+  const refreshOrdersToday = useCallback(async (routeValue: string | undefined) => {
+    if (!routeValue) {
+      setOrdersTodayMap(new Map());
+      return;
+    }
+    try {
+      const data = await api.listCustomerOrdersToday(routeValue);
+      setOrdersTodayMap(new Map(data.map((d) => [d.account, d.order_count])));
+    } catch {
+      setOrdersTodayMap(new Map());
+    }
+  }, []);
+
   useEffect(() => {
     if (!selectedRoute) {
       setCustomers([]);
       setSelectedCustomer(null);
+      setOrdersTodayMap(new Map());
       return;
     }
     (async () => {
@@ -175,8 +196,9 @@ export function OrderAssistantScreen() {
         setIsLoadingCustomers(false);
       }
     })();
+    refreshOrdersToday(selectedRoute.value);
     setSelectedCustomer(null);
-  }, [selectedRoute]);
+  }, [selectedRoute, refreshOrdersToday]);
 
   useEffect(() => {
     if (!selectedCustomer) {
@@ -442,12 +464,47 @@ export function OrderAssistantScreen() {
     // Bump session key so the finalize modal remounts fresh next time (dates,
     // description, discount reset to defaults).
     setFinalizeSessionKey((k) => k + 1);
+    // Refresh the "orders today" badges so the just-placed order shows up next
+    // to the customer immediately.
+    refreshOrdersToday(selectedRoute?.value);
     // No second success modal — SalesOrderScreen already showed one with the
     // actual order number before it fired onPlaced.
-  }, []);
+  }, [refreshOrdersToday, selectedRoute]);
 
   return (
     <div className="h-full bg-gray-50 p-2 flex flex-col">
+      {pendingCustomerPick && (
+        <div className="fixed inset-0 z-50 bg-black bg-opacity-30 flex items-center justify-center p-4">
+          <div className="bg-white rounded shadow-lg max-w-md w-full p-4">
+            <h3 className="font-semibold text-gray-900 text-sm mb-2">
+              Customer already has orders today
+            </h3>
+            <p className="text-sm text-gray-700 mb-4">
+              <strong>{pendingCustomerPick.label}</strong> already has{" "}
+              <strong>{ordersTodayMap.get(pendingCustomerPick.value) ?? 0}</strong>{" "}
+              order(s) placed today. Do you want to place another one?
+            </p>
+            <div className="flex justify-end gap-2">
+              <button
+                onClick={() => setPendingCustomerPick(null)}
+                className="px-3 py-1 text-sm border border-gray-300 rounded hover:bg-gray-50"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => {
+                  setSelectedCustomer(pendingCustomerPick);
+                  setPendingCustomerPick(null);
+                }}
+                className="px-3 py-1 text-sm bg-blue-600 text-white rounded hover:bg-blue-700"
+              >
+                Continue
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       <div className="max-w-[1600px] mx-auto w-full flex-1 min-h-0 flex flex-col gap-2">
         {/* Top bar: route + customer */}
         <div className="grid grid-cols-2 gap-2 flex-shrink-0">
@@ -477,7 +534,33 @@ export function OrderAssistantScreen() {
             <Select
               options={customers}
               value={selectedCustomer}
-              onChange={(opt) => setSelectedCustomer(opt as Option | null)}
+              onChange={(opt) => {
+                const next = opt as Option | null;
+                if (!next) {
+                  setSelectedCustomer(null);
+                  return;
+                }
+                const count = ordersTodayMap.get(next.value) ?? 0;
+                if (count > 0 && next.value !== selectedCustomer?.value) {
+                  setPendingCustomerPick(next);
+                  return;
+                }
+                setSelectedCustomer(next);
+              }}
+              formatOptionLabel={(opt) => {
+                const o = opt as Option;
+                const count = ordersTodayMap.get(o.value) ?? 0;
+                return (
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="truncate">{o.label}</span>
+                    {count > 0 && (
+                      <span className="flex-shrink-0 text-[10px] font-semibold bg-emerald-100 text-emerald-800 border border-emerald-300 px-1.5 py-0.5 rounded-full">
+                        {count} today
+                      </span>
+                    )}
+                  </div>
+                );
+              }}
               placeholder={
                 selectedRoute ? "Search customer..." : "Select route first"
               }

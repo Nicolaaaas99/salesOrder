@@ -552,6 +552,10 @@ button { font-family: inherit; }
   background: var(--ok-soft);
   color: var(--ok);
 }
+.state-badge--partial {
+  background: #fef3c7;  /* amber-100 */
+  color:      #92400e;  /* amber-800 */
+}
 
 .date-wrap {
   position: relative;
@@ -821,7 +825,7 @@ button { font-family: inherit; }
 }
 
 /* Compact variant of the credit-status block — used by narrow panels like the
-   Customer Overview sidebar where the 130px left-indent of the default style
+   Route Overview sidebar where the 130px left-indent of the default style
    would push the content off-screen. */
 .credit-status--compact {
   padding: 6px 10px 8px 10px;

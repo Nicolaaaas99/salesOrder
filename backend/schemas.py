@@ -189,6 +189,11 @@ class HistoryCustomer(BaseModel):
     display: str
 
 
+class CustomerOrderCount(BaseModel):
+    account: str
+    order_count: int
+
+
 class HistoricalOrderLine(BaseModel):
     stockCode: str
     description: str

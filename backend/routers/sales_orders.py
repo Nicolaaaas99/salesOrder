@@ -152,16 +152,22 @@ SEARCH_SQL = """
     FROM InvNum inv
     LEFT JOIN Client c ON c.DCLink = inv.AccountID
     WHERE inv.DocType = 4
-      AND inv.DocState IN (1, 4)
+      AND inv.DocState IN :states
       AND ISNULL(inv.OrderNum, '') <> ''
       AND (:account IS NULL OR c.Account LIKE :account OR c.Name LIKE :account)
       AND (:order_no IS NULL OR inv.OrderNum LIKE :order_no)
       AND (:ext_order IS NULL OR inv.ExtOrderNum LIKE :ext_order)
       AND (:description IS NULL OR inv.Description LIKE :description)
-      AND (:date_from IS NULL OR inv.InvDate >= :date_from)
-      AND (:date_to IS NULL OR inv.InvDate <= :date_to)
+      AND (:date_from IS NULL OR CAST(inv.OrderDate AS DATE) >= :date_from)
+      AND (:date_to   IS NULL OR CAST(inv.OrderDate AS DATE) <= :date_to)
     ORDER BY inv.OrderNum DESC
 """
+
+
+# Default to the three "real" sales-order states — Unprocessed, Partially
+# Processed, Archived. Quotes/templates/cancelled are intentionally excluded
+# so the Open dialog stays focused on actual orders.
+DEFAULT_SEARCH_STATES = (1, 3, 4)
 
 
 @router.get("", response_model=List[schemas.SalesOrderSearchResult])
@@ -172,6 +178,7 @@ def search_sales_orders(
     description: Optional[str] = Query(None),
     date_from: Optional[date] = Query(None),
     date_to: Optional[date] = Query(None),
+    states: Optional[List[int]] = Query(None),
     limit: int = Query(200, le=500),
     db: Session = Depends(get_db),
 ):
@@ -179,8 +186,11 @@ def search_sales_orders(
         v = (v or "").strip()
         return f"%{v}%" if v else None
 
+    chosen_states = tuple(states) if states else DEFAULT_SEARCH_STATES
+
+    stmt = text(SEARCH_SQL).bindparams(bindparam("states", expanding=True))
     rows = db.execute(
-        text(SEARCH_SQL),
+        stmt,
         {
             "account": like(account),
             "order_no": like(order_no),
@@ -188,8 +198,64 @@ def search_sales_orders(
             "description": like(description),
             "date_from": date_from,
             "date_to": date_to,
+            "states": chosen_states,
             "limit": limit,
         },
+    ).mappings().all()
+
+    return [
+        schemas.SalesOrderSearchResult(
+            order_no=r["order_no"] or "",
+            external_order=r["external_order"] or "",
+            description=r["description"] or "",
+            invoice_date=_to_date(r["invoice_date"]),
+            order_date=_to_date(r["order_date"]),
+            customer_account=r["customer_account"] or "",
+            customer_name=r["customer_name"] or "",
+            doc_state=int(r["doc_state"] or 0),
+            doc_state_label=DOC_STATE_LABELS.get(int(r["doc_state"] or 0), "Unknown"),
+            total_incl=float(r["total_incl"] or 0),
+            is_archived=int(r["doc_state"] or 0) == 4,
+        )
+        for r in rows
+    ]
+
+
+BY_ORDER_DATE_SQL = """
+    SELECT
+        inv.OrderNum      AS order_no,
+        inv.ExtOrderNum   AS external_order,
+        inv.Description   AS description,
+        inv.InvDate       AS invoice_date,
+        inv.OrderDate     AS order_date,
+        inv.DocState      AS doc_state,
+        inv.OrdTotIncl    AS total_incl,
+        c.Account         AS customer_account,
+        c.Name            AS customer_name
+    FROM InvNum inv
+    LEFT JOIN Client c ON c.DCLink = inv.AccountID
+    WHERE inv.DocType = 4
+      AND inv.DocState IN (1, 3, 4)
+      AND ISNULL(inv.OrderNum, '') <> ''
+      AND c.Account = :account
+      AND CAST(inv.OrderDate AS DATE) = :on_date
+    ORDER BY inv.OrderNum DESC
+"""
+
+
+@router.get("/by-order-date", response_model=List[schemas.SalesOrderSearchResult])
+def list_orders_by_order_date(
+    account: str = Query(...),
+    on_date: date = Query(..., alias="date"),
+    db: Session = Depends(get_db),
+):
+    """Return the sales orders for one customer whose OrderDate matches the
+    given calendar day. Mirrors the DocState filter used by the per-day
+    counts view (_vw_SOCustomerOrdersPerDay) so the modal list stays
+    consistent with the pill count on the Route Overview."""
+    rows = db.execute(
+        text(BY_ORDER_DATE_SQL),
+        {"account": account.strip(), "on_date": on_date},
     ).mappings().all()
 
     return [
