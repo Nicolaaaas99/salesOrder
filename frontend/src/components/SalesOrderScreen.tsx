@@ -82,6 +82,10 @@ function detailToLines(detail: SalesOrderDetail, cust: CustomerDetail): LineRow[
     // match the saved intent.
     pack_size: 1,
     pack_override: false,
+    // Loaded prices came from Evolution directly (not re-resolved via the
+    // view) so we don't know the warehouse they were priced in. Treat as
+    // non-fallback; the UI only flags fresh lookups.
+    is_fallback_warehouse: false,
   }));
 }
 

@@ -222,40 +222,45 @@ def search_sales_orders(
     ]
 
 
-BY_ORDER_DATE_SQL = """
-    SELECT
-        inv.OrderNum      AS order_no,
-        inv.ExtOrderNum   AS external_order,
-        inv.Description   AS description,
-        inv.InvDate       AS invoice_date,
-        inv.OrderDate     AS order_date,
-        inv.DocState      AS doc_state,
-        inv.OrdTotIncl    AS total_incl,
-        c.Account         AS customer_account,
-        c.Name            AS customer_name
-    FROM InvNum inv
-    LEFT JOIN Client c ON c.DCLink = inv.AccountID
-    WHERE inv.DocType = 4
-      AND inv.DocState IN (1, 3, 4)
-      AND ISNULL(inv.OrderNum, '') <> ''
-      AND c.Account = :account
-      AND CAST(inv.OrderDate AS DATE) = :on_date
-    ORDER BY inv.OrderNum DESC
-"""
+def _by_date_column(by: str) -> str:
+    """Whitelist mapping so we can safely interpolate the column name into
+    SQL without creating an injection vector."""
+    return {"order": "OrderDate", "delivery": "DeliveryDate"}[by]
 
 
 @router.get("/by-order-date", response_model=List[schemas.SalesOrderSearchResult])
 def list_orders_by_order_date(
     account: str = Query(...),
     on_date: date = Query(..., alias="date"),
+    by: str = Query("order", pattern="^(order|delivery)$"),
     db: Session = Depends(get_db),
 ):
-    """Return the sales orders for one customer whose OrderDate matches the
-    given calendar day. Mirrors the DocState filter used by the per-day
-    counts view (_vw_SOCustomerOrdersPerDay) so the modal list stays
-    consistent with the pill count on the Route Overview."""
+    """Return the sales orders for one customer where the chosen date column
+    matches the given calendar day. `by=order` (default) uses OrderDate; the
+    Route Overview passes `by=delivery` to use DeliveryDate."""
+    date_col = _by_date_column(by)
+    sql = f"""
+        SELECT
+            inv.OrderNum      AS order_no,
+            inv.ExtOrderNum   AS external_order,
+            inv.Description   AS description,
+            inv.InvDate       AS invoice_date,
+            inv.OrderDate     AS order_date,
+            inv.DocState      AS doc_state,
+            inv.OrdTotIncl    AS total_incl,
+            c.Account         AS customer_account,
+            c.Name            AS customer_name
+        FROM InvNum inv
+        LEFT JOIN Client c ON c.DCLink = inv.AccountID
+        WHERE inv.DocType = 4
+          AND inv.DocState IN (1, 3, 4)
+          AND ISNULL(inv.OrderNum, '') <> ''
+          AND c.Account = :account
+          AND CAST(inv.{date_col} AS DATE) = :on_date
+        ORDER BY inv.OrderNum DESC
+    """
     rows = db.execute(
-        text(BY_ORDER_DATE_SQL),
+        text(sql),
         {"account": account.strip(), "on_date": on_date},
     ).mappings().all()
 

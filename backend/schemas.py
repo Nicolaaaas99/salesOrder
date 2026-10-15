@@ -11,10 +11,12 @@ class LoginRequest(BaseModel):
 class LoginResponse(BaseModel):
     token: str
     username: str
+    default_warehouse_code: Optional[str] = None
 
 
 class MeResponse(BaseModel):
     username: str
+    default_warehouse_code: Optional[str] = None
 
 
 class CustomerSummary(BaseModel):
@@ -62,11 +64,20 @@ class CustomerPrice(BaseModel):
     excl_price: float = 0.0
     incl_price: float = 0.0
     source: str = "None"        # 'Customer Deal' | 'Group Deal' | 'Price List' | 'None'
+    # True when the agent's default warehouse had no price for this stock and
+    # we fell back to the lowest price from any warehouse. UI shows a badge
+    # so the rep sees the price didn't come from their DC's price list.
+    is_fallback_warehouse: bool = False
 
 
 class CustomerPricesRequest(BaseModel):
     account: str
     stock_codes: List[str]
+    # Optional warehouse scope — when provided, prices are preferred from
+    # this warehouse (falling back to lowest-across-warehouses if the stock
+    # has no row in it). Normally set to the logged-in agent's default
+    # warehouse so the rep sees prices from their own DC.
+    warehouse_code: Optional[str] = None
 
 
 class PackSizesRequest(BaseModel):

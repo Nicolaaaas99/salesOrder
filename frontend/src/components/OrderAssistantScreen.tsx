@@ -18,6 +18,7 @@ import { productKey, type CategoryProduct } from "../utils/history";
 import { today } from "../utils/date";
 import { makeEmptyLine, pickDefaultWarehouse, snapToPack } from "./LineItemsGrid";
 import { SalesOrderScreen } from "./SalesOrderScreen";
+import { useAuth } from "../context/AuthContext";
 
 type Option = { value: string; label: string };
 
@@ -52,7 +53,8 @@ const selectStyles = {
 
 function draftFromSuggestion(
   s: OrderSuggestion,
-  defaultTaxTypeId: number | null
+  defaultTaxTypeId: number | null,
+  preferredWhse: string | null,
 ): DraftLine {
   const line = makeEmptyLine(defaultTaxTypeId);
   const priced = s.unit_price > 0;
@@ -62,7 +64,7 @@ function draftFromSuggestion(
     stock_code: s.stock_code,
     item_description: s.item_description || s.description,
     description: s.item_description || s.description,
-    warehouse_code: s.is_whse_item ? pickDefaultWarehouse(s.warehouse_codes) : "",
+    warehouse_code: s.is_whse_item ? pickDefaultWarehouse(s.warehouse_codes, preferredWhse) : "",
     warehouse_codes: s.warehouse_codes,
     available: s.available,
     // Suggestion is already snapped to pack size on the backend
@@ -84,7 +86,8 @@ function draftFromSuggestion(
 function draftFromInventoryItem(
   item: InventoryItem,
   quantity: number,
-  defaultTaxTypeId: number | null
+  defaultTaxTypeId: number | null,
+  preferredWhse: string | null,
 ): DraftLine {
   const line = makeEmptyLine(defaultTaxTypeId);
   const pack = item.pack_size || 1;
@@ -94,7 +97,7 @@ function draftFromInventoryItem(
     item_description: item.description,
     description: item.description,
     warehouse_code: item.is_whse_item
-      ? pickDefaultWarehouse(item.warehouse_codes)
+      ? pickDefaultWarehouse(item.warehouse_codes, preferredWhse)
       : "",
     warehouse_codes: item.warehouse_codes,
     available: item.available,
@@ -111,6 +114,7 @@ function draftFromInventoryItem(
 }
 
 export function OrderAssistantScreen() {
+  const { defaultWarehouseCode } = useAuth();
   const [routes, setRoutes] = useState<Option[]>([]);
   const [customers, setCustomers] = useState<Option[]>([]);
   const [selectedRoute, setSelectedRoute] = useState<Option | null>(null);
@@ -228,7 +232,7 @@ export function OrderAssistantScreen() {
       try {
         const [ordersData, suggestionsData, detail] = await Promise.all([
           api.listHistoryOrders(selectedCustomer.value),
-          api.listOrderSuggestions(selectedCustomer.value),
+          api.listOrderSuggestions(selectedCustomer.value, undefined, undefined, defaultWarehouseCode),
           api.getCustomer(selectedCustomer.value).catch(() => null),
         ]);
         setOrders(ordersData);
@@ -254,7 +258,8 @@ export function OrderAssistantScreen() {
           try {
             const priceMap = await api.getCustomerPrices(
               selectedCustomer.value,
-              [...codes]
+              [...codes],
+              defaultWarehouseCode,
             );
             const srcMap = new Map<string, string>();
             Object.entries(priceMap).forEach(([code, p]) => {
@@ -347,7 +352,7 @@ export function OrderAssistantScreen() {
         const account = customerDetail.account;
         const code = line.stock_code;
         api
-          .getCustomerPrices(account, [code])
+          .getCustomerPrices(account, [code], defaultWarehouseCode)
           .then((map) => {
             const p = map[code];
             // Store BOTH prices on the draft line — excl is the computational
@@ -364,6 +369,7 @@ export function OrderAssistantScreen() {
                       unit_price_incl: incl,
                       price_source: p?.source ?? "None",
                       price_locked: excl > 0,
+                      is_fallback_warehouse: p?.is_fallback_warehouse ?? false,
                     }
                   : l
               )
@@ -373,7 +379,7 @@ export function OrderAssistantScreen() {
             setDraftLines((prev) =>
               prev.map((l) =>
                 l.stock_code === code
-                  ? { ...l, price_source: "None", price_locked: false }
+                  ? { ...l, price_source: "None", price_locked: false, is_fallback_warehouse: false }
                   : l
               )
             );
@@ -390,7 +396,7 @@ export function OrderAssistantScreen() {
       suggestion: OrderSuggestion | undefined
     ) => {
       if (suggestion) {
-        addLine(draftFromSuggestion(suggestion, defaultTaxTypeId));
+        addLine(draftFromSuggestion(suggestion, defaultTaxTypeId, defaultWarehouseCode));
         return;
       }
 
@@ -407,7 +413,7 @@ export function OrderAssistantScreen() {
         const match =
           results.find((r) => r.code === product.stockCode) ?? results[0];
         if (match) {
-          addLine(draftFromInventoryItem(match, qty, defaultTaxTypeId));
+          addLine(draftFromInventoryItem(match, qty, defaultTaxTypeId, defaultWarehouseCode));
           return;
         }
       } catch {
@@ -425,16 +431,16 @@ export function OrderAssistantScreen() {
         pack_size: pack,
       });
     },
-    [addLine, defaultTaxTypeId]
+    [addLine, defaultTaxTypeId, defaultWarehouseCode, packSizes]
   );
 
   const handleAddAllSuggested = useCallback(() => {
     // Iterate the live map (which has already subtracted drafted qty) so this
     // button only tops up the remaining suggestion instead of double-adding.
     suggestionsMap.forEach((s) => {
-      addLine(draftFromSuggestion(s, defaultTaxTypeId));
+      addLine(draftFromSuggestion(s, defaultTaxTypeId, defaultWarehouseCode));
     });
-  }, [suggestionsMap, addLine, defaultTaxTypeId]);
+  }, [suggestionsMap, addLine, defaultTaxTypeId, defaultWarehouseCode]);
 
   const handleUpdateLine = useCallback(
     (index: number, patch: Partial<DraftLine>) => {
@@ -453,9 +459,9 @@ export function OrderAssistantScreen() {
 
   const handleAddItem = useCallback(
     (item: InventoryItem) => {
-      addLine(draftFromInventoryItem(item, 0, defaultTaxTypeId));
+      addLine(draftFromInventoryItem(item, 0, defaultTaxTypeId, defaultWarehouseCode));
     },
-    [addLine, defaultTaxTypeId]
+    [addLine, defaultTaxTypeId, defaultWarehouseCode]
   );
 
   const handleContinue = useCallback(() => {

@@ -1,7 +1,7 @@
 from datetime import date, timedelta
 from io import BytesIO
 from statistics import median
-from typing import List
+from typing import List, Optional
 from fastapi import APIRouter, Depends, Query
 from fastapi.responses import StreamingResponse
 from sqlalchemy import bindparam, text
@@ -57,32 +57,17 @@ def list_customers(route: str = Query(...), db: Session = Depends(get_db)):
     ]
 
 
-EXPORT_ORDERS_PER_DAY_SQL = """
-    -- All active, routed customers on the LEFT so zero-order customers still
-    -- land in the export. Order counts come from the per-day view, which
-    -- already filters DocType=4 and DocState IN (1,3,4).
-    SELECT
-        cl.ulARRoute          AS route,
-        cl.Account            AS account,
-        cl.Name               AS customer_name,
-        ISNULL(opd.order_count, 0) AS order_count
-    FROM dbo.Client cl
-    LEFT JOIN (
-        SELECT Account, SUM(NoOfOrders) AS order_count
-        FROM dbo._vw_SOCustomerOrdersPerDay
-        WHERE CAST(OrderDate AS DATE) = :on_date
-        GROUP BY Account
-    ) opd ON opd.Account = cl.Account
-    WHERE ISNULL(cl.On_Hold, 0) = 0
-      AND cl.ulARRoute IS NOT NULL
-      AND LTRIM(RTRIM(cl.ulARRoute)) <> ''
-    ORDER BY cl.ulARRoute, cl.Name
-"""
+def _date_column(by: str) -> str:
+    """Whitelist mapping so endpoints can swap OrderDate / DeliveryDate safely
+    (dict lookup, not user string interpolation, so there's no SQL injection
+    risk even though we're building the WHERE column name in Python)."""
+    return {"order": "OrderDate", "delivery": "DeliveryDate"}[by]
 
 
 @router.get("/export-orders-per-day")
 def export_orders_per_day(
     on_date: date = Query(default_factory=date.today, alias="date"),
+    by: str = Query("order", pattern="^(order|delivery)$"),
     db: Session = Depends(get_db),
 ):
     """Download an .xlsx workbook of every active, routed customer with their
@@ -92,13 +77,39 @@ def export_orders_per_day(
     from openpyxl import Workbook
     from openpyxl.styles import Font
 
-    rows = db.execute(text(EXPORT_ORDERS_PER_DAY_SQL), {"on_date": on_date}).mappings().all()
+    date_col = _date_column(by)
+    sql = f"""
+        -- All active, routed customers on the LEFT so zero-order customers
+        -- still appear. Order counts come from InvNum directly so we can
+        -- swap OrderDate for DeliveryDate based on the `by` argument.
+        SELECT
+            cl.ulARRoute          AS route,
+            cl.Account            AS account,
+            cl.Name               AS customer_name,
+            ISNULL(opd.order_count, 0) AS order_count
+        FROM dbo.Client cl
+        LEFT JOIN (
+            SELECT CL2.Account, COUNT(NUM.OrderNum) AS order_count
+            FROM dbo.InvNum NUM
+            JOIN dbo.Client CL2 ON CL2.DCLink = NUM.AccountID
+            WHERE NUM.DocType = 4
+              AND NUM.DocState IN (1, 3, 4)
+              AND CAST(NUM.{date_col} AS DATE) = :on_date
+            GROUP BY CL2.Account
+        ) opd ON opd.Account = cl.Account
+        WHERE ISNULL(cl.On_Hold, 0) = 0
+          AND cl.ulARRoute IS NOT NULL
+          AND LTRIM(RTRIM(cl.ulARRoute)) <> ''
+        ORDER BY cl.ulARRoute, cl.Name
+    """
+    rows = db.execute(text(sql), {"on_date": on_date}).mappings().all()
 
     wb = Workbook()
     ws = wb.active
+    date_label = "DeliveryDate" if by == "delivery" else "OrderDate"
     ws.title = f"Orders {on_date.isoformat()}"
 
-    headers = ["OrderDate", "Route", "CustomerAccount", "CustomerName", "NoOfOrders"]
+    headers = [date_label, "Route", "CustomerAccount", "CustomerName", "NoOfOrders"]
     ws.append(headers)
     for cell in ws[1]:
         cell.font = Font(bold=True)
@@ -133,17 +144,23 @@ def export_orders_per_day(
 def list_orders_today(
     route: str = Query(...),
     on_date: date = Query(default_factory=date.today, alias="date"),
+    by: str = Query("order", pattern="^(order|delivery)$"),
     db: Session = Depends(get_db),
 ):
     """Order counts per customer on the given route for a single calendar day.
-    Defaults to today. Used by the Order Assistant to flag customers that have
-    already had orders placed today."""
-    sql = """
-        SELECT Account AS account, SUM(NoOfOrders) AS order_count
-        FROM dbo._vw_SOCustomerOrdersPerDay
-        WHERE LTRIM(RTRIM(Route)) = :route
-          AND CAST(OrderDate AS DATE) = :on_date
-        GROUP BY Account
+    Defaults to today. `by=order` (default) counts by OrderDate — used by the
+    Order Assistant pill. `by=delivery` counts by DeliveryDate — used by the
+    Route Overview summary."""
+    date_col = _date_column(by)
+    sql = f"""
+        SELECT CL.Account AS account, COUNT(NUM.OrderNum) AS order_count
+        FROM dbo.InvNum NUM
+        JOIN dbo.Client CL ON CL.DCLink = NUM.AccountID
+        WHERE NUM.DocType = 4
+          AND NUM.DocState IN (1, 3, 4)
+          AND LTRIM(RTRIM(CL.ulARRoute)) = :route
+          AND CAST(NUM.{date_col} AS DATE) = :on_date
+        GROUP BY CL.Account
     """
     rows = db.execute(
         text(sql), {"route": route.strip(), "on_date": on_date}
@@ -248,6 +265,7 @@ def order_suggestions(
     customer_id: str = Query(...),
     weeks: int = Query(6, ge=2, le=26),
     min_weeks: int = Query(3, ge=1),
+    warehouse_code: Optional[str] = Query(None),
     db: Session = Depends(get_db),
 ):
     """
@@ -440,7 +458,9 @@ def order_suggestions(
         # with no priced entry stay at 0 and the rep must enter a price.
         # Both excl + incl are returned so the frontend's Tax Mode toggle can
         # display the exact Price List value without re-deriving.
-        price_map = resolve_customer_prices(db, customer_id, codes)
+        price_map = resolve_customer_prices(
+            db, customer_id, codes, warehouse_code=warehouse_code
+        )
         for s in suggestions:
             p = price_map.get(s.stock_code)
             if p:

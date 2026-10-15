@@ -2,6 +2,7 @@ import { useEffect, useRef } from "react";
 import { Lock, Unlock } from "lucide-react";
 import type { Warehouse, TaxType } from "../api/types";
 import { api } from "../api/client";
+import { useAuth } from "../context/AuthContext";
 import { ItemPicker } from "./ItemPicker";
 import { NumberCell } from "./NumberCell";
 import { ProjectPicker } from "./ProjectPicker";
@@ -33,6 +34,10 @@ export type LineRow = {
    *  intentionally order a non-pack-multiple (e.g. 7 of a 12-pack item for a
    *  spaza shop). Visually flagged in the UI. */
   pack_override: boolean;
+  /** True when the price for this line came from a warehouse other than the
+   *  logged-in agent's default (i.e. the agent's DC didn't have a price list
+   *  entry for this stock). Shown as a small badge next to the price input. */
+  is_fallback_warehouse: boolean;
 };
 
 export function makeEmptyLine(defaultTaxTypeId: number | null = null): LineRow {
@@ -56,6 +61,7 @@ export function makeEmptyLine(defaultTaxTypeId: number | null = null): LineRow {
     project_code: "",
     pack_size: 1,
     pack_override: false,
+    is_fallback_warehouse: false,
   };
 }
 
@@ -72,17 +78,16 @@ export function snapToPack(qty: number, packSize: number): number {
 }
 
 /**
- * Head-office/pollination warehouse — the one telesales orders ship from most
- * of the time. Default on any new line unless the stock isn't set up there.
+ * Pick the warehouse to pre-select on a new line. Prefers `preferred` (the
+ * logged-in agent's default warehouse from `_vw_SOAgentDefaultWhse`) when the
+ * stock is set up there, else the first available. Nothing warehouse-specific
+ * is hardcoded on the frontend — the preference is resolved at login.
  */
-export const DEFAULT_WAREHOUSE_CODE = "01.HOF_POL";
-
-/**
- * Pick the warehouse to pre-select on a new line. Prefers `DEFAULT_WAREHOUSE_CODE`
- * when the stock is set up there; otherwise falls back to the first available.
- */
-export function pickDefaultWarehouse(available: string[]): string {
-  if (available.includes(DEFAULT_WAREHOUSE_CODE)) return DEFAULT_WAREHOUSE_CODE;
+export function pickDefaultWarehouse(
+  available: string[],
+  preferred?: string | null,
+): string {
+  if (preferred && available.includes(preferred)) return preferred;
   return available[0] ?? "";
 }
 
@@ -183,6 +188,7 @@ type FocusTarget = { row: number; col?: number };
 export function LineItemsGrid({
   lines, warehouses, taxTypes, defaultTaxTypeId, taxMode, customerAccount, onChange,
 }: Props) {
+  const { defaultWarehouseCode } = useAuth();
   const tbodyRef = useRef<HTMLTableSectionElement>(null);
   const focusTarget = useRef<FocusTarget | null>(null);
   const prevLineCount = useRef(lines.length);
@@ -383,7 +389,7 @@ export function LineItemsGrid({
                             (linked.length === 0 ||
                               linked.includes(line.warehouse_code))
                             ? line.warehouse_code
-                            : pickDefaultWarehouse(linked)
+                            : pickDefaultWarehouse(linked, defaultWarehouseCode)
                           : "";
                         const pack = item.pack_size || 1;
                         updateLine(i, {
@@ -409,7 +415,7 @@ export function LineItemsGrid({
                         if (customerAccount) {
                           const pickedCode = item.code;
                           api
-                            .getCustomerPrices(customerAccount, [pickedCode])
+                            .getCustomerPrices(customerAccount, [pickedCode], defaultWarehouseCode)
                             .then((map) => {
                               const p = map[pickedCode];
                               // Store both prices — unit_price = excl is the
@@ -427,6 +433,7 @@ export function LineItemsGrid({
                                         unit_price_incl: incl,
                                         price_source: p?.source ?? "None",
                                         price_locked: excl > 0,
+                                        is_fallback_warehouse: p?.is_fallback_warehouse ?? false,
                                       }
                                     : l,
                                 ),
@@ -436,7 +443,7 @@ export function LineItemsGrid({
                               onChange((prev) =>
                                 prev.map((l, idx) =>
                                   idx === i && l.stock_code === pickedCode
-                                    ? { ...l, price_source: "None", price_locked: false }
+                                    ? { ...l, price_source: "None", price_locked: false, is_fallback_warehouse: false }
                                     : l,
                                 ),
                               );
@@ -458,9 +465,21 @@ export function LineItemsGrid({
                   <td>
                     <SelectCell
                       value={line.warehouse_code || null}
-                      options={warehouseOptions.filter((w) =>
-                        line.warehouse_codes.includes(w.key as string)
-                      )}
+                      options={warehouseOptions.filter((w) => {
+                        const code = w.key as string;
+                        if (!line.warehouse_codes.includes(code)) return false;
+                        // Scope the dropdown to the agent's default warehouse
+                        // when the stock is set up there. If it isn't, fall
+                        // back to showing every warehouse the stock is in so
+                        // the line can still be placed.
+                        if (
+                          defaultWarehouseCode &&
+                          line.warehouse_codes.includes(defaultWarehouseCode)
+                        ) {
+                          return code === defaultWarehouseCode;
+                        }
+                        return true;
+                      })}
                       disabled={cellsDisabled || !line.is_whse_item}
                       onChange={(v) => updateLine(i, { warehouse_code: (v as string) ?? "" })}
                     />
@@ -524,11 +543,22 @@ export function LineItemsGrid({
                       className="cell-input num"
                       value={displayPrice(line, taxTypes, taxMode)}
                       disabled={cellsDisabled || line.price_locked}
-                      title={line.price_locked ? `Price from ${line.price_source}` : undefined}
+                      title={
+                        line.is_fallback_warehouse
+                          ? `Price from a different warehouse — your DC (${defaultWarehouseCode ?? "n/a"}) has no price list entry for this stock`
+                          : line.price_locked
+                          ? `Price from ${line.price_source}`
+                          : undefined
+                      }
                       onChange={(v) =>
                         updateLine(i, priceEditFromDisplay(v, line, taxTypes, taxMode))
                       }
                     />
+                    {line.is_fallback_warehouse && (
+                      <div className="text-[9px] text-amber-700 font-semibold leading-tight mt-0.5">
+                        other whse
+                      </div>
+                    )}
                   </td>
                   <td>
                     <SelectCell

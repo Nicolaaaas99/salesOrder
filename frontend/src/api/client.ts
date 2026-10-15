@@ -64,7 +64,11 @@ http.interceptors.response.use(
   }
 );
 
-export type LoginResponse = { token: string; username: string };
+export type LoginResponse = {
+  token: string;
+  username: string;
+  default_warehouse_code: string | null;
+};
 
 export const auth = {
   login: (username: string, password: string) =>
@@ -72,7 +76,10 @@ export const auth = {
       .post<LoginResponse>("/auth/login", { username, password })
       .then((r) => r.data),
   logout: () => http.post("/auth/logout").then((r) => r.data),
-  me: () => http.get<{ username: string }>("/auth/me").then((r) => r.data),
+  me: () =>
+    http
+      .get<{ username: string; default_warehouse_code: string | null }>("/auth/me")
+      .then((r) => r.data),
 };
 
 export const api = {
@@ -92,11 +99,16 @@ export const api = {
     http.get<Project[]>("/lookups/projects", { params: { q, limit: 50 } }).then((r) => r.data),
   listSettlementTerms: () => http.get<SettlementTerm[]>("/lookups/settlement-terms").then((r) => r.data),
 
-  getCustomerPrices: (account: string, stockCodes: string[]) =>
+  getCustomerPrices: (
+    account: string,
+    stockCodes: string[],
+    warehouseCode?: string | null,
+  ) =>
     http
       .post<Record<string, CustomerPrice>>("/lookups/customer-prices", {
         account,
         stock_codes: stockCodes,
+        warehouse_code: warehouseCode ?? null,
       })
       .then((r) => r.data),
 
@@ -115,10 +127,14 @@ export const api = {
       .get<SalesOrderSearchResult[]>("/sales-orders", { params: filters })
       .then((r) => r.data),
 
-  listOrdersByOrderDate: (account: string, date: string) =>
+  listOrdersByOrderDate: (
+    account: string,
+    date: string,
+    by: "order" | "delivery" = "order",
+  ) =>
     http
       .get<SalesOrderSearchResult[]>("/sales-orders/by-order-date", {
-        params: { account, date },
+        params: { account, date, by },
       })
       .then((r) => r.data),
 
@@ -141,19 +157,26 @@ export const api = {
       .get<HistoryCustomer[]>("/history/customers", { params: { route } })
       .then((r) => r.data),
 
-  listCustomerOrdersToday: (route: string, date?: string) =>
+  listCustomerOrdersToday: (
+    route: string,
+    date?: string,
+    by: "order" | "delivery" = "order",
+  ) =>
     http
       .get<CustomerOrderCount[]>("/history/orders-today", {
-        params: { route, ...(date ? { date } : {}) },
+        params: { route, by, ...(date ? { date } : {}) },
       })
       .then((r) => r.data),
 
   /** Download the xlsx workbook of all customer order counts for a date.
    *  Triggers a browser download — fetched as a binary blob so our auth
    *  interceptor still attaches the Bearer token. */
-  exportOrdersPerDayXlsx: async (date: string) => {
+  exportOrdersPerDayXlsx: async (
+    date: string,
+    by: "order" | "delivery" = "order",
+  ) => {
     const resp = await http.get<Blob>("/history/export-orders-per-day", {
-      params: { date },
+      params: { date, by },
       responseType: "blob",
     });
     const blob = resp.data;
@@ -170,10 +193,20 @@ export const api = {
       .get<HistoricalOrder[]>("/history/orders", { params: { customer_id: customerId } })
       .then((r) => r.data),
 
-  listOrderSuggestions: (customerId: string, weeks = 6, minWeeks = 3) =>
+  listOrderSuggestions: (
+    customerId: string,
+    weeks = 6,
+    minWeeks = 3,
+    warehouseCode?: string | null,
+  ) =>
     http
       .get<OrderSuggestion[]>("/history/suggestions", {
-        params: { customer_id: customerId, weeks, min_weeks: minWeeks },
+        params: {
+          customer_id: customerId,
+          weeks,
+          min_weeks: minWeeks,
+          ...(warehouseCode ? { warehouse_code: warehouseCode } : {}),
+        },
       })
       .then((r) => r.data),
 };

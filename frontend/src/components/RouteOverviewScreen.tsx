@@ -271,7 +271,7 @@ export function RouteOverviewScreen({ onOpenOrder }: RouteOverviewProps = {}) {
           <div className="bg-white rounded border p-2 shadow-sm w-44">
             <label className="flex items-center font-semibold text-gray-800 mb-1 text-xs">
               <Calendar className="w-3 h-3 mr-1 text-blue-600" />
-              Date
+              Order Date
             </label>
             <DateInput value={selectedDate} onChange={setSelectedDate} />
           </div>
@@ -279,11 +279,11 @@ export function RouteOverviewScreen({ onOpenOrder }: RouteOverviewProps = {}) {
           <button
             onClick={handleExport}
             disabled={isExporting}
-            title="Download CSV of order counts for every route on this date (opens in Excel)"
-            className="inline-flex items-center gap-1 px-3 py-2 text-xs font-semibold bg-emerald-600 text-white rounded shadow-sm hover:bg-emerald-700 disabled:opacity-60 disabled:cursor-not-allowed self-end"
+            title="Download an .xlsx workbook of order counts for every route on this date"
+            className="inline-flex items-center gap-1.5 px-4 py-1.5 text-xs font-semibold bg-emerald-600 text-white rounded-md shadow-sm hover:bg-emerald-700 disabled:opacity-60 disabled:cursor-not-allowed self-center"
           >
-            <Download className="w-3 h-3" />
-            {isExporting ? "Exporting…" : "Export (all routes)"}
+            <Download className="w-3.5 h-3.5" />
+            {isExporting ? "Exporting…" : "Export"}
           </button>
         </div>
 
@@ -477,7 +477,7 @@ function RouteSummary({
                 <th className="text-left px-3 py-1.5 font-semibold">Account</th>
                 <th className="text-left px-3 py-1.5 font-semibold">Customer</th>
                 <th className="text-center px-3 py-1.5 font-semibold w-32">
-                  Orders on date
+                  Orders
                 </th>
                 <th className="w-28"></th>
               </tr>
@@ -616,7 +616,7 @@ function OrdersOnDatePanel({
     <div className="bg-white rounded border shadow-sm flex flex-col overflow-hidden flex-shrink-0 max-h-[40%]">
       <div className="px-3 py-2 border-b border-gray-200 bg-gray-50 flex items-center justify-between">
         <div>
-          <div className="text-xs font-semibold text-gray-700 uppercase tracking-wide">Orders on date</div>
+          <div className="text-xs font-semibold text-gray-700 uppercase tracking-wide">Orders</div>
           <div className="text-xs text-gray-500">{date}</div>
         </div>
         <span className="text-[10px] font-semibold bg-emerald-100 text-emerald-800 border border-emerald-300 px-2 py-0.5 rounded-full">

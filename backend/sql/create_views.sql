@@ -364,7 +364,26 @@ OUTER APPLY (
 GO
 
 -- =============================================================================
+-- 13. _vw_SOAgentDefaultWhse  (telesales agent -> default warehouse code)
+--     Pricing uses this so each rep sees prices from the warehouse at the
+--     distribution centre they work from. iDefWhseId is filtered to the two
+--     valid DCs (48 = 01.HOF_MAK, 49 = 01.HOF_POL) and only Telesales agents
+--     are included so other operators don't accidentally match.
+-- =============================================================================
+CREATE OR ALTER VIEW dbo._vw_SOAgentDefaultWhse AS
+SELECT
+    AG.idAgents,
+    AG.cAgentName,
+    AG.cDescription,
+    AG.iDefWhseId,
+    WH.Code      AS WhseCode
+FROM dbo._rtblAgents AG
+JOIN dbo.WhseMst WH ON WH.WhseLink = AG.iDefWhseId
+WHERE AG.bAgentActive = 1
+GO
+
+-- =============================================================================
 -- Verification
 -- =============================================================================
 SELECT name FROM sys.views WHERE name LIKE '_vw_SO%' ORDER BY name;
--- Expected 12 rows.
+-- Expected 13 rows.

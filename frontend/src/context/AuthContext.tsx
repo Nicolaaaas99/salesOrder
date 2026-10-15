@@ -14,6 +14,10 @@ type AuthState = {
   /** `YYYY-MM-DD` in LOCAL calendar. Null until the rep picks one at the
    *  start of a session. All sales-order date defaults use this. */
   sessionDate: string | null;
+  /** The warehouse the logged-in telesales agent works out of (from
+   *  _vw_SOAgentDefaultWhse). Pricing calls pass this through so the rep
+   *  sees prices from their own DC. Null if the agent isn't in the view. */
+  defaultWarehouseCode: string | null;
 };
 
 type AuthContextValue = AuthState & {
@@ -39,6 +43,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     token: sessionStorage.getItem("auth_token"),
     username: sessionStorage.getItem("auth_username"),
     sessionDate: sessionStorage.getItem("auth_session_date"),
+    defaultWarehouseCode: sessionStorage.getItem("auth_default_warehouse"),
   }));
 
   const login = useCallback(async (username: string, password: string) => {
@@ -47,7 +52,17 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     sessionStorage.setItem("auth_username", res.username);
     // Fresh login = re-prompt for session date.
     sessionStorage.removeItem("auth_session_date");
-    setState({ token: res.token, username: res.username, sessionDate: null });
+    if (res.default_warehouse_code) {
+      sessionStorage.setItem("auth_default_warehouse", res.default_warehouse_code);
+    } else {
+      sessionStorage.removeItem("auth_default_warehouse");
+    }
+    setState({
+      token: res.token,
+      username: res.username,
+      sessionDate: null,
+      defaultWarehouseCode: res.default_warehouse_code ?? null,
+    });
   }, []);
 
   const logout = useCallback(() => {
@@ -57,7 +72,13 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     sessionStorage.removeItem("auth_token");
     sessionStorage.removeItem("auth_username");
     sessionStorage.removeItem("auth_session_date");
-    setState({ token: null, username: null, sessionDate: null });
+    sessionStorage.removeItem("auth_default_warehouse");
+    setState({
+      token: null,
+      username: null,
+      sessionDate: null,
+      defaultWarehouseCode: null,
+    });
   }, []);
 
   const setSessionDate = useCallback((date: string) => {
@@ -67,7 +88,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     const onAuthFail = () =>
-      setState({ token: null, username: null, sessionDate: null });
+      setState({
+        token: null,
+        username: null,
+        sessionDate: null,
+        defaultWarehouseCode: null,
+      });
     window.addEventListener("auth:401", onAuthFail);
     return () => window.removeEventListener("auth:401", onAuthFail);
   }, []);

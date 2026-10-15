@@ -246,7 +246,9 @@ def get_customer_prices(
     account = (payload.account or "").strip()
     if not account:
         raise HTTPException(400, "account is required")
-    return resolve_customer_prices(db, account, payload.stock_codes)
+    return resolve_customer_prices(
+        db, account, payload.stock_codes, warehouse_code=payload.warehouse_code
+    )
 
 
 @router.get("/settlement-terms", response_model=List[schemas.SettlementTerm])

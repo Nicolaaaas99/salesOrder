@@ -40,6 +40,10 @@ export type CustomerPrice = {
   excl_price: number;
   incl_price: number;
   source: string;    // 'Customer Deal' | 'Group Deal' | 'Price List' | 'None'
+  /** True when the agent's default warehouse didn't have this stock priced,
+   *  and we fell back to the lowest price from any other warehouse. UI shows
+   *  a small badge so the rep knows it isn't from their DC's price list. */
+  is_fallback_warehouse: boolean;
 };
 
 export type Warehouse = { code: string; description: string };

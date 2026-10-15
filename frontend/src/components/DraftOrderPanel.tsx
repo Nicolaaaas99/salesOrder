@@ -254,7 +254,9 @@ export function DraftOrderPanel({
                         }
                         disabled={line.price_locked}
                         title={
-                          line.price_locked
+                          line.is_fallback_warehouse
+                            ? "Price from a different warehouse — this stock has no price list entry at your DC"
+                            : line.price_locked
                             ? `Price from ${line.price_source}`
                             : undefined
                         }
@@ -267,6 +269,11 @@ export function DraftOrderPanel({
                         }`}
                         placeholder=""
                       />
+                      {line.is_fallback_warehouse && (
+                        <div className="text-[9px] text-amber-700 font-semibold leading-tight mt-0.5">
+                          other whse
+                        </div>
+                      )}
                     </td>
                     <td className="py-1 px-1 text-right font-mono">
                       {fmtNumber(excl)}
