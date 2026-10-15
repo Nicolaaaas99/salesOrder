@@ -1,7 +1,9 @@
 from datetime import date, timedelta
+from io import BytesIO
 from statistics import median
 from typing import List
 from fastapi import APIRouter, Depends, Query
+from fastapi.responses import StreamingResponse
 from sqlalchemy import bindparam, text
 from sqlalchemy.orm import Session
 
@@ -53,6 +55,78 @@ def list_customers(route: str = Query(...), db: Session = Depends(get_db)):
         )
         for r in rows
     ]
+
+
+EXPORT_ORDERS_PER_DAY_SQL = """
+    -- All active, routed customers on the LEFT so zero-order customers still
+    -- land in the export. Order counts come from the per-day view, which
+    -- already filters DocType=4 and DocState IN (1,3,4).
+    SELECT
+        cl.ulARRoute          AS route,
+        cl.Account            AS account,
+        cl.Name               AS customer_name,
+        ISNULL(opd.order_count, 0) AS order_count
+    FROM dbo.Client cl
+    LEFT JOIN (
+        SELECT Account, SUM(NoOfOrders) AS order_count
+        FROM dbo._vw_SOCustomerOrdersPerDay
+        WHERE CAST(OrderDate AS DATE) = :on_date
+        GROUP BY Account
+    ) opd ON opd.Account = cl.Account
+    WHERE ISNULL(cl.On_Hold, 0) = 0
+      AND cl.ulARRoute IS NOT NULL
+      AND LTRIM(RTRIM(cl.ulARRoute)) <> ''
+    ORDER BY cl.ulARRoute, cl.Name
+"""
+
+
+@router.get("/export-orders-per-day")
+def export_orders_per_day(
+    on_date: date = Query(default_factory=date.today, alias="date"),
+    db: Session = Depends(get_db),
+):
+    """Download an .xlsx workbook of every active, routed customer with their
+    order count for the given day — zero-count customers included."""
+    # Deferred import so the module still loads if openpyxl isn't installed
+    # (e.g. a stale venv) — only this endpoint would 500 until pip install.
+    from openpyxl import Workbook
+    from openpyxl.styles import Font
+
+    rows = db.execute(text(EXPORT_ORDERS_PER_DAY_SQL), {"on_date": on_date}).mappings().all()
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = f"Orders {on_date.isoformat()}"
+
+    headers = ["OrderDate", "Route", "CustomerAccount", "CustomerName", "NoOfOrders"]
+    ws.append(headers)
+    for cell in ws[1]:
+        cell.font = Font(bold=True)
+
+    for r in rows:
+        ws.append([
+            on_date.isoformat(),
+            (r["route"] or "").strip(),
+            (r["account"] or "").strip(),
+            (r["customer_name"] or "").strip(),
+            int(r["order_count"] or 0),
+        ])
+
+    # Reasonable default column widths (approximate — openpyxl uses char units).
+    for col_letter, width in zip(("A", "B", "C", "D", "E"), (12, 20, 18, 48, 12)):
+        ws.column_dimensions[col_letter].width = width
+    ws.freeze_panes = "A2"
+
+    buf = BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+
+    filename = f"orders-per-day-{on_date.isoformat()}.xlsx"
+    return StreamingResponse(
+        buf,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @router.get("/orders-today", response_model=List[schemas.CustomerOrderCount])

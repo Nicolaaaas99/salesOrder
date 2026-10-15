@@ -162,6 +162,10 @@ class SalesOrderLineDetail(BaseModel):
     tax_type_id: Optional[int] = None
     discount_percent: float = 0.0
     project_code: str = ""
+    # Pack size for the stock item (ulIIPerCrate). The frontend uses this to
+    # flag lines where qty is not a multiple of pack size (the "off-pack"
+    # chip in the OrderSummaryModal / edit grid).
+    pack_size: int = 1
 
 
 class SalesOrderDetail(BaseModel):
@@ -198,6 +202,16 @@ class HistoryCustomer(BaseModel):
 class CustomerOrderCount(BaseModel):
     account: str
     order_count: int
+
+
+class CustomerOrderCountRow(BaseModel):
+    """One row per (date, route, customer) with order count. Used by the
+    Route Overview CSV export."""
+    order_date: Optional[date] = None
+    route: str = ""
+    account: str = ""
+    customer_name: str = ""
+    order_count: int = 0
 
 
 class HistoricalOrderLine(BaseModel):

@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import Select from "react-select";
-import { Truck, Calendar, XCircle, FileText, ArrowLeft, Search, ListOrdered } from "lucide-react";
+import { Truck, Calendar, XCircle, FileText, ArrowLeft, Search, ListOrdered, Download } from "lucide-react";
 import { api } from "../api/client";
 import type {
   CustomerDetail,
@@ -20,6 +20,7 @@ import { fmtCurrency } from "../utils/format";
 type Option = { value: string; label: string };
 type CustomerRow = { id: string; display: string; ordersOnDate: number };
 type OrderFilter = "all" | "with" | "without";
+
 
 const selectStyles = {
   control: (base: any) => ({
@@ -80,6 +81,8 @@ export function RouteOverviewScreen({ onOpenOrder }: RouteOverviewProps = {}) {
   // customer") — same shape as the modal's list but surfaced inline below
   // the customer info panel.
   const [drillOrders, setDrillOrders] = useState<SalesOrderSearchResult[]>([]);
+  // Export-to-CSV state for the "download all routes for this date" button.
+  const [isExporting, setIsExporting] = useState(false);
   const [customerDetail, setCustomerDetail] = useState<CustomerDetail | null>(null);
   const [orders, setOrders] = useState<HistoricalOrder[]>([]);
   const [suggestions, setSuggestions] = useState<OrderSuggestion[]>([]);
@@ -219,6 +222,17 @@ export function RouteOverviewScreen({ onOpenOrder }: RouteOverviewProps = {}) {
       });
   }, [customers, search, orderFilter]);
 
+  async function handleExport() {
+    setIsExporting(true);
+    try {
+      await api.exportOrdersPerDayXlsx(selectedDate);
+    } catch (e: any) {
+      setError(`Export failed: ${e?.message ?? e}`);
+    } finally {
+      setIsExporting(false);
+    }
+  }
+
   const totalOrders = useMemo(
     () => customers.reduce((sum, c) => sum + c.ordersOnDate, 0),
     [customers]
@@ -261,6 +275,16 @@ export function RouteOverviewScreen({ onOpenOrder }: RouteOverviewProps = {}) {
             </label>
             <DateInput value={selectedDate} onChange={setSelectedDate} />
           </div>
+
+          <button
+            onClick={handleExport}
+            disabled={isExporting}
+            title="Download CSV of order counts for every route on this date (opens in Excel)"
+            className="inline-flex items-center gap-1 px-3 py-2 text-xs font-semibold bg-emerald-600 text-white rounded shadow-sm hover:bg-emerald-700 disabled:opacity-60 disabled:cursor-not-allowed self-end"
+          >
+            <Download className="w-3 h-3" />
+            {isExporting ? "Exporting…" : "Export (all routes)"}
+          </button>
         </div>
 
         {error && (

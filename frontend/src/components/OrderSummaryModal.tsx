@@ -134,26 +134,38 @@ export function OrderSummaryModal({ orderNo, onClose, onEdit }: Props) {
                   </tr>
                 </thead>
                 <tbody>
-                  {detail.lines.map((l, i) => (
-                    <tr key={i} className="border-b border-gray-100">
-                      <td className="px-3 py-1.5 font-mono text-gray-800">{l.stock_code}</td>
-                      <td className="px-3 py-1.5 text-gray-700 truncate max-w-[22rem]">
-                        {l.item_description || l.description}
-                      </td>
-                      <td className="px-3 py-1.5 text-right font-mono text-gray-900">
-                        {l.quantity.toLocaleString()}
-                      </td>
-                      <td className="px-3 py-1.5 text-right font-mono text-gray-900">
-                        {fmtCurrency(l.unit_price)}
-                      </td>
-                      <td className="px-3 py-1.5 text-right font-mono text-gray-900">
-                        {fmtCurrency(l.unit_price_incl)}
-                      </td>
-                      <td className="px-3 py-1.5 text-right font-mono text-gray-900">
-                        {fmtCurrency(l.line_total_incl)}
-                      </td>
-                    </tr>
-                  ))}
+                  {detail.lines.map((l, i) => {
+                    const offPack =
+                      l.pack_size > 1 && l.quantity > 0 && l.quantity % l.pack_size !== 0;
+                    return (
+                      <tr key={i} className="border-b border-gray-100">
+                        <td className="px-3 py-1.5 font-mono text-gray-800">{l.stock_code}</td>
+                        <td className="px-3 py-1.5 text-gray-700 truncate max-w-[22rem]">
+                          {l.item_description || l.description}
+                        </td>
+                        <td className="px-3 py-1.5 text-right font-mono text-gray-900">
+                          {l.quantity.toLocaleString()}
+                          {offPack && (
+                            <div
+                              className="text-[9px] text-amber-700 font-semibold leading-tight"
+                              title={`Pack size is ${l.pack_size} — this line was ordered off-pack`}
+                            >
+                              off-pack · ×{l.pack_size}
+                            </div>
+                          )}
+                        </td>
+                        <td className="px-3 py-1.5 text-right font-mono text-gray-900">
+                          {fmtCurrency(l.unit_price)}
+                        </td>
+                        <td className="px-3 py-1.5 text-right font-mono text-gray-900">
+                          {fmtCurrency(l.unit_price_incl)}
+                        </td>
+                        <td className="px-3 py-1.5 text-right font-mono text-gray-900">
+                          {fmtCurrency(l.line_total_incl)}
+                        </td>
+                      </tr>
+                    );
+                  })}
                 </tbody>
                 <tfoot className="bg-gray-50 border-t border-gray-300">
                   <tr>

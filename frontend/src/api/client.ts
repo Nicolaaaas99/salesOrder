@@ -148,6 +148,23 @@ export const api = {
       })
       .then((r) => r.data),
 
+  /** Download the xlsx workbook of all customer order counts for a date.
+   *  Triggers a browser download — fetched as a binary blob so our auth
+   *  interceptor still attaches the Bearer token. */
+  exportOrdersPerDayXlsx: async (date: string) => {
+    const resp = await http.get<Blob>("/history/export-orders-per-day", {
+      params: { date },
+      responseType: "blob",
+    });
+    const blob = resp.data;
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `orders-per-day-${date}.xlsx`;
+    a.click();
+    URL.revokeObjectURL(url);
+  },
+
   listHistoryOrders: (customerId: string) =>
     http
       .get<HistoricalOrder[]>("/history/orders", { params: { customer_id: customerId } })

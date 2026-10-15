@@ -317,6 +317,7 @@ DETAIL_LINES_SQL = """
         il.fLineDiscount           AS discount_percent,
         si.Code                    AS stock_code,
         si.Description_1           AS item_description,
+        ISNULL(si.ulIIPerCrate, 1) AS pack_size,
         w.Code                     AS warehouse_code,
         p.ProjectCode              AS project_code
     FROM _btblInvoiceLines il
@@ -371,6 +372,7 @@ def _load_sales_order(order_no: str, db: Session) -> schemas.SalesOrderDetail:
             tax_type_id=int(r["tax_type_id"]) if r["tax_type_id"] else None,
             discount_percent=float(r["discount_percent"] or 0),
             project_code=r["project_code"] or "",
+            pack_size=int(r["pack_size"] or 1),
         )
         for r in line_rows
     ]

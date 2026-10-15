@@ -1,5 +1,5 @@
 import { useEffect, useRef } from "react";
-import { ArrowRight, Trash2, Plus, ListOrdered } from "lucide-react";
+import { ArrowRight, Trash2, Plus, ListOrdered, Lock, Unlock } from "lucide-react";
 import type {
   CustomerDetail,
   InventoryItem,
@@ -118,7 +118,7 @@ export function DraftOrderPanel({
               <tr className="text-gray-500 border-b bg-gray-50">
                 <th className="text-left py-1 px-1 font-medium">Item</th>
                 <th className="text-center py-1 px-1 font-medium w-[55px]">Pack</th>
-                <th className="text-center py-1 px-1 font-medium w-[37px]">Qty</th>
+                <th className="text-center py-1 px-1 font-medium w-[45px] whitespace-nowrap">Units</th>
                 <th className="text-center py-0.5 px-1 font-medium w-[40px] leading-tight">
                   <div>Price</div>
                   <div className="text-[9px] font-normal text-gray-500">(excl)</div>
@@ -200,14 +200,51 @@ export function DraftOrderPanel({
                       {line.pack_size > 1 ? `× ${line.pack_size}` : ""}
                     </td>
                     <td className="py-1 px-1" data-qty>
-                      <NumberCell
-                        value={line.quantity}
-                        snapStep={line.pack_size > 1 ? line.pack_size : undefined}
-                        cursorToEnd
-                        onChange={(v) => onUpdateLine(i, { quantity: v })}
-                        className="w-full text-right border border-gray-200 rounded px-1 py-0.5 text-sm font-semibold focus:border-blue-500 focus:outline-none bg-white"
-                        placeholder=""
-                      />
+                      <div className="flex items-center gap-0.5">
+                        {line.pack_size > 1 && (
+                          <button
+                            type="button"
+                            onClick={() =>
+                              onUpdateLine(i, { pack_override: !line.pack_override })
+                            }
+                            title={
+                              line.pack_override
+                                ? "Pack size override is ON — click to re-enable pack snapping"
+                                : "Click to allow a non-pack-multiple qty"
+                            }
+                            className={`flex-shrink-0 p-0.5 rounded ${
+                              line.pack_override
+                                ? "text-amber-600 hover:bg-amber-50"
+                                : "text-gray-300 hover:text-gray-500 hover:bg-gray-50"
+                            }`}
+                          >
+                            {line.pack_override ? (
+                              <Unlock className="w-3 h-3" />
+                            ) : (
+                              <Lock className="w-3 h-3" />
+                            )}
+                          </button>
+                        )}
+                        <NumberCell
+                          value={line.quantity}
+                          snapStep={
+                            line.pack_override || line.pack_size <= 1
+                              ? undefined
+                              : line.pack_size
+                          }
+                          cursorToEnd
+                          onChange={(v) => onUpdateLine(i, { quantity: v })}
+                          className="w-full text-right border border-gray-200 rounded px-1 py-0.5 text-sm font-semibold focus:border-blue-500 focus:outline-none bg-white"
+                          placeholder=""
+                        />
+                      </div>
+                      {line.pack_size > 1 &&
+                        line.quantity > 0 &&
+                        line.quantity % line.pack_size !== 0 && (
+                          <div className="text-[9px] text-amber-700 font-semibold leading-tight mt-0.5">
+                            off-pack
+                          </div>
+                        )}
                     </td>
                     <td className="py-1 px-1">
                       <NumberCell

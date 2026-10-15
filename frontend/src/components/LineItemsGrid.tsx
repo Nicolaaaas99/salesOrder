@@ -1,4 +1,5 @@
 import { useEffect, useRef } from "react";
+import { Lock, Unlock } from "lucide-react";
 import type { Warehouse, TaxType } from "../api/types";
 import { api } from "../api/client";
 import { ItemPicker } from "./ItemPicker";
@@ -28,6 +29,10 @@ export type LineRow = {
   discount_percent: number;
   project_code: string;
   pack_size: number;      // qty must be a multiple of this (1 = no constraint)
+  /** When true, the Qty input stops snapping to `pack_size`. Lets the rep
+   *  intentionally order a non-pack-multiple (e.g. 7 of a 12-pack item for a
+   *  spaza shop). Visually flagged in the UI. */
+  pack_override: boolean;
 };
 
 export function makeEmptyLine(defaultTaxTypeId: number | null = null): LineRow {
@@ -50,6 +55,7 @@ export function makeEmptyLine(defaultTaxTypeId: number | null = null): LineRow {
     discount_percent: 0,
     project_code: "",
     pack_size: 1,
+    pack_override: false,
   };
 }
 
@@ -464,13 +470,53 @@ export function LineItemsGrid({
                     {hasItem && line.pack_size > 1 ? `× ${line.pack_size}` : ""}
                   </td>
                   <td>
-                    <NumberCell
-                      className="cell-input num"
-                      value={line.quantity}
-                      disabled={cellsDisabled}
-                      snapStep={line.pack_size > 1 ? line.pack_size : undefined}
-                      onChange={(v) => updateLine(i, { quantity: v })}
-                    />
+                    <div className="flex items-center gap-0.5">
+                      <NumberCell
+                        className="cell-input num"
+                        value={line.quantity}
+                        disabled={cellsDisabled}
+                        snapStep={
+                          line.pack_override || line.pack_size <= 1
+                            ? undefined
+                            : line.pack_size
+                        }
+                        onChange={(v) => updateLine(i, { quantity: v })}
+                      />
+                      {line.pack_size > 1 && (
+                        <button
+                          type="button"
+                          disabled={cellsDisabled}
+                          onClick={() =>
+                            updateLine(i, { pack_override: !line.pack_override })
+                          }
+                          title={
+                            line.pack_override
+                              ? "Pack size override is ON — click to re-enable pack snapping"
+                              : "Click to allow a non-pack-multiple qty"
+                          }
+                          className={`flex-shrink-0 p-0.5 rounded ${
+                            cellsDisabled
+                              ? "text-gray-200 cursor-not-allowed"
+                              : line.pack_override
+                              ? "text-amber-600 hover:bg-amber-50"
+                              : "text-gray-300 hover:text-gray-500 hover:bg-gray-50"
+                          }`}
+                        >
+                          {line.pack_override ? (
+                            <Unlock className="w-3 h-3" />
+                          ) : (
+                            <Lock className="w-3 h-3" />
+                          )}
+                        </button>
+                      )}
+                    </div>
+                    {line.pack_size > 1 &&
+                      line.quantity > 0 &&
+                      line.quantity % line.pack_size !== 0 && (
+                        <div className="text-[9px] text-amber-700 font-semibold leading-tight mt-0.5">
+                          off-pack
+                        </div>
+                      )}
                   </td>
                   <td>{line.is_uom_item ? line.uom : ""}</td>
                   <td>

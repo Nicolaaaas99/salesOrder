@@ -121,6 +121,7 @@ export type SalesOrderLineDetail = {
   tax_type_id: number | null;
   discount_percent: number;
   project_code: string;
+  pack_size: number;
 };
 
 export type SalesOrderDetail = {
@@ -147,6 +148,13 @@ export type SalesOrderDetail = {
 export type HistoryRoute = { id: string; display: string };
 export type HistoryCustomer = { id: string; display: string };
 export type CustomerOrderCount = { account: string; order_count: number };
+export type CustomerOrderCountRow = {
+  order_date: string | null;
+  route: string;
+  account: string;
+  customer_name: string;
+  order_count: number;
+};
 
 export type HistoricalOrderLine = {
   stockCode: string;

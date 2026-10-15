@@ -76,8 +76,12 @@ function detailToLines(detail: SalesOrderDetail, cust: CustomerDetail): LineRow[
     tax_type_id: l.tax_type_id,
     discount_percent: l.discount_percent || 0,
     project_code: l.project_code || "",
-    // Resolved after load (see effect in SalesOrderScreen)
+    // Resolved after load (see effect in SalesOrderScreen); if the loaded qty
+    // turns out to be non-pack-multiple once pack_size resolves, the effect
+    // flips pack_override on so the chip + unlocked snapping behaviour both
+    // match the saved intent.
     pack_size: 1,
+    pack_override: false,
   }));
 }
 
@@ -192,9 +196,10 @@ export function SalesOrderScreen({
         setLines((prev) =>
           prev.map((l) => {
             const pack = map[l.stock_code];
-            return pack && pack > 1 && (!l.pack_size || l.pack_size === 1)
-              ? { ...l, pack_size: pack }
-              : l;
+            if (!pack || pack <= 1) return l;
+            if (l.pack_size && l.pack_size !== 1) return l;
+            const offPack = l.quantity > 0 && l.quantity % pack !== 0;
+            return { ...l, pack_size: pack, pack_override: l.pack_override || offPack };
           }),
         );
       })
