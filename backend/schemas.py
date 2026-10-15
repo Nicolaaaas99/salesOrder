@@ -153,6 +153,12 @@ class SalesOrderLineDetail(BaseModel):
     # excl × (1+rate) when the price list overrides it). Used by the frontend
     # to display Incl mode exactly without floating-point drift.
     unit_price_incl: float = 0.0
+    # Stored line totals — Evolution's authoritative values. Prefer these
+    # over `qty × unit_price_incl` on the frontend to avoid cumulative
+    # rounding drift (e.g. 12 × R9.19 = R110.28, but Evolution stored R110.26).
+    line_total_excl: float = 0.0
+    line_total_tax: float = 0.0
+    line_total_incl: float = 0.0
     tax_type_id: Optional[int] = None
     discount_percent: float = 0.0
     project_code: str = ""

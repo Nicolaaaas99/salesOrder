@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import Select from "react-select";
-import { Truck, Calendar, XCircle, FileText, ArrowLeft, Search, ListOrdered, ExternalLink } from "lucide-react";
+import { Truck, Calendar, XCircle, FileText, ArrowLeft, Search, ListOrdered } from "lucide-react";
 import { api } from "../api/client";
 import type {
   CustomerDetail,
@@ -11,6 +11,8 @@ import type {
 import { HistoryGrid } from "./HistoryGrid";
 import { CreditStatus } from "./CreditStatus";
 import { DateInput } from "./DateInput";
+import { OrdersModal } from "./OrdersModal";
+import { OrderSummaryModal } from "./OrderSummaryModal";
 import { productKey } from "../utils/history";
 import { today } from "../utils/date";
 import { fmtCurrency } from "../utils/format";
@@ -66,10 +68,18 @@ export function RouteOverviewScreen({ onOpenOrder }: RouteOverviewProps = {}) {
   const [drillCustomer, setDrillCustomer] = useState<{ id: string; display: string } | null>(null);
 
   // Orders modal — when set, show the orders placed by this customer on the
-  // selected date, with a "Go to source" link to edit each one.
+  // selected date.
   const [viewingOrdersFor, setViewingOrdersFor] = useState<{ id: string; display: string } | null>(null);
   const [orderList, setOrderList] = useState<SalesOrderSearchResult[]>([]);
   const [isLoadingOrderList, setIsLoadingOrderList] = useState(false);
+  // When the user picks a specific order to view the detail of, we open the
+  // read-only summary modal. Route Overview supplies an onEdit callback so
+  // Unprocessed orders can be opened for editing in the Sales Order Entry tab.
+  const [viewingSummaryOf, setViewingSummaryOf] = useState<string | null>(null);
+  // Separate orders list for the drill-in view ("orders on this date for this
+  // customer") — same shape as the modal's list but surfaced inline below
+  // the customer info panel.
+  const [drillOrders, setDrillOrders] = useState<SalesOrderSearchResult[]>([]);
   const [customerDetail, setCustomerDetail] = useState<CustomerDetail | null>(null);
   const [orders, setOrders] = useState<HistoricalOrder[]>([]);
   const [suggestions, setSuggestions] = useState<OrderSuggestion[]>([]);
@@ -124,33 +134,40 @@ export function RouteOverviewScreen({ onOpenOrder }: RouteOverviewProps = {}) {
     })();
   }, [selectedRoute, selectedDate]);
 
-  // Fetch history/suggestions/detail when drilling into a customer.
+  // Fetch history/suggestions/detail when drilling into a customer. Also fetch
+  // the orders for the selected date so the right-side panel can list them
+  // beneath the customer info.
   useEffect(() => {
     if (!drillCustomer) {
       setOrders([]);
       setSuggestions([]);
       setCustomerDetail(null);
+      setDrillOrders([]);
       return;
     }
     (async () => {
       setIsLoadingOrders(true);
       setError(null);
       try {
-        const [ordersData, suggestionsData, detail] = await Promise.all([
+        const [ordersData, suggestionsData, detail, dayOrders] = await Promise.all([
           api.listHistoryOrders(drillCustomer.id),
           api.listOrderSuggestions(drillCustomer.id),
           api.getCustomer(drillCustomer.id).catch(() => null),
+          api
+            .listOrdersByOrderDate(drillCustomer.id, selectedDate)
+            .catch(() => [] as SalesOrderSearchResult[]),
         ]);
         setOrders(ordersData);
         setSuggestions(suggestionsData);
         setCustomerDetail(detail);
+        setDrillOrders(dayOrders);
       } catch {
         setError("Failed to load history / suggestions.");
       } finally {
         setIsLoadingOrders(false);
       }
     })();
-  }, [drillCustomer]);
+  }, [drillCustomer, selectedDate]);
 
   // Fetch orders for the chosen customer+date when the modal opens.
   useEffect(() => {
@@ -292,7 +309,16 @@ export function RouteOverviewScreen({ onOpenOrder }: RouteOverviewProps = {}) {
                 suggestions={suggestionsMap}
                 heightStyle="100%"
               />
-              <CustomerInfoPanel customer={customerDetail} />
+              <div className="flex flex-col gap-2 min-h-0">
+                <div className="flex-1 min-h-0">
+                  <CustomerInfoPanel customer={customerDetail} />
+                </div>
+                <OrdersOnDatePanel
+                  date={selectedDate}
+                  orders={drillOrders}
+                  onViewOrder={(no) => setViewingSummaryOf(no)}
+                />
+              </div>
             </div>
           </>
         )}
@@ -305,10 +331,19 @@ export function RouteOverviewScreen({ onOpenOrder }: RouteOverviewProps = {}) {
           orders={orderList}
           isLoading={isLoadingOrderList}
           onClose={() => setViewingOrdersFor(null)}
-          onOpenOrder={
+          onViewOrder={(no) => setViewingSummaryOf(no)}
+        />
+      )}
+
+      {viewingSummaryOf && (
+        <OrderSummaryModal
+          orderNo={viewingSummaryOf}
+          onClose={() => setViewingSummaryOf(null)}
+          onEdit={
             onOpenOrder
               ? (no) => {
                   onOpenOrder(no);
+                  setViewingSummaryOf(null);
                   setViewingOrdersFor(null);
                 }
               : undefined
@@ -544,96 +579,52 @@ function InfoRow({
   );
 }
 
-type OrdersModalProps = {
-  customer: { id: string; display: string };
+function OrdersOnDatePanel({
+  date,
+  orders,
+  onViewOrder,
+}: {
   date: string;
   orders: SalesOrderSearchResult[];
-  isLoading: boolean;
-  onClose: () => void;
-  onOpenOrder?: (orderNo: string) => void;
-};
-
-function OrdersModal({ customer, date, orders, isLoading, onClose, onOpenOrder }: OrdersModalProps) {
-  const total = orders.reduce((s, o) => s + (o.total_incl || 0), 0);
+  onViewOrder: (orderNo: string) => void;
+}) {
   return (
-    <div className="fixed inset-0 z-50 bg-black bg-opacity-30 flex items-center justify-center p-4">
-      <div className="bg-white rounded shadow-lg max-w-3xl w-full max-h-[80vh] flex flex-col overflow-hidden">
-        <div className="px-4 py-3 border-b bg-gray-50 flex items-start justify-between gap-2">
-          <div>
-            <div className="text-xs text-gray-500 uppercase tracking-wide">Orders on {date}</div>
-            <div className="text-sm font-semibold text-gray-900">{customer.id} · {customer.display}</div>
+    <div className="bg-white rounded border shadow-sm flex flex-col overflow-hidden flex-shrink-0 max-h-[40%]">
+      <div className="px-3 py-2 border-b border-gray-200 bg-gray-50 flex items-center justify-between">
+        <div>
+          <div className="text-xs font-semibold text-gray-700 uppercase tracking-wide">Orders on date</div>
+          <div className="text-xs text-gray-500">{date}</div>
+        </div>
+        <span className="text-[10px] font-semibold bg-emerald-100 text-emerald-800 border border-emerald-300 px-2 py-0.5 rounded-full">
+          {orders.length}
+        </span>
+      </div>
+      <div className="flex-1 overflow-auto">
+        {orders.length === 0 ? (
+          <div className="h-16 flex items-center justify-center text-xs text-gray-400 px-3 text-center">
+            No orders on this date.
           </div>
-          <button
-            onClick={onClose}
-            className="text-gray-400 hover:text-gray-700 text-xl leading-none px-2"
-            title="Close"
-          >
-            ×
-          </button>
-        </div>
-
-        <div className="flex-1 overflow-auto">
-          {isLoading ? (
-            <div className="h-32 flex items-center justify-center text-sm text-gray-500">Loading…</div>
-          ) : orders.length === 0 ? (
-            <div className="h-32 flex items-center justify-center text-sm text-gray-500">
-              No orders found for this customer on {date}.
-            </div>
-          ) : (
-            <table className="w-full text-xs border-collapse">
-              <thead className="bg-gray-100 sticky top-0 z-10">
-                <tr className="text-gray-700 border-b border-gray-300">
-                  <th className="text-left px-3 py-1.5 font-semibold">Order #</th>
-                  <th className="text-left px-3 py-1.5 font-semibold">Description</th>
-                  <th className="text-left px-3 py-1.5 font-semibold">Status</th>
-                  <th className="text-right px-3 py-1.5 font-semibold">Total (incl)</th>
-                  <th className="w-28"></th>
-                </tr>
-              </thead>
-              <tbody>
-                {orders.map((o) => (
-                  <tr key={o.order_no} className="border-b border-gray-100 hover:bg-blue-50">
-                    <td className="px-3 py-1.5 font-mono text-gray-800">{o.order_no}</td>
-                    <td className="px-3 py-1.5 text-gray-700 truncate max-w-[16rem]" title={o.description}>
-                      {o.description || "—"}
-                    </td>
-                    <td className="px-3 py-1.5 text-gray-700">
-                      {o.doc_state_label}
-                      {o.is_archived && (
-                        <span className="ml-1 text-[10px] bg-gray-200 text-gray-700 rounded px-1">archived</span>
-                      )}
-                    </td>
-                    <td className="px-3 py-1.5 text-right font-mono text-gray-900">
-                      {o.total_incl.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-                    </td>
-                    <td className="px-3 py-1.5 text-right">
-                      {onOpenOrder && (
-                        <button
-                          onClick={() => onOpenOrder(o.order_no)}
-                          className="inline-flex items-center gap-1 text-xs text-blue-600 hover:text-blue-800 underline"
-                        >
-                          <ExternalLink className="w-3 h-3" />
-                          Go to source
-                        </button>
-                      )}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-              <tfoot>
-                <tr className="border-t border-gray-300 bg-gray-50">
-                  <td className="px-3 py-1.5 font-semibold text-gray-700" colSpan={3}>
-                    {orders.length} order{orders.length === 1 ? "" : "s"}
-                  </td>
-                  <td className="px-3 py-1.5 text-right font-mono font-semibold text-gray-900">
-                    {total.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-                  </td>
-                  <td></td>
-                </tr>
-              </tfoot>
-            </table>
-          )}
-        </div>
+        ) : (
+          <ul className="divide-y divide-gray-100">
+            {orders.map((o) => (
+              <li key={o.order_no}>
+                <button
+                  onClick={() => onViewOrder(o.order_no)}
+                  className="w-full text-left px-3 py-1.5 hover:bg-blue-50 flex items-center justify-between gap-2"
+                >
+                  <div className="min-w-0">
+                    <div className="font-mono text-xs text-gray-800 truncate">{o.order_no}</div>
+                    <div className="text-[10px] text-gray-500">{o.doc_state_label}</div>
+                  </div>
+                  <div className="text-xs font-mono text-gray-900 text-right whitespace-nowrap">
+                    {o.total_incl.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                    <span className="text-[9px] text-gray-500 ml-1">incl</span>
+                  </div>
+                </button>
+              </li>
+            ))}
+          </ul>
+        )}
       </div>
     </div>
   );

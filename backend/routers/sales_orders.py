@@ -303,19 +303,22 @@ DETAIL_HEADER_SQL = """
 
 DETAIL_LINES_SQL = """
     SELECT
-        il.iStockCodeID     AS stock_id,
-        il.iWarehouseID     AS warehouse_id,
-        il.iLineProjectID   AS project_id,
-        il.iTaxTypeID       AS tax_type_id,
-        il.cDescription     AS description,
-        il.fQuantity        AS quantity,
-        il.fUnitPriceExcl   AS unit_price_excl,
-        il.fUnitPriceIncl   AS unit_price_incl,
-        il.fLineDiscount    AS discount_percent,
-        si.Code             AS stock_code,
-        si.Description_1    AS item_description,
-        w.Code              AS warehouse_code,
-        p.ProjectCode       AS project_code
+        il.iStockCodeID            AS stock_id,
+        il.iWarehouseID            AS warehouse_id,
+        il.iLineProjectID          AS project_id,
+        il.iTaxTypeID              AS tax_type_id,
+        il.cDescription            AS description,
+        il.fQuantity               AS quantity,
+        il.fUnitPriceExcl          AS unit_price_excl,
+        il.fUnitPriceIncl          AS unit_price_incl,
+        il.fQuantityLineTotExcl    AS line_total_excl,
+        il.fQuantityLineTaxAmount  AS line_total_tax,
+        il.fQuantityLineTotIncl    AS line_total_incl,
+        il.fLineDiscount           AS discount_percent,
+        si.Code                    AS stock_code,
+        si.Description_1           AS item_description,
+        w.Code                     AS warehouse_code,
+        p.ProjectCode              AS project_code
     FROM _btblInvoiceLines il
     LEFT JOIN StkItem si ON si.StockLink = il.iStockCodeID
     LEFT JOIN WhseMst w ON w.WhseLink = il.iWarehouseID
@@ -359,6 +362,12 @@ def _load_sales_order(order_no: str, db: Session) -> schemas.SalesOrderDetail:
             # List / Evolution stored for incl.
             unit_price=float(r["unit_price_excl"] or 0),
             unit_price_incl=float(r["unit_price_incl"] or 0),
+            # Line totals as stored by Evolution — avoids rounding drift from
+            # multiplying rounded unit prices on the frontend (e.g. 12 * R9.19
+            # = R110.28, but Evolution's stored total is R110.26).
+            line_total_excl=float(r["line_total_excl"] or 0),
+            line_total_tax=float(r["line_total_tax"] or 0),
+            line_total_incl=float(r["line_total_incl"] or 0),
             tax_type_id=int(r["tax_type_id"]) if r["tax_type_id"] else None,
             discount_percent=float(r["discount_percent"] or 0),
             project_code=r["project_code"] or "",

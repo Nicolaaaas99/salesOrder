@@ -1,5 +1,5 @@
 import { useEffect, useRef } from "react";
-import { ArrowRight, Trash2, Plus } from "lucide-react";
+import { ArrowRight, Trash2, Plus, ListOrdered } from "lucide-react";
 import type {
   CustomerDetail,
   InventoryItem,
@@ -31,6 +31,10 @@ type Props = {
   /** Object identity bumps whenever a line is added/merged; the Qty cell at
    *  `idx` is then focused + scrolled into view. */
   focusTarget?: { idx: number } | null;
+  /** When set, the credit area shows a green "N today" pill. Clicking it
+   *  calls `onShowOrdersToday`. */
+  ordersTodayCount?: number;
+  onShowOrdersToday?: () => void;
 };
 
 const taxMode: TaxMode = "Exclusive";
@@ -45,6 +49,8 @@ export function DraftOrderPanel({
   onContinue,
   taxTypes,
   focusTarget,
+  ordersTodayCount,
+  onShowOrdersToday,
 }: Props) {
   const totals = orderTotals(lines, taxTypes, taxMode, 0);
 
@@ -293,6 +299,18 @@ export function DraftOrderPanel({
       {customer && (
         <div className="border-t border-gray-200 px-2 py-2">
           <CreditStatus customer={customer} currentOrderIncl={totals.incl} compact />
+          {ordersTodayCount !== undefined && ordersTodayCount > 0 && onShowOrdersToday && (
+            <div className="mt-2 flex justify-end">
+              <button
+                onClick={onShowOrdersToday}
+                className="inline-flex items-center gap-1 text-[10px] font-semibold bg-emerald-100 text-emerald-800 border border-emerald-300 px-2 py-0.5 rounded-full hover:bg-emerald-200"
+                title="View orders placed today for this customer"
+              >
+                <ListOrdered className="w-3 h-3" />
+                {ordersTodayCount} today
+              </button>
+            </div>
+          )}
         </div>
       )}
 

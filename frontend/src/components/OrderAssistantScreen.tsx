@@ -7,11 +7,15 @@ import type {
   HistoricalOrder,
   InventoryItem,
   OrderSuggestion,
+  SalesOrderSearchResult,
   TaxType,
 } from "../api/types";
 import { HistoryGrid } from "./HistoryGrid";
 import { DraftOrderPanel, type DraftLine } from "./DraftOrderPanel";
+import { OrdersModal } from "./OrdersModal";
+import { OrderSummaryModal } from "./OrderSummaryModal";
 import { productKey, type CategoryProduct } from "../utils/history";
+import { today } from "../utils/date";
 import { makeEmptyLine, pickDefaultWarehouse, snapToPack } from "./LineItemsGrid";
 import { SalesOrderScreen } from "./SalesOrderScreen";
 
@@ -118,6 +122,13 @@ export function OrderAssistantScreen() {
   // When the user clicks a customer that already has orders today, we hold the
   // pending pick here while asking for confirmation.
   const [pendingCustomerPick, setPendingCustomerPick] = useState<Option | null>(null);
+
+  // Orders-today modal state for the SELECTED customer. Opens from the pill
+  // in the draft panel; is view-only (no edit).
+  const [showOrdersToday, setShowOrdersToday] = useState(false);
+  const [ordersTodayList, setOrdersTodayList] = useState<SalesOrderSearchResult[]>([]);
+  const [isLoadingOrdersToday, setIsLoadingOrdersToday] = useState(false);
+  const [viewingSummaryOf, setViewingSummaryOf] = useState<string | null>(null);
 
   const [customerDetail, setCustomerDetail] = useState<CustomerDetail | null>(
     null
@@ -454,6 +465,25 @@ export function OrderAssistantScreen() {
 
   const handleFinalizeClose = useCallback(() => setFinalizeOpen(false), []);
 
+  // Fetch today's orders for the selected customer when the modal opens.
+  useEffect(() => {
+    if (!showOrdersToday || !selectedCustomer) {
+      setOrdersTodayList([]);
+      return;
+    }
+    (async () => {
+      setIsLoadingOrdersToday(true);
+      try {
+        const data = await api.listOrdersByOrderDate(selectedCustomer.value, today());
+        setOrdersTodayList(data);
+      } catch {
+        setOrdersTodayList([]);
+      } finally {
+        setIsLoadingOrdersToday(false);
+      }
+    })();
+  }, [showOrdersToday, selectedCustomer]);
+
   const handleFinalizePlaced = useCallback(() => {
     // Soft reload: close the finalize sheet and clear the customer selection,
     // which cascades (via the selectedCustomer effect) to reset orders,
@@ -503,6 +533,28 @@ export function OrderAssistantScreen() {
             </div>
           </div>
         </div>
+      )}
+
+      {showOrdersToday && selectedCustomer && (
+        <OrdersModal
+          customer={{
+            id: selectedCustomer.value,
+            display: selectedCustomer.label.replace(/^[^—]+—\s*/, ""),
+          }}
+          date={today()}
+          orders={ordersTodayList}
+          isLoading={isLoadingOrdersToday}
+          onClose={() => setShowOrdersToday(false)}
+          onViewOrder={(no) => setViewingSummaryOf(no)}
+        />
+      )}
+
+      {viewingSummaryOf && (
+        <OrderSummaryModal
+          orderNo={viewingSummaryOf}
+          onClose={() => setViewingSummaryOf(null)}
+          // No onEdit — Order Assistant context is view-only, no "go to source".
+        />
       )}
 
       <div className="max-w-[1600px] mx-auto w-full flex-1 min-h-0 flex flex-col gap-2">
@@ -610,6 +662,10 @@ export function OrderAssistantScreen() {
               onContinue={handleContinue}
               taxTypes={taxTypes}
               focusTarget={focusTarget}
+              ordersTodayCount={
+                selectedCustomer ? ordersTodayMap.get(selectedCustomer.value) : undefined
+              }
+              onShowOrdersToday={() => setShowOrdersToday(true)}
             />
           </div>
         </div>

@@ -112,6 +112,12 @@ export type SalesOrderLineDetail = {
   quantity: number;
   unit_price: number;        // always excl
   unit_price_incl: number;   // actual incl from Price List / Evolution
+  // Stored line totals from Evolution — use these in read-only displays
+  // (OrderSummaryModal) so the sums match Evolution exactly without
+  // rounding drift from multiplying unit × qty on the frontend.
+  line_total_excl: number;
+  line_total_tax: number;
+  line_total_incl: number;
   tax_type_id: number | null;
   discount_percent: number;
   project_code: string;
