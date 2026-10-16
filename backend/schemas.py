@@ -12,11 +12,16 @@ class LoginResponse(BaseModel):
     token: str
     username: str
     default_warehouse_code: Optional[str] = None
+    # Mirrors OrdersDf.bForceExtOrderNum — when True, the frontend blocks
+    # saving an order without an External Order number and the backend
+    # rejects such payloads defensively.
+    force_ext_order_num: bool = False
 
 
 class MeResponse(BaseModel):
     username: str
     default_warehouse_code: Optional[str] = None
+    force_ext_order_num: bool = False
 
 
 class CustomerSummary(BaseModel):
@@ -27,10 +32,12 @@ class CustomerSummary(BaseModel):
 class CustomerDetail(BaseModel):
     account: str
     name: str
+    route: str = ""
     delivery_address: str = ""
     postal_address: str = ""
     contact_name: str = ""
     contact_tel: str = ""
+    contact_tel2: str = ""
     contact_email: str = ""
     default_tax_type_id: Optional[int] = None
     credit_limit: float = 0.0

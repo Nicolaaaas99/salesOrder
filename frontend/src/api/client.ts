@@ -68,6 +68,7 @@ export type LoginResponse = {
   token: string;
   username: string;
   default_warehouse_code: string | null;
+  force_ext_order_num: boolean;
 };
 
 export const auth = {
@@ -78,13 +79,17 @@ export const auth = {
   logout: () => http.post("/auth/logout").then((r) => r.data),
   me: () =>
     http
-      .get<{ username: string; default_warehouse_code: string | null }>("/auth/me")
+      .get<{
+        username: string;
+        default_warehouse_code: string | null;
+        force_ext_order_num: boolean;
+      }>("/auth/me")
       .then((r) => r.data),
 };
 
 export const api = {
-  searchCustomers: (q: string) =>
-    http.get<CustomerSummary[]>("/lookups/customers", { params: { q, limit: 50 } }).then((r) => r.data),
+  searchCustomers: (q: string, limit = 50) =>
+    http.get<CustomerSummary[]>("/lookups/customers", { params: { q, limit } }).then((r) => r.data),
 
   getCustomer: (account: string) =>
     http.get<CustomerDetail>(`/lookups/customers/${encodeURIComponent(account)}`).then((r) => r.data),

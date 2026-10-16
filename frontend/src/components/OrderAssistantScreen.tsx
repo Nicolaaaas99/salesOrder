@@ -1,6 +1,7 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Select from "react-select";
-import { Truck, Users, XCircle } from "lucide-react";
+import AsyncSelect from "react-select/async";
+import { Truck, Users, XCircle, User, Phone, Mail } from "lucide-react";
 import { api } from "../api/client";
 import type {
   CustomerDetail,
@@ -116,7 +117,6 @@ function draftFromInventoryItem(
 export function OrderAssistantScreen() {
   const { defaultWarehouseCode } = useAuth();
   const [routes, setRoutes] = useState<Option[]>([]);
-  const [customers, setCustomers] = useState<Option[]>([]);
   const [selectedRoute, setSelectedRoute] = useState<Option | null>(null);
   const [selectedCustomer, setSelectedCustomer] = useState<Option | null>(null);
   // Customer → number of orders already placed TODAY on this route. Fetched
@@ -144,7 +144,6 @@ export function OrderAssistantScreen() {
   const [taxTypes, setTaxTypes] = useState<TaxType[]>([]);
 
   const [isLoadingRoutes, setIsLoadingRoutes] = useState(false);
-  const [isLoadingCustomers, setIsLoadingCustomers] = useState(false);
   const [isLoadingOrders, setIsLoadingOrders] = useState(false);
 
   const [error, setError] = useState<string | null>(null);
@@ -191,29 +190,74 @@ export function OrderAssistantScreen() {
     }
   }, []);
 
+  // One cache entry per route — fetched the first time the AsyncSelect's
+  // loader needs the route's customer list, then reused for subsequent
+  // keystrokes (we filter in-memory). Lives in a ref so the loader can read
+  // it synchronously without being tied to React state timing.
+  const routeCustomersCacheRef = useRef<Map<string, Option[]>>(new Map());
+
+  // Route change: refresh the orders-today map, and if the current customer
+  // isn't in the new route's list clear them. Doesn't touch customer on
+  // route-cleared (null) — that case is handled in the Route selector's
+  // onChange so we can distinguish "typed in customer dropdown" (keep
+  // customer) from "user clicked the X" (clear customer).
   useEffect(() => {
     if (!selectedRoute) {
-      setCustomers([]);
-      setSelectedCustomer(null);
-      setOrdersTodayMap(new Map());
+      refreshOrdersToday(undefined);
       return;
     }
-    (async () => {
-      setIsLoadingCustomers(true);
-      setError(null);
-      try {
-        const data = await api.listHistoryCustomers(selectedRoute.value);
-        // Prefix the account code so reps can search / scan on it.
-        setCustomers(data.map((c) => ({ value: c.id, label: `${c.id} — ${c.display}` })));
-      } catch {
-        setError("Failed to load customers.");
-      } finally {
-        setIsLoadingCustomers(false);
-      }
-    })();
     refreshOrdersToday(selectedRoute.value);
-    setSelectedCustomer(null);
+    let cancelled = false;
+    (async () => {
+      let list = routeCustomersCacheRef.current.get(selectedRoute.value);
+      if (!list) {
+        try {
+          const data = await api.listHistoryCustomers(selectedRoute.value);
+          list = data.map((c) => ({ value: c.id, label: `${c.id} — ${c.display}` }));
+          routeCustomersCacheRef.current.set(selectedRoute.value, list);
+        } catch {
+          list = [];
+        }
+      }
+      if (cancelled) return;
+      setSelectedCustomer((prev) =>
+        prev && list!.some((c) => c.value === prev.value) ? prev : null
+      );
+    })();
+    return () => {
+      cancelled = true;
+    };
   }, [selectedRoute, refreshOrdersToday]);
+
+  // AsyncSelect loader. For the route case we fetch once per route (cached in
+  // the ref above) and filter in-memory — one network call per route change,
+  // zero per keystroke. For the no-route case we hit the backend search per
+  // input (debounced by AsyncSelect) so the rep can find any customer.
+  const loadCustomerOptions = useCallback(
+    async (input: string): Promise<Option[]> => {
+      const term = input.trim().toLowerCase();
+      if (selectedRoute) {
+        let list = routeCustomersCacheRef.current.get(selectedRoute.value);
+        if (!list) {
+          try {
+            const data = await api.listHistoryCustomers(selectedRoute.value);
+            list = data.map((c) => ({ value: c.id, label: `${c.id} — ${c.display}` }));
+            routeCustomersCacheRef.current.set(selectedRoute.value, list);
+          } catch {
+            return [];
+          }
+        }
+        return term ? list.filter((o) => o.label.toLowerCase().includes(term)) : list;
+      }
+      try {
+        const data = await api.searchCustomers(term, 50);
+        return data.map((c) => ({ value: c.account, label: `${c.account} — ${c.name}` }));
+      } catch {
+        return [];
+      }
+    },
+    [selectedRoute],
+  );
 
   useEffect(() => {
     if (!selectedCustomer) {
@@ -238,6 +282,14 @@ export function OrderAssistantScreen() {
         setOrders(ordersData);
         setSuggestions(suggestionsData);
         setCustomerDetail(detail);
+
+        // When the customer carries an AR route and the dropdown isn't already
+        // on it, snap the Route selector to match. The route-watching effect
+        // below is adjusted so it won't clear the just-picked customer.
+        if (detail?.route && detail.route !== selectedRoute?.value) {
+          const match = routes.find((r) => r.value === detail.route);
+          if (match) setSelectedRoute(match);
+        }
 
         const codes = new Set<string>();
         suggestionsData.forEach((s) => codes.add(s.stock_code));
@@ -574,7 +626,15 @@ export function OrderAssistantScreen() {
             <Select
               options={routes}
               value={selectedRoute}
-              onChange={(opt) => setSelectedRoute(opt as Option | null)}
+              onChange={(opt) => {
+                const next = opt as Option | null;
+                setSelectedRoute(next);
+                // User explicitly cleared the Route → clear the customer too.
+                // (Typing in the customer dropdown ALSO clears the route, but
+                // via a separate handler that intentionally keeps the customer
+                // mid-search — so this branch only runs for the X click.)
+                if (!next) setSelectedCustomer(null);
+              }}
               placeholder="Search route..."
               isDisabled={isLoadingRoutes}
               isLoading={isLoadingRoutes}
@@ -589,13 +649,17 @@ export function OrderAssistantScreen() {
               <Users className="w-3 h-3 mr-1 text-green-600" />
               Customer
             </label>
-            <Select
-              options={customers}
+            <AsyncSelect
+              key={selectedRoute?.value ?? "all"}
+              cacheOptions={!!selectedRoute}
+              defaultOptions
+              loadOptions={loadCustomerOptions}
               value={selectedCustomer}
               onChange={(opt) => {
                 const next = opt as Option | null;
                 if (!next) {
                   setSelectedCustomer(null);
+                  setSelectedRoute(null);     // clearing the customer also clears the route
                   return;
                 }
                 const count = ordersTodayMap.get(next.value) ?? 0;
@@ -620,16 +684,66 @@ export function OrderAssistantScreen() {
                 );
               }}
               placeholder={
-                selectedRoute ? "Search customer..." : "Select route first"
+                selectedRoute ? "Search customer in route..." : "Search any customer..."
               }
-              isDisabled={!selectedRoute || isLoadingCustomers}
-              isLoading={isLoadingCustomers}
               styles={selectStyles}
-              isSearchable
               isClearable
             />
           </div>
         </div>
+
+        {customerDetail && (
+          <div className="bg-white rounded border px-3 py-1.5 shadow-sm flex items-center gap-4 text-xs flex-shrink-0">
+            <span className="flex items-center gap-1 text-gray-700 min-w-0">
+              <User className="w-3 h-3 text-gray-400 flex-shrink-0" />
+              <span className="font-semibold truncate" title={customerDetail.contact_name || "—"}>
+                {customerDetail.contact_name || "—"}
+              </span>
+            </span>
+            <span className="flex items-center gap-1 text-gray-700 min-w-0">
+              <Phone className="w-3 h-3 text-gray-400 flex-shrink-0" />
+              {customerDetail.contact_tel ? (
+                <a
+                  href={`tel:${customerDetail.contact_tel}`}
+                  className="font-mono hover:text-blue-600 truncate"
+                  title={`Phone 1: ${customerDetail.contact_tel}`}
+                >
+                  {customerDetail.contact_tel}
+                </a>
+              ) : (
+                <span className="text-gray-400">—</span>
+              )}
+            </span>
+            <span className="flex items-center gap-1 text-gray-700 min-w-0">
+              <Phone className="w-3 h-3 text-gray-400 flex-shrink-0" />
+              {customerDetail.contact_tel2 ? (
+                <a
+                  href={`tel:${customerDetail.contact_tel2}`}
+                  className="font-mono hover:text-blue-600 truncate"
+                  title={`Phone 2: ${customerDetail.contact_tel2}`}
+                >
+                  {customerDetail.contact_tel2}
+                </a>
+              ) : (
+                <span className="text-gray-400">—</span>
+              )}
+            </span>
+            <span className="flex items-center gap-1 text-gray-700 min-w-0 flex-1">
+              <Mail className="w-3 h-3 text-gray-400 flex-shrink-0" />
+              {customerDetail.contact_email ? (
+                <a
+                  href={`mailto:${customerDetail.contact_email}`}
+                  className="hover:text-blue-600 truncate"
+                  title={customerDetail.contact_email}
+                >
+                  {customerDetail.contact_email}
+                </a>
+              ) : (
+                <span className="text-gray-400">—</span>
+              )}
+            </span>
+          </div>
+        )}
 
         {error && (
           <div className="p-1 bg-red-100 border border-red-300 text-red-800 rounded flex items-center text-xs flex-shrink-0">

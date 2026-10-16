@@ -3,10 +3,15 @@ export type CustomerSummary = { account: string; name: string };
 export type CustomerDetail = {
   account: string;
   name: string;
+  /** The AR route this customer is linked to (Client.ulARRoute). Shown next
+   *  to contact info so reps know which route to adjust in master data when
+   *  a customer appears under the "wrong" route. */
+  route: string;
   delivery_address: string;
   postal_address: string;
   contact_name: string;
   contact_tel: string;
+  contact_tel2: string;
   contact_email: string;
   default_tax_type_id: number | null;
   credit_limit: number;

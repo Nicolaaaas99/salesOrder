@@ -109,9 +109,10 @@ GO
 CREATE OR ALTER VIEW dbo._vw_SOCustomerDetail AS
 SELECT
     C.Account, C.Name, C.DCLink,
+    C.ulARRoute AS Route,
     C.Physical1, C.Physical2, C.Physical3, C.Physical4, C.Physical5, C.PhysicalPC,
     C.Post1,     C.Post2,     C.Post3,     C.Post4,     C.Post5,     C.PostPC,
-    C.Contact_Person, C.Telephone, C.EMail,
+    C.Contact_Person, C.Telephone, C.Facsimile, C.EMail,
     C.iDefTaxTypeID,
     C.Credit_Limit,
     ISNULL(C.CheckTerms, 0)         AS CheckTerms,
@@ -388,7 +389,20 @@ WHERE AG.bAgentActive = 1
 GO
 
 -- =============================================================================
+-- 14. _vw_SOSalesOrderConfig  (single-row tenant config)
+--     Mirrors Evolution's OrdersDf.bForceExtOrderNum so the app can read the
+--     Evolution-admin-controlled setting and force / allow blank External
+--     Order on sales orders accordingly. One row, one bit column.
+-- =============================================================================
+CREATE OR ALTER VIEW dbo._vw_SOSalesOrderConfig AS
+SELECT TOP 1
+    CAST(ISNULL(bForceExtOrderNum, 0) AS bit) AS ForceExtOrderNum
+FROM dbo.OrdersDf
+WHERE DefaultCounter = 1;
+GO
+
+-- =============================================================================
 -- Verification
 -- =============================================================================
 SELECT name FROM sys.views WHERE name LIKE '_vw_SO%' ORDER BY name;
--- Expected 13 rows.
+-- Expected 14 rows.

@@ -113,7 +113,7 @@ export function SalesOrderScreen({
   // Order Date and Due Date default to today — those are "when was this placed"
   // fields, not "when does it ship". Falls back to next-business-day for safety
   // if SalesOrderScreen is somehow mounted outside the AuthProvider gate.
-  const { sessionDate } = useAuth();
+  const { sessionDate, forceExtOrderNum } = useAuth();
   const sessionDateDefault = sessionDate ?? nextBusinessDay();
   const todayDefault = today();
 
@@ -315,6 +315,13 @@ export function SalesOrderScreen({
       }
     }
 
+    if (forceExtOrderNum && !externalOrder.trim()) {
+      setErrorMsg(
+        "External Order Number is required (set by Evolution's sales-order config)."
+      );
+      return;
+    }
+
     const filledLines = lines.filter((l) => l.stock_code);
     if (filledLines.length === 0) {
       setErrorMsg("Add at least one line with an item.");
@@ -484,6 +491,7 @@ export function SalesOrderScreen({
             externalOrder={externalOrder}
             orderDate={orderDate}
             dueDate={dueDate}
+            externalOrderRequired={forceExtOrderNum}
             onChange={(p) => {
               if (p.externalOrder !== undefined) setExternalOrder(p.externalOrder);
               if (p.orderDate !== undefined) setOrderDate(p.orderDate);

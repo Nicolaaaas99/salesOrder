@@ -22,19 +22,31 @@ def _join_address(*parts) -> str:
 @router.get("/customers", response_model=List[schemas.CustomerSummary])
 def list_customers(
     q: Optional[str] = Query(None),
-    limit: int = Query(50, le=200),
+    limit: int = Query(50, le=2000),
     db: Session = Depends(get_db),
 ):
     sql = """
         SELECT TOP (:limit) AccountCode AS account, CustomerName AS name
         FROM dbo._vw_SOCustomers
-        WHERE (:like IS NULL OR AccountCode LIKE :like OR CustomerName LIKE :like)
+        WHERE AccountCode IS NOT NULL
+          AND CustomerName IS NOT NULL
+          AND (:like IS NULL OR AccountCode LIKE :like OR CustomerName LIKE :like)
         ORDER BY CustomerName
     """
     q_stripped = (q or "").strip()
     like = f"%{q_stripped}%" if q_stripped else None
     rows = db.execute(text(sql), {"like": like, "limit": limit}).mappings().all()
-    return [schemas.CustomerSummary(**r) for r in rows]
+    # Null-guard: a customer row with a null name/account would otherwise fail
+    # the Pydantic `str` validation and surface as a 500 — more likely with the
+    # higher no-route limit (500) than the default (50).
+    return [
+        schemas.CustomerSummary(
+            account=(r["account"] or "").strip(),
+            name=(r["name"] or "").strip(),
+        )
+        for r in rows
+        if r["account"] and r["name"]
+    ]
 
 
 CUSTOMER_CREDIT_SQL = """
@@ -75,6 +87,7 @@ def _build_customer_detail(row) -> schemas.CustomerDetail:
     return schemas.CustomerDetail(
         account=g("Account", ""),
         name=g("Name", "") or "",
+        route=(g("Route", "") or "").strip(),
         delivery_address=_join_address(
             g("Physical1"), g("Physical2"), g("Physical3"),
             g("Physical4"), g("Physical5"), g("PhysicalPC"),
@@ -85,6 +98,7 @@ def _build_customer_detail(row) -> schemas.CustomerDetail:
         ),
         contact_name=g("Contact_Person", "") or "",
         contact_tel=g("Telephone", "") or "",
+        contact_tel2=g("Facsimile", "") or "",
         contact_email=g("EMail", "") or "",
         default_tax_type_id=int(def_tax) if def_tax else None,
         credit_limit=credit_limit,

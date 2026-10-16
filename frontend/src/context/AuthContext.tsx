@@ -18,6 +18,9 @@ type AuthState = {
    *  _vw_SOAgentDefaultWhse). Pricing calls pass this through so the rep
    *  sees prices from their own DC. Null if the agent isn't in the view. */
   defaultWarehouseCode: string | null;
+  /** Mirrors Evolution's OrdersDf.bForceExtOrderNum. When true, the UI blocks
+   *  saving a sales order without an External Order number. */
+  forceExtOrderNum: boolean;
 };
 
 type AuthContextValue = AuthState & {
@@ -44,6 +47,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     username: sessionStorage.getItem("auth_username"),
     sessionDate: sessionStorage.getItem("auth_session_date"),
     defaultWarehouseCode: sessionStorage.getItem("auth_default_warehouse"),
+    forceExtOrderNum: sessionStorage.getItem("auth_force_ext_order_num") === "1",
   }));
 
   const login = useCallback(async (username: string, password: string) => {
@@ -57,11 +61,17 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     } else {
       sessionStorage.removeItem("auth_default_warehouse");
     }
+    if (res.force_ext_order_num) {
+      sessionStorage.setItem("auth_force_ext_order_num", "1");
+    } else {
+      sessionStorage.removeItem("auth_force_ext_order_num");
+    }
     setState({
       token: res.token,
       username: res.username,
       sessionDate: null,
       defaultWarehouseCode: res.default_warehouse_code ?? null,
+      forceExtOrderNum: !!res.force_ext_order_num,
     });
   }, []);
 
@@ -73,17 +83,52 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     sessionStorage.removeItem("auth_username");
     sessionStorage.removeItem("auth_session_date");
     sessionStorage.removeItem("auth_default_warehouse");
+    sessionStorage.removeItem("auth_force_ext_order_num");
     setState({
       token: null,
       username: null,
       sessionDate: null,
       defaultWarehouseCode: null,
+      forceExtOrderNum: false,
     });
   }, []);
 
   const setSessionDate = useCallback((date: string) => {
     sessionStorage.setItem("auth_session_date", date);
     setState((prev) => ({ ...prev, sessionDate: date }));
+  }, []);
+
+  // On first mount with a cached token, re-fetch /auth/me so the per-session
+  // tenant config (default warehouse, force-ext-order-num) stays fresh — e.g.
+  // an admin flipping the Evolution setting while the rep's session is open
+  // takes effect after the next page refresh instead of requiring a logout.
+  useEffect(() => {
+    if (!state.token) return;
+    authApi
+      .me()
+      .then((me) => {
+        if (me.default_warehouse_code) {
+          sessionStorage.setItem("auth_default_warehouse", me.default_warehouse_code);
+        } else {
+          sessionStorage.removeItem("auth_default_warehouse");
+        }
+        if (me.force_ext_order_num) {
+          sessionStorage.setItem("auth_force_ext_order_num", "1");
+        } else {
+          sessionStorage.removeItem("auth_force_ext_order_num");
+        }
+        setState((prev) => ({
+          ...prev,
+          defaultWarehouseCode: me.default_warehouse_code ?? null,
+          forceExtOrderNum: !!me.force_ext_order_num,
+        }));
+      })
+      .catch(() => {
+        /* 401s already handled by the axios interceptor */
+      });
+    // Intentionally runs only on mount — we only want a single refresh at the
+    // start of a hydrated session.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
@@ -93,6 +138,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         username: null,
         sessionDate: null,
         defaultWarehouseCode: null,
+        forceExtOrderNum: false,
       });
     window.addEventListener("auth:401", onAuthFail);
     return () => window.removeEventListener("auth:401", onAuthFail);

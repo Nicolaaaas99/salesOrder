@@ -48,6 +48,22 @@ def _fmt_money(v: float) -> str:
     return f"{v:,.2f}"
 
 
+def _enforce_ext_order_requirement(db: Session, payload: schemas.SalesOrderCreate) -> None:
+    """Defensive backend check mirroring Evolution's OrdersDf.bForceExtOrderNum.
+    The frontend disables the save button when the setting is on and the field
+    is blank, but if a stale client bypasses it we still want a clean 400."""
+    try:
+        row = db.execute(
+            text("SELECT ForceExtOrderNum FROM dbo._vw_SOSalesOrderConfig")
+        ).mappings().first()
+    except Exception:
+        return  # view missing — fail-open so orders aren't blocked by infra
+    if not row or not row["ForceExtOrderNum"]:
+        return
+    if not (payload.external_order or "").strip():
+        raise HTTPException(400, "External Order Number is required by the Evolution configuration.")
+
+
 def _compute_order_incl_total(payload: schemas.SalesOrderCreate, db: Session) -> float:
     unique_tax_ids = {int(l.tax_type_id) for l in payload.lines if l.tax_type_id is not None}
     rates: dict[int, float] = {}
@@ -88,6 +104,8 @@ def place_order(
 ):
     if not payload.lines:
         raise HTTPException(400, "At least one line is required")
+
+    _enforce_ext_order_requirement(db, payload)
 
     row = db.execute(text(CUSTOMER_CREDIT_SQL), {"account": payload.customer_account}).mappings().first()
     if not row:
@@ -461,6 +479,8 @@ def update_order(
 
     if not payload.lines:
         raise HTTPException(400, "At least one line is required")
+
+    _enforce_ext_order_requirement(db, payload)
 
     try:
         return update_sales_order(order_no, payload, agent_username=username)

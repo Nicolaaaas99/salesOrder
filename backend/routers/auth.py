@@ -35,6 +35,19 @@ def _default_warehouse_for(db: Session, agent_username: str) -> Optional[str]:
     return code.strip() if isinstance(code, str) else code
 
 
+def _force_ext_order_num(db: Session) -> bool:
+    """Read Evolution's OrdersDf.bForceExtOrderNum via the config view. Falls
+    to False if the view is missing or the row doesn't exist (fail-open so
+    orders can still be placed if the config isn't set up)."""
+    try:
+        row = db.execute(
+            text("SELECT ForceExtOrderNum FROM dbo._vw_SOSalesOrderConfig")
+        ).mappings().first()
+        return bool(row and row["ForceExtOrderNum"])
+    except Exception:
+        return False
+
+
 @router.post("/login", response_model=schemas.LoginResponse)
 def login(payload: schemas.LoginRequest, db: Session = Depends(get_db)):
     """
@@ -66,11 +79,11 @@ def login(payload: schemas.LoginRequest, db: Session = Depends(get_db)):
         )
 
     token = issue_token(username)
-    default_whse = _default_warehouse_for(db, username)
     return schemas.LoginResponse(
         token=token,
         username=username,
-        default_warehouse_code=default_whse,
+        default_warehouse_code=_default_warehouse_for(db, username),
+        force_ext_order_num=_force_ext_order_num(db),
     )
 
 
@@ -85,4 +98,5 @@ def me(username: str = Depends(get_current_user), db: Session = Depends(get_db))
     return schemas.MeResponse(
         username=username,
         default_warehouse_code=_default_warehouse_for(db, username),
+        force_ext_order_num=_force_ext_order_num(db),
     )
