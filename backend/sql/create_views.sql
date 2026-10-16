@@ -125,13 +125,19 @@ SELECT
         WHERE AccountLink = C.DCLink
     ), 0) AS TotalOutstanding,
     ISNULL((
+        -- Statement terms: an invoice is overdue when its month-end-of-TxDate
+        --   is before (today − TermsDays). All invoices sharing a calendar
+        --   month share the same due date.
+        -- Invoice-date terms: an invoice is overdue when its TxDate is before
+        --   (today − TermsDays). Day-N is still within terms; day-(N+1) tips.
+        -- CutoffDate = (today − TermsDays) in both branches.
         SELECT ROUND(SUM(p.Outstanding), 2)
         FROM dbo.PostAR p
         WHERE p.AccountLink = C.DCLink
           AND ISNULL(p.Outstanding, 0) > 0
           AND (
-                (ISNULL(t.iAgeTypeOption, 0) = 1 AND CAST(p.TxDate AS date) <= cutoff.CutoffDate)
-             OR (ISNULL(t.iAgeTypeOption, 0) = 0 AND CAST(p.TxDate AS date) <  cutoff.CutoffDate)
+                (ISNULL(t.iAgeTypeOption, 0) = 1 AND EOMONTH(p.TxDate)        < cutoff.CutoffDate)
+             OR (ISNULL(t.iAgeTypeOption, 0) = 0 AND CAST(p.TxDate AS date)   < cutoff.CutoffDate)
           )
     ), 0) AS OverdueAmount,
     ISNULL((
@@ -154,11 +160,10 @@ CROSS APPLY (
     END AS TermsDays
 ) td
 CROSS APPLY (
-    SELECT CASE
-        WHEN ISNULL(t.iAgeTypeOption, 0) = 1
-            THEN EOMONTH(DATEADD(day, -td.TermsDays, CAST(GETDATE() AS date)))
-        ELSE DATEADD(day, -td.TermsDays, CAST(GETDATE() AS date))
-    END AS CutoffDate
+    -- Uniform cutoff for both aging types: today − TermsDays. The subquery
+    -- above decides whether to compare TxDate directly (invoice-date terms)
+    -- or EOMONTH(TxDate) (statement/month-end terms) against this date.
+    SELECT DATEADD(day, -td.TermsDays, CAST(GETDATE() AS date)) AS CutoffDate
 ) cutoff;
 GO
 

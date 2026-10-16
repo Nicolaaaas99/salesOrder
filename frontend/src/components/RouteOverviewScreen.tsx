@@ -120,7 +120,7 @@ export function RouteOverviewScreen({ onOpenOrder }: RouteOverviewProps = {}) {
       try {
         const [custs, counts] = await Promise.all([
           api.listHistoryCustomers(selectedRoute.value),
-          api.listCustomerOrdersToday(selectedRoute.value, selectedDate),
+          api.listCustomerOrdersToday(selectedRoute.value, selectedDate, "delivery"),
         ]);
         const countMap = new Map(counts.map((c) => [c.account, c.order_count]));
         const merged: CustomerRow[] = custs.map((c) => ({
@@ -157,7 +157,7 @@ export function RouteOverviewScreen({ onOpenOrder }: RouteOverviewProps = {}) {
           api.listOrderSuggestions(drillCustomer.id),
           api.getCustomer(drillCustomer.id).catch(() => null),
           api
-            .listOrdersByOrderDate(drillCustomer.id, selectedDate)
+            .listOrdersByOrderDate(drillCustomer.id, selectedDate, "delivery")
             .catch(() => [] as SalesOrderSearchResult[]),
         ]);
         setOrders(ordersData);
@@ -181,7 +181,7 @@ export function RouteOverviewScreen({ onOpenOrder }: RouteOverviewProps = {}) {
     (async () => {
       setIsLoadingOrderList(true);
       try {
-        const data = await api.listOrdersByOrderDate(viewingOrdersFor.id, selectedDate);
+        const data = await api.listOrdersByOrderDate(viewingOrdersFor.id, selectedDate, "delivery");
         setOrderList(data);
       } catch {
         setOrderList([]);
@@ -225,7 +225,7 @@ export function RouteOverviewScreen({ onOpenOrder }: RouteOverviewProps = {}) {
   async function handleExport() {
     setIsExporting(true);
     try {
-      await api.exportOrdersPerDayXlsx(selectedDate);
+      await api.exportOrdersPerDayXlsx(selectedDate, "delivery");
     } catch (e: any) {
       setError(`Export failed: ${e?.message ?? e}`);
     } finally {
@@ -271,7 +271,7 @@ export function RouteOverviewScreen({ onOpenOrder }: RouteOverviewProps = {}) {
           <div className="bg-white rounded border p-2 shadow-sm w-44">
             <label className="flex items-center font-semibold text-gray-800 mb-1 text-xs">
               <Calendar className="w-3 h-3 mr-1 text-blue-600" />
-              Order Date
+              Delivery Date
             </label>
             <DateInput value={selectedDate} onChange={setSelectedDate} />
           </div>

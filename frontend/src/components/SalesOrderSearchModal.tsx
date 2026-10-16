@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { api } from "../api/client";
 import type { SalesOrderSearchResult } from "../api/types";
 import { CustomerPicker } from "./CustomerPicker";
@@ -103,9 +103,27 @@ export function SalesOrderSearchModal({ onClose, onSelect }: Props) {
   const [loading, setLoading] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
+  // Monotonic request id so that if the user clicks Find rapidly with
+  // different filters, only the LATEST response wins — any earlier in-flight
+  // response is discarded instead of overwriting the newer results.
+  const searchSeqRef = useRef(0);
+
+  // Clear visible results whenever the Status filter changes so the rep can't
+  // mistake stale rows (from a previous filter choice) for the new filter's
+  // output. Other filter fields are text inputs that don't ambiguously
+  // "redefine the scope"; only the status is swapped like this.
+  useEffect(() => {
+    setResults(null);
+    setSelected(null);
+    setErrorMsg(null);
+  }, [state]);
+
   async function runSearch() {
+    const seq = ++searchSeqRef.current;
     setLoading(true);
     setErrorMsg(null);
+    setResults(null);        // blank out stale rows while fetching
+    setSelected(null);
     try {
       const data = await api.searchSalesOrders({
         account: account || undefined,
@@ -116,13 +134,14 @@ export function SalesOrderSearchModal({ onClose, onSelect }: Props) {
         date_to: dateTo || undefined,
         states: STATE_FILTER_TO_IDS[state],
       });
+      if (seq !== searchSeqRef.current) return;    // a newer search has started
       setResults(data);
-      setSelected(null);
     } catch (e: any) {
+      if (seq !== searchSeqRef.current) return;
       setErrorMsg(e?.response?.data?.detail ?? e?.message ?? "Search failed");
       setResults([]);
     } finally {
-      setLoading(false);
+      if (seq === searchSeqRef.current) setLoading(false);
     }
   }
 
@@ -201,9 +220,9 @@ export function SalesOrderSearchModal({ onClose, onSelect }: Props) {
             onChange={(e) => setState(e.target.value as StateFilter)}
           >
             <option value="all">All</option>
-            <option value="unprocessed">Unprocessed only</option>
-            <option value="partial">Partially Processed only</option>
-            <option value="archived">Archived only</option>
+            <option value="unprocessed">Unprocessed</option>
+            <option value="partial">Partially Processed</option>
+            <option value="archived">Archived</option>
           </select>
         </div>
 
