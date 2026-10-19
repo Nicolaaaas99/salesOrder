@@ -8,7 +8,7 @@ import { NumberCell } from "./NumberCell";
 import { ProjectPicker } from "./ProjectPicker";
 import { SelectCell } from "./SelectCell";
 import { fmtNumber } from "../utils/format";
-import { isCrateStock } from "../utils/history";
+import { resolvedPriceSource } from "../utils/history";
 
 export type TaxMode = "Exclusive" | "Inclusive";
 
@@ -458,10 +458,6 @@ export function LineItemsGrid({
 
                         if (customerAccount) {
                           const pickedCode = item.code;
-                          // Crates are priced 0 by design — skip the
-                          // "price not found" state so they don't block
-                          // Continue or show the red label.
-                          const isCrate = isCrateStock(pickedCode);
                           api
                             .getCustomerPrices(customerAccount, [pickedCode], defaultWarehouseCode)
                             .then((map) => {
@@ -469,10 +465,12 @@ export function LineItemsGrid({
                               // Store both prices — unit_price = excl is the
                               // invariant used by totals/tax math, and
                               // unit_price_incl is the actual Price List incl
-                              // used by the Incl display.
+                              // used by the Incl display. `resolvedPriceSource`
+                              // enforces the "zero price on a Price-List row =
+                              // not found" rule for non-crates.
                               const excl = p?.excl_price ?? 0;
                               const incl = p?.incl_price ?? 0;
-                              const resolvedSource = p?.source ?? (isCrate ? "Price List" : "None");
+                              const source = resolvedPriceSource(pickedCode, excl, p?.source ?? null);
                               onChange((prev) =>
                                 prev.map((l, idx) =>
                                   idx === i && l.stock_code === pickedCode
@@ -480,7 +478,7 @@ export function LineItemsGrid({
                                         ...l,
                                         unit_price: excl,
                                         unit_price_incl: incl,
-                                        price_source: resolvedSource,
+                                        price_source: source,
                                         price_locked: excl > 0,
                                         is_fallback_warehouse: p?.is_fallback_warehouse ?? false,
                                       }
@@ -489,11 +487,11 @@ export function LineItemsGrid({
                               );
                             })
                             .catch(() => {
-                              const fallbackSource = isCrate ? "Price List" : "None";
+                              const source = resolvedPriceSource(pickedCode, 0, null);
                               onChange((prev) =>
                                 prev.map((l, idx) =>
                                   idx === i && l.stock_code === pickedCode
-                                    ? { ...l, price_source: fallbackSource, price_locked: false, is_fallback_warehouse: false }
+                                    ? { ...l, price_source: source, price_locked: false, is_fallback_warehouse: false }
                                     : l,
                                 ),
                               );

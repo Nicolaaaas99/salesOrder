@@ -10,6 +10,26 @@ export function isCrateStock(stockCode: string): boolean {
   return (stockCode || "").trim() === "999000";
 }
 
+/**
+ * Normalise the resolver's price-source onto what the UI should actually show.
+ * Everything with a positive price keeps whatever source came back (deal or
+ * price list). Deals with a 0 price keep their deal source — that's an
+ * intentional free line. Price-List entries that resolved to 0, however,
+ * are treated as "None" (price not found) because they signal a stock
+ * that's on the list but doesn't have a real price captured. Crates are
+ * always allowed to be 0 (containers aren't priced).
+ */
+export function resolvedPriceSource(
+  stockCode: string,
+  unitPrice: number,
+  source: string | null | undefined,
+): string {
+  if (isCrateStock(stockCode)) return source || "Price List";
+  if (!source || source === "None") return "None";
+  if (source === "Price List" && unitPrice <= 0) return "None";
+  return source;
+}
+
 export type WeekRange = {
   start: Date;
   end: Date;

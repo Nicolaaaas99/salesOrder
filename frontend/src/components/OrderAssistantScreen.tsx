@@ -16,7 +16,12 @@ import { DraftOrderPanel, type DraftLine } from "./DraftOrderPanel";
 import { OrdersModal } from "./OrdersModal";
 import { OrderSummaryModal } from "./OrderSummaryModal";
 import { CustomerContactStrip } from "./CustomerContactStrip";
-import { productKey, isCrateStock, type CategoryProduct } from "../utils/history";
+import {
+  productKey,
+  isCrateStock,
+  resolvedPriceSource,
+  type CategoryProduct,
+} from "../utils/history";
 import { makeEmptyLine, pickDefaultWarehouse, snapToPack } from "./LineItemsGrid";
 import { SalesOrderScreen } from "./SalesOrderScreen";
 import { useAuth } from "../context/AuthContext";
@@ -78,7 +83,7 @@ function draftFromSuggestion(
     is_whse_item: s.is_whse_item,
     unit_price: s.unit_price,
     unit_price_incl: s.unit_price_incl,
-    price_source: s.price_source || (priced ? "Price List" : "None"),
+    price_source: resolvedPriceSource(s.stock_code, s.unit_price, s.price_source),
     price_locked: priced,
     tax_type_id: s.default_tax_type_id ?? defaultTaxTypeId,
     discount_percent: 0,
@@ -527,18 +532,18 @@ export function OrderAssistantScreen({ onOpenOrder }: OrderAssistantProps = {}) 
       if (needsPrice && customerDetail?.account) {
         const account = customerDetail.account;
         const code = line.stock_code;
-        const isCrate = isCrateStock(code);
         api
           .getCustomerPrices(account, [code], defaultWarehouseCode)
           .then((map) => {
             const p = map[code];
             // Store BOTH prices on the draft line — excl is the computational
             // invariant, incl is the exact Price List incl used by the
-            // SalesOrderScreen's Tax Mode display. Crates skip the
-            // "price not found" state: they're priced 0 by design.
+            // SalesOrderScreen's Tax Mode display. `resolvedPriceSource`
+            // enforces the "zero price on a Price-List row = not found"
+            // rule for non-crates.
             const excl = p?.excl_price ?? 0;
             const incl = p?.incl_price ?? 0;
-            const resolvedSource = p?.source ?? (isCrate ? "Price List" : "None");
+            const source = resolvedPriceSource(code, excl, p?.source ?? null);
             setDraftLines((prev) =>
               prev.map((l) =>
                 l.stock_code === code
@@ -546,7 +551,7 @@ export function OrderAssistantScreen({ onOpenOrder }: OrderAssistantProps = {}) 
                       ...l,
                       unit_price: excl,
                       unit_price_incl: incl,
-                      price_source: resolvedSource,
+                      price_source: source,
                       price_locked: excl > 0,
                       is_fallback_warehouse: p?.is_fallback_warehouse ?? false,
                     }
@@ -555,11 +560,11 @@ export function OrderAssistantScreen({ onOpenOrder }: OrderAssistantProps = {}) 
             );
           })
           .catch(() => {
-            const fallbackSource = isCrate ? "Price List" : "None";
+            const source = resolvedPriceSource(code, 0, null);
             setDraftLines((prev) =>
               prev.map((l) =>
                 l.stock_code === code
-                  ? { ...l, price_source: fallbackSource, price_locked: false, is_fallback_warehouse: false }
+                  ? { ...l, price_source: source, price_locked: false, is_fallback_warehouse: false }
                   : l
               )
             );
