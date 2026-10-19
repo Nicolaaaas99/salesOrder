@@ -32,6 +32,10 @@ type Props = {
   /** Map of stock_code → price source ('Customer Deal' | 'Group Deal' | 'Price List' | 'None').
    *  When present, products with an active deal get a visible badge next to their name. */
   priceSources?: Map<string, string>;
+  /** Stock codes the customer has NEVER purchased but which carry an active
+   *  Customer / Group Deal — rendered with a "New" badge next to the deal
+   *  badge so the rep can spot deal-only prospects. */
+  newDealStocks?: Set<string>;
   /** Called when user clicks Add on a product row. */
   onAddToOrder?: (
     product: CategoryProduct,
@@ -71,6 +75,7 @@ export function HistoryGrid({
   emptyMessage = "No data",
   suggestions,
   priceSources,
+  newDealStocks,
   onAddToOrder,
   onAddAllSuggested,
   heightStyle = "calc(100vh - 240px)",
@@ -322,6 +327,7 @@ export function HistoryGrid({
                     problemItems={problemItems}
                     suggestions={suggestions}
                     priceSources={priceSources}
+                    newDealStocks={newDealStocks}
                     onAddToOrder={onAddToOrder}
                     showAddButton={showAddButton}
                     stickyLeftWidth={stickyLeftWidth}
@@ -359,6 +365,7 @@ type CategoryRowProps = {
   problemItems: Map<string, ProblemInfo>;
   suggestions?: Map<string, OrderSuggestion>;
   priceSources?: Map<string, string>;
+  newDealStocks?: Set<string>;
   onAddToOrder?: Props["onAddToOrder"];
   showAddButton: boolean;
   stickyLeftWidth: string;
@@ -379,6 +386,7 @@ function CategoryRow({
   problemItems,
   suggestions,
   priceSources,
+  newDealStocks,
   onAddToOrder,
   showAddButton,
   stickyLeftWidth,
@@ -581,6 +589,14 @@ function CategoryRow({
                           className={`text-[9px] font-bold uppercase px-1 py-0.5 rounded whitespace-nowrap ${dealBadge.cls}`}
                         >
                           {dealBadge.label}
+                        </span>
+                      )}
+                      {newDealStocks?.has(product.stockCode) && (
+                        <span
+                          className="text-[9px] font-bold uppercase px-1 py-0.5 rounded whitespace-nowrap bg-amber-100 text-amber-800"
+                          title="Deal item — this customer hasn't ordered it before"
+                        >
+                          New
                         </span>
                       )}
                     </div>

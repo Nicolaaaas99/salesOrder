@@ -150,6 +150,10 @@ export function OrderAssistantScreen({ onOpenOrder }: OrderAssistantProps = {}) 
   const [suggestions, setSuggestions] = useState<OrderSuggestion[]>([]);
   const [packSizes, setPackSizes] = useState<Map<string, number>>(new Map());
   const [priceSources, setPriceSources] = useState<Map<string, string>>(new Map());
+  // Stock codes that showed up only via active Customer / Group Deals (i.e.
+  // the customer has NEVER bought them). Powers the "New" badge next to
+  // the stock code so the rep sees deal-only prospects at a glance.
+  const [newDealStocks, setNewDealStocks] = useState<Set<string>>(new Set());
   const [taxTypes, setTaxTypes] = useState<TaxType[]>([]);
 
   const [isLoadingRoutes, setIsLoadingRoutes] = useState(false);
@@ -298,6 +302,7 @@ export function OrderAssistantScreen({ onOpenOrder }: OrderAssistantProps = {}) 
       setSuggestions([]);
       setPackSizes(new Map());
       setPriceSources(new Map());
+      setNewDealStocks(new Set());
       setCustomerDetail(null);
       setDraftLines([]);
       setOpenedCategories(new Set());
@@ -362,6 +367,9 @@ export function OrderAssistantScreen({ onOpenOrder }: OrderAssistantProps = {}) 
         setOrders([...ordersData, ...dealOnlyOrders]);
         setSuggestions(suggestionsData);
         setCustomerDetail(detail);
+        setNewDealStocks(
+          new Set(dealOnlyOrders.map((o) => o.items[0].stockCode)),
+        );
 
         // When the customer carries an AR route and the dropdown isn't already
         // on it, snap the Route selector to match. The route-watching effect
@@ -974,6 +982,7 @@ export function OrderAssistantScreen({ onOpenOrder }: OrderAssistantProps = {}) 
             }
             suggestions={suggestionsMap}
             priceSources={priceSources}
+            newDealStocks={newDealStocks}
             onAddToOrder={handleAddToOrder}
             onAddAllSuggested={handleAddAllSuggested}
             draftQuantities={draftQuantities}
