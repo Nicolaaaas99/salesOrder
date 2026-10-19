@@ -1,5 +1,15 @@
 import type { HistoricalOrder } from "../api/types";
 
+/**
+ * The crate / container stock. Matches by exact stock code — the backend
+ * view uses the same `STK.Code = '999000'` filter so the two stay in sync.
+ * Crate lines are intentionally priced at 0 and shouldn't flag
+ * "price not found" or block Continue-to-order.
+ */
+export function isCrateStock(stockCode: string): boolean {
+  return (stockCode || "").trim() === "999000";
+}
+
 export type WeekRange = {
   start: Date;
   end: Date;
@@ -88,7 +98,7 @@ export const getWeekRange = (dateString: string): WeekRange => {
 
 /**
  * Bucket orders into categories → products → weekly quantities.
- * Filters out stock codes containing "999000" and descriptions containing "crate".
+ * Filters out the "999000" crate stock (see `isCrateStock`).
  */
 export function aggregateOrders(orders: HistoricalOrder[]): {
   categories: Record<string, CategoryData>;
@@ -117,12 +127,7 @@ export function aggregateOrders(orders: HistoricalOrder[]): {
     const weekKey = getWeekRange(order.orderDate).key;
 
     order.items.forEach((item) => {
-      if (
-        item.stockCode.includes("999000") ||
-        item.description.toLowerCase().includes("crate")
-      ) {
-        return;
-      }
+      if (isCrateStock(item.stockCode)) return;
 
       const category = item.category || "Uncategorized";
       if (!categoriesData[category]) {

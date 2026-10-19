@@ -100,17 +100,28 @@ export function ItemPicker({ value, onSelect }: Props) {
           setOpen(true);
         }}
         onKeyDown={(e) => {
-          // Enter + Tab both commit the top match so the rep can add an item
-          // without reaching for the mouse. Enter also prevents the browser's
-          // default (form submit) just in case.
-          if (
-            (e.key === "Enter" || e.key === "Tab") &&
+          // Enter commits ONLY on an exact code match — so typing "131" and
+          // pressing Enter won't accidentally add "905131". Tab still commits
+          // the top fuzzy match (unchanged) so the quick-type workflow for
+          // auto-complete still works.
+          if (e.key === "Enter" && open && isTyping) {
+            e.preventDefault();
+            const q = (query as string).trim();
+            if (!q || results.length === 0) return;
+            const exact = results.find(
+              (r) => r.code.toLowerCase() === q.toLowerCase(),
+            );
+            if (!exact) return; // no exact match → do nothing
+            onSelect(exact);
+            setQuery(null);
+            setOpen(false);
+          } else if (
+            e.key === "Tab" &&
             open &&
             isTyping &&
             (query as string).trim() &&
             results.length > 0
           ) {
-            if (e.key === "Enter") e.preventDefault();
             const top = results[0];
             onSelect(top);
             setQuery(null);

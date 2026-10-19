@@ -16,7 +16,7 @@ import { DraftOrderPanel, type DraftLine } from "./DraftOrderPanel";
 import { OrdersModal } from "./OrdersModal";
 import { OrderSummaryModal } from "./OrderSummaryModal";
 import { CustomerContactStrip } from "./CustomerContactStrip";
-import { productKey, type CategoryProduct } from "../utils/history";
+import { productKey, isCrateStock, type CategoryProduct } from "../utils/history";
 import { makeEmptyLine, pickDefaultWarehouse, snapToPack } from "./LineItemsGrid";
 import { SalesOrderScreen } from "./SalesOrderScreen";
 import { useAuth } from "../context/AuthContext";
@@ -167,6 +167,11 @@ export function OrderAssistantScreen({ onOpenOrder }: OrderAssistantProps = {}) 
   // on an in-history pick, so the row inside shows the blue highlight the
   // moment the rep manually opens the category.
   const [focusStockCode, setFocusStockCode] = useState<{ code: string; bumpKey: number } | null>(null);
+  // One-shot blue row flash — fires when + is clicked on an item that's
+  // already in the draft. Signals "already added, adjust qty in the draft"
+  // without silently bumping. Each duplicate click bumps bumpKey so the
+  // CSS animation restarts.
+  const [focusRowFlash, setFocusRowFlash] = useState<{ code: string; bumpKey: number } | null>(null);
   // Persistent set of categories that need the rep's attention. Written by
   // picker-blocks (one category) and Continue-blocks (all unopened); entries
   // drop as the user opens each category.
@@ -427,12 +432,7 @@ export function OrderAssistantScreen({ onOpenOrder }: OrderAssistantProps = {}) 
     for (const o of orders) {
       for (const l of o.items) {
         if (!l.stockCode) continue;
-        if (
-          l.stockCode.includes("999000") ||
-          l.description.toLowerCase().includes("crate")
-        ) {
-          continue;
-        }
+        if (isCrateStock(l.stockCode)) continue;
         stocks.add(l.stockCode);
         if (!stockToCategory.has(l.stockCode) && l.category) {
           stockToCategory.set(l.stockCode, l.category);
@@ -444,27 +444,25 @@ export function OrderAssistantScreen({ onOpenOrder }: OrderAssistantProps = {}) 
 
   const addLine = useCallback(
     (line: DraftLine) => {
-      // Compute the resulting row index up-front so the DraftOrderPanel can
-      // focus the right Qty cell — both when the stock is new (appended) and
-      // when it's already in the draft (merged into its existing row).
+      // Already in the draft? Don't silently bump the quantity — a repeated
+      // + click is almost always an accidental double-tap. Flash the row so
+      // the rep can see it's theirs and adjust the qty in the draft panel.
       const existingIdx = draftLines.findIndex(
         (l) => l.stock_code === line.stock_code
       );
-      const targetIdx = existingIdx >= 0 ? existingIdx : draftLines.length;
+      if (existingIdx >= 0) {
+        setFocusRowFlash((prev) => ({
+          code: line.stock_code,
+          bumpKey: (prev?.bumpKey ?? 0) + 1,
+        }));
+        return;
+      }
 
+      const targetIdx = draftLines.length;
       setDraftLines((prev) => {
-        const existingIdxFresh = prev.findIndex(
-          (l) => l.stock_code === line.stock_code
-        );
-        if (existingIdxFresh >= 0) {
-          // Bump quantity if already in draft
-          const next = [...prev];
-          next[existingIdxFresh] = {
-            ...next[existingIdxFresh],
-            quantity: next[existingIdxFresh].quantity + line.quantity,
-          };
-          return next;
-        }
+        // Concurrent-safety re-check: if the state changed between the outer
+        // check and this updater running, bail without duplicating.
+        if (prev.some((l) => l.stock_code === line.stock_code)) return prev;
         return [...prev, line];
       });
       // New object identity each call so the panel's effect re-fires even when
@@ -480,15 +478,18 @@ export function OrderAssistantScreen({ onOpenOrder }: OrderAssistantProps = {}) 
       if (needsPrice && customerDetail?.account) {
         const account = customerDetail.account;
         const code = line.stock_code;
+        const isCrate = isCrateStock(code);
         api
           .getCustomerPrices(account, [code], defaultWarehouseCode)
           .then((map) => {
             const p = map[code];
             // Store BOTH prices on the draft line — excl is the computational
             // invariant, incl is the exact Price List incl used by the
-            // SalesOrderScreen's Tax Mode display.
+            // SalesOrderScreen's Tax Mode display. Crates skip the
+            // "price not found" state: they're priced 0 by design.
             const excl = p?.excl_price ?? 0;
             const incl = p?.incl_price ?? 0;
+            const resolvedSource = p?.source ?? (isCrate ? "Price List" : "None");
             setDraftLines((prev) =>
               prev.map((l) =>
                 l.stock_code === code
@@ -496,7 +497,7 @@ export function OrderAssistantScreen({ onOpenOrder }: OrderAssistantProps = {}) 
                       ...l,
                       unit_price: excl,
                       unit_price_incl: incl,
-                      price_source: p?.source ?? "None",
+                      price_source: resolvedSource,
                       price_locked: excl > 0,
                       is_fallback_warehouse: p?.is_fallback_warehouse ?? false,
                     }
@@ -505,10 +506,11 @@ export function OrderAssistantScreen({ onOpenOrder }: OrderAssistantProps = {}) 
             );
           })
           .catch(() => {
+            const fallbackSource = isCrate ? "Price List" : "None";
             setDraftLines((prev) =>
               prev.map((l) =>
                 l.stock_code === code
-                  ? { ...l, price_source: "None", price_locked: false, is_fallback_warehouse: false }
+                  ? { ...l, price_source: fallbackSource, price_locked: false, is_fallback_warehouse: false }
                   : l
               )
             );
@@ -612,7 +614,12 @@ export function OrderAssistantScreen({ onOpenOrder }: OrderAssistantProps = {}) 
         return;
       }
       // New product — safe to add straight from the picker.
-      addLine(draftFromInventoryItem(item, 0, defaultTaxTypeId, defaultWarehouseCode));
+      // Crates get a default qty of 1 so the Continue gate doesn't grey out:
+      // regular items are added at qty 0 by design (rep must set it from the
+      // history pattern), but crates aren't in history and nothing else
+      // would populate the qty — leaving it 0 would strand the rep.
+      const defaultQty = isCrateStock(item.code) ? 1 : 0;
+      addLine(draftFromInventoryItem(item, defaultQty, defaultTaxTypeId, defaultWarehouseCode));
       setBlockedPick(null);
     },
     [addLine, defaultTaxTypeId, defaultWarehouseCode, historyIndex]
@@ -953,6 +960,8 @@ export function OrderAssistantScreen({ onOpenOrder }: OrderAssistantProps = {}) 
               blockedPick={blockedPick}
               onDismissBlocked={() => setBlockedPick(null)}
               continueBlockMsg={continueBlockMsg}
+              onDismissContinueBlock={() => setContinueBlockMsg(null)}
+              focusRowFlash={focusRowFlash}
             />
           </div>
         </div>

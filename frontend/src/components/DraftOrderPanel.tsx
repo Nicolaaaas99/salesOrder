@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { ArrowRight, Trash2, Plus, Lock, Unlock, AlertCircle, X } from "lucide-react";
 import type {
   CustomerDetail,
@@ -50,6 +50,14 @@ type Props = {
    *  every category in the history yet. The blue highlight on each
    *  unopened category is the primary signal; this is just a text nudge. */
   continueBlockMsg?: string | null;
+  /** Dismiss the Continue-block banner — fires on outside-click or an
+   *  explicit close. The highlighted categories stay highlighted; only
+   *  the banner goes away. */
+  onDismissContinueBlock?: () => void;
+  /** Imperative "flash this draft row blue once" trigger — fires when the
+   *  rep clicks + on an item that's already in the draft so they can see
+   *  which row is theirs on this panel. */
+  focusRowFlash?: { code: string; bumpKey: number } | null;
 };
 
 const taxMode: TaxMode = "Exclusive";
@@ -70,13 +78,79 @@ export function DraftOrderPanel({
   blockedPick,
   onDismissBlocked,
   continueBlockMsg,
+  onDismissContinueBlock,
+  focusRowFlash,
 }: Props) {
+  // Refs so we can detect clicks outside the pop-ups and dismiss them.
+  const blockedPickRef = useRef<HTMLDivElement | null>(null);
+  const continueBlockRef = useRef<HTMLDivElement | null>(null);
+
+  // Flash state for the "already in draft" row cue. flashRowKey bumps on
+  // every parent-side bump so the row remounts and the CSS animation
+  // restarts even for rapid repeat clicks on the same stock.
+  const [flashRowCode, setFlashRowCode] = useState<string | null>(null);
+  const [flashRowKey, setFlashRowKey] = useState(0);
+  useEffect(() => {
+    if (!focusRowFlash?.code) return;
+    setFlashRowCode(focusRowFlash.code);
+    setFlashRowKey((k) => k + 1);
+    const t = setTimeout(() => setFlashRowCode(null), 2000);
+    return () => clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focusRowFlash?.bumpKey]);
+
+  // Dismiss the blocked-pick toast on any mousedown outside of it.
+  useEffect(() => {
+    if (!blockedPick || !onDismissBlocked) return;
+    function onMouseDown(e: MouseEvent) {
+      const t = e.target as Node;
+      if (blockedPickRef.current && !blockedPickRef.current.contains(t)) {
+        onDismissBlocked!();
+      }
+    }
+    document.addEventListener("mousedown", onMouseDown);
+    return () => document.removeEventListener("mousedown", onMouseDown);
+  }, [blockedPick, onDismissBlocked]);
+
+  // Dismiss the Continue-blocked banner on any mousedown outside of it.
+  useEffect(() => {
+    if (!continueBlockMsg || !onDismissContinueBlock) return;
+    function onMouseDown(e: MouseEvent) {
+      const t = e.target as Node;
+      if (continueBlockRef.current && !continueBlockRef.current.contains(t)) {
+        onDismissContinueBlock!();
+      }
+    }
+    document.addEventListener("mousedown", onMouseDown);
+    return () => document.removeEventListener("mousedown", onMouseDown);
+  }, [continueBlockMsg, onDismissContinueBlock]);
   const totals = orderTotals(lines, taxTypes, taxMode, 0);
 
+  // Safety gate: every drafted line must have stock + qty, AND must have a
+  // resolved price source (Price List, Customer Deal, or Group Deal). A
+  // Zero-price line is fine as long as it came from the Price List (crates,
+  // samples). A line with `price_source = "None"` means the resolver found
+  // no entry at the rep's DC — the rep must have the Price List updated
+  // rather than letting it slip through.
+  const missingPrice = lines.find(
+    (l) => l.stock_code && l.quantity > 0 && l.price_source === "None",
+  );
   const canContinue =
     !!customer &&
     lines.length > 0 &&
-    lines.every((l) => l.stock_code && l.quantity > 0);
+    lines.every((l) => l.stock_code && l.quantity > 0) &&
+    !missingPrice;
+
+  // Grow the Units column so larger qty values aren't truncated. Item column
+  // has no explicit width — in `table-layout: fixed` it absorbs whatever's
+  // left, so widening Units automatically shrinks Item.
+  const maxUnitsDigits = Math.max(
+    2,
+    ...lines.map((l) => String(Math.floor(l.quantity || 0)).length),
+  );
+  // 10 px per digit + 20 px for input padding / borders, floored at 45 px
+  // (the original width) so short-digit orders look identical to before.
+  const unitsColumnPx = Math.max(45, maxUnitsDigits * 10 + 20);
 
   // Focus the Qty cell at `focusTarget.idx` whenever the parent signals an
   // add/merge. Scrolls the row into view too, so re-adding a stock that's
@@ -137,7 +211,12 @@ export function DraftOrderPanel({
               <tr className="text-gray-500 border-b bg-gray-50">
                 <th className="text-left py-1 px-1 font-medium">Item</th>
                 <th className="text-center py-1 px-1 font-medium w-[55px]">Pack</th>
-                <th className="text-center py-1 px-1 font-medium w-[45px] whitespace-nowrap">Units</th>
+                <th
+                  className="text-center py-1 px-1 font-medium whitespace-nowrap"
+                  style={{ width: `${unitsColumnPx}px` }}
+                >
+                  Units
+                </th>
                 <th className="text-center py-0.5 px-1 font-medium w-[40px] leading-tight">
                   <div>Price</div>
                   <div className="text-[9px] font-normal text-gray-500">(excl)</div>
@@ -189,10 +268,16 @@ export function DraftOrderPanel({
               {lines.map((line, i) => {
                 const { excl } = lineAmounts(line, taxTypes, taxMode);
                 const itemTitle = `${line.stock_code} — ${line.item_description || line.description}`;
+                const isFlashing = flashRowCode === line.stock_code;
                 return (
                   <tr
-                    key={i}
-                    className="draft-row border-b border-gray-100 align-top cursor-text"
+                    // Keying the flashing row with flashRowKey forces a remount
+                    // so the CSS animation restarts for rapid repeat clicks.
+                    key={isFlashing ? `flash-${flashRowKey}-${i}` : i}
+                    className={
+                      "draft-row border-b border-gray-100 align-top cursor-text" +
+                      (isFlashing ? " draft-row-flash-blue" : "")
+                    }
                     onClick={(e) => {
                       // Click anywhere in the row that isn't itself an interactive
                       // element → focus the Qty cell. Lets the rep tap the stock
@@ -282,22 +367,24 @@ export function DraftOrderPanel({
                         onChange={(v) =>
                           onUpdateLine(i, priceEditFromDisplay(v, line, taxTypes, taxMode))
                         }
-                        // Price is read-only — Price List / Deals resolver
-                        // is the single source of truth. Reps can't override.
+                        // Price is never editable — the Price List / Deals
+                        // resolver is the single source of truth. Lines with
+                        // source=None (price not found for the rep's DC) get
+                        // the "price not found" label below and block
+                        // Continue; the rep must have the price added to
+                        // the Price List rather than typing one here.
                         disabled
                         title={
-                          line.is_fallback_warehouse
-                            ? "Price from a different warehouse — this stock has no price list entry at your DC"
-                            : line.price_locked
+                          line.price_source && line.price_source !== "None"
                             ? `Price from ${line.price_source}`
-                            : "Prices are managed by the Price List — not editable here"
+                            : "No price found for this stock at your DC"
                         }
                         className="w-full text-right border rounded px-1 py-0.5 text-xs bg-gray-100 border-gray-200 text-gray-700 cursor-not-allowed focus:outline-none"
                         placeholder=""
                       />
-                      {line.is_fallback_warehouse && (
-                        <div className="text-[9px] text-amber-700 font-semibold leading-tight mt-0.5">
-                          other whse
+                      {line.price_source === "None" && (
+                        <div className="text-[9px] text-red-700 font-semibold leading-tight mt-0.5">
+                          price not found
                         </div>
                       )}
                     </td>
@@ -322,7 +409,10 @@ export function DraftOrderPanel({
       </div>
 
       {blockedPick && (
-        <div className="mx-2 mt-1.5 mb-5 border border-blue-200 bg-blue-50 rounded shadow-sm flex items-center gap-2 px-2.5 py-1.5 text-[11px] text-blue-900">
+        <div
+          ref={blockedPickRef}
+          className="mx-2 mt-5 mb-5 border border-blue-200 bg-blue-50 rounded shadow-sm flex items-center gap-2 px-2.5 py-1.5 text-[11px] text-blue-900"
+        >
           <AlertCircle className="w-3.5 h-3.5 text-blue-600 flex-shrink-0" />
           <div className="flex-1 min-w-0 truncate">
             <span className="font-mono font-semibold">{blockedPick.code}</span>
@@ -408,8 +498,20 @@ export function DraftOrderPanel({
       )}
 
       <div className="border-t border-gray-200 p-2">
-        {continueBlockMsg && (
-          <div className="mb-2 border border-blue-200 bg-blue-50 rounded shadow-sm flex items-center gap-2 px-2.5 py-1.5 text-[11px] text-blue-900">
+        {missingPrice && (
+          <div className="mb-2 border border-red-200 bg-red-50 rounded shadow-sm flex items-center gap-2 px-2.5 py-1.5 text-[11px] text-red-900">
+            <AlertCircle className="w-3.5 h-3.5 text-red-600 flex-shrink-0" />
+            <span className="flex-1">
+              <span className="font-mono font-semibold">{missingPrice.stock_code}</span>
+              {" has no price at your DC — add it to the Price List before continuing."}
+            </span>
+          </div>
+        )}
+        {continueBlockMsg && !missingPrice && (
+          <div
+            ref={continueBlockRef}
+            className="mb-2 border border-blue-200 bg-blue-50 rounded shadow-sm flex items-center gap-2 px-2.5 py-1.5 text-[11px] text-blue-900"
+          >
             <AlertCircle className="w-3.5 h-3.5 text-blue-600 flex-shrink-0" />
             <span className="flex-1">{continueBlockMsg}</span>
           </div>
@@ -417,6 +519,11 @@ export function DraftOrderPanel({
         <button
           onClick={onContinue}
           disabled={!canContinue}
+          title={
+            missingPrice
+              ? `No Price List entry for ${missingPrice.stock_code} at your DC — add one before continuing`
+              : undefined
+          }
           className={`w-full py-2 rounded font-semibold text-sm flex items-center justify-center gap-2 ${
             canContinue
               ? "bg-blue-600 hover:bg-blue-700 text-white"

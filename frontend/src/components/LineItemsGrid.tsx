@@ -8,6 +8,7 @@ import { NumberCell } from "./NumberCell";
 import { ProjectPicker } from "./ProjectPicker";
 import { SelectCell } from "./SelectCell";
 import { fmtNumber } from "../utils/format";
+import { isCrateStock } from "../utils/history";
 
 export type TaxMode = "Exclusive" | "Inclusive";
 
@@ -414,6 +415,10 @@ export function LineItemsGrid({
 
                         if (customerAccount) {
                           const pickedCode = item.code;
+                          // Crates are priced 0 by design — skip the
+                          // "price not found" state so they don't block
+                          // Continue or show the red label.
+                          const isCrate = isCrateStock(pickedCode);
                           api
                             .getCustomerPrices(customerAccount, [pickedCode], defaultWarehouseCode)
                             .then((map) => {
@@ -424,6 +429,7 @@ export function LineItemsGrid({
                               // used by the Incl display.
                               const excl = p?.excl_price ?? 0;
                               const incl = p?.incl_price ?? 0;
+                              const resolvedSource = p?.source ?? (isCrate ? "Price List" : "None");
                               onChange((prev) =>
                                 prev.map((l, idx) =>
                                   idx === i && l.stock_code === pickedCode
@@ -431,7 +437,7 @@ export function LineItemsGrid({
                                         ...l,
                                         unit_price: excl,
                                         unit_price_incl: incl,
-                                        price_source: p?.source ?? "None",
+                                        price_source: resolvedSource,
                                         price_locked: excl > 0,
                                         is_fallback_warehouse: p?.is_fallback_warehouse ?? false,
                                       }
@@ -440,10 +446,11 @@ export function LineItemsGrid({
                               );
                             })
                             .catch(() => {
+                              const fallbackSource = isCrate ? "Price List" : "None";
                               onChange((prev) =>
                                 prev.map((l, idx) =>
                                   idx === i && l.stock_code === pickedCode
-                                    ? { ...l, price_source: "None", price_locked: false, is_fallback_warehouse: false }
+                                    ? { ...l, price_source: fallbackSource, price_locked: false, is_fallback_warehouse: false }
                                     : l,
                                 ),
                               );
@@ -553,24 +560,24 @@ export function LineItemsGrid({
                     <NumberCell
                       className="cell-input num"
                       value={displayPrice(line, taxTypes, taxMode)}
-                      // Price is read-only: the Price List / Customer Deal /
-                      // Group Deal resolver is the single source of truth.
-                      // Reps shouldn't be able to override it on the fly.
+                      // Price is never editable — Price List / Deals resolver
+                      // is the single source of truth. Lines with
+                      // source=None (price not found at the rep's DC) show
+                      // the "price not found" label below and block
+                      // Continue upstream.
                       disabled
                       title={
-                        line.is_fallback_warehouse
-                          ? `Price from a different warehouse — your DC (${defaultWarehouseCode ?? "n/a"}) has no price list entry for this stock`
-                          : line.price_locked
+                        line.price_source && line.price_source !== "None"
                           ? `Price from ${line.price_source}`
-                          : "Prices are managed by the Price List — not editable here"
+                          : "No price found for this stock at your DC"
                       }
                       onChange={(v) =>
                         updateLine(i, priceEditFromDisplay(v, line, taxTypes, taxMode))
                       }
                     />
-                    {line.is_fallback_warehouse && (
-                      <div className="text-[9px] text-amber-700 font-semibold leading-tight mt-0.5">
-                        other whse
+                    {line.price_source === "None" && (
+                      <div className="text-[9px] text-red-700 font-semibold leading-tight mt-0.5">
+                        price not found
                       </div>
                     )}
                   </td>

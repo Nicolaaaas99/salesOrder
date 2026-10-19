@@ -22,6 +22,30 @@
   box-shadow: inset 4px 0 0 #3b82f6;     /* blue-500 bar */
 }
 
+/* Transient blue flash on the DRAFT panel row when the rep clicks + on an
+   item that's already in the draft. Signals "already added — adjust qty
+   here if you want more" without silently bumping the quantity. The
+   box-shadow is a belt-and-braces cue because `!important` inside keyframes
+   is ignored by browsers; the fill alone can get overpowered by Tailwind
+   `bg-*` utilities on the row. */
+@keyframes draftRowFlashBlue {
+  0%, 10% {
+    background-color: #93c5fd;                      /* blue-300 */
+    box-shadow: inset 0 0 0 2px #3b82f6;            /* blue-500 ring */
+  }
+  60% {
+    background-color: #dbeafe;                      /* blue-100 */
+    box-shadow: inset 0 0 0 2px rgba(59, 130, 246, 0.3);
+  }
+  100% {
+    background-color: transparent;
+    box-shadow: inset 0 0 0 2px transparent;
+  }
+}
+.draft-row-flash-blue > td {
+  animation: draftRowFlashBlue 2s ease-out;
+}
+
 :root {
   --bg: #f6f7fb;
   --panel: #ffffff;
