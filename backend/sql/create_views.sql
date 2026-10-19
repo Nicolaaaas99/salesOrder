@@ -277,10 +277,23 @@ GO
 -- 11. _vw_SOActiveDeals  (customer- and group-level volume discount deals
 --     that are effective today)
 -- =============================================================================
+-- CHANGE NOTE (added columns, no behavioural change):
+--   • Added  CL.DCLink      to the outer SELECT of both halves of the UNION.
+--   • Added  VD.iStockID    to the outer SELECT of both halves (sourced from
+--                           VDLN.iStockID in the inner subselect).
+--   • Added  VDLN.iStockID  to the inner subselect's SELECT list so the outer
+--                           can expose it.
+-- The reason: _vw_SOCustomerPrice can now OUTER APPLY to this view on IDs
+-- (DCLink + iStockID) instead of text keys (Account + StockCode), which is
+-- cheaper for the SQL optimizer.
+--
+-- To revert: delete the three new columns per section (CL.DCLink,
+-- VD.iStockID in the outer SELECT; VDLN.iStockID in the inner SELECT).
 CREATE OR ALTER VIEW dbo._vw_SOActiveDeals AS
 SELECT 'Customer Deal' AS DealType,
-       CL.Account, CL.Name,
+       CL.Account, CL.DCLink, CL.Name,                 -- CL.DCLink was NOT here before
        GRP.Code AS CustGroup,
+       VD.iStockID,                                     -- NEW column
        VD.StockCode, VD.Description_1,
        VD.dEffDate, VD.dExpDate,
        VD.fQuantity, VD.fPriceDisc, VD.fPriceDiscIncl
@@ -288,6 +301,7 @@ FROM   dbo.Client CL
 JOIN   ( SELECT IdCliClass, Code, Description FROM dbo.Cliclass ) GRP
        ON GRP.IdCliClass = CL.iClassID
 JOIN   ( SELECT VD.IDVD, VD.iARAPID,
+                VDLN.iStockID,                          -- NEW: was not selected before
                 STK.Code AS StockCode, STK.Description_1,
                 VDLN.dEffDate, VDLN.dExpDate,
                 VDLN.fQuantity, VDLN.fPriceDisc,
@@ -312,8 +326,9 @@ JOIN   ( SELECT VD.IDVD, VD.iARAPID,
 UNION ALL
 
 SELECT 'Group Deal' AS DealType,
-       CL.Account, CL.Name,
+       CL.Account, CL.DCLink, CL.Name,                 -- CL.DCLink was NOT here before
        GRP.Code AS CustGroup,
+       VD.iStockID,                                     -- NEW column
        VD.StockCode, VD.Description_1,
        VD.dEffDate, VD.dExpDate,
        VD.fQuantity, VD.fPriceDisc, VD.fPriceDiscIncl
@@ -321,6 +336,7 @@ FROM   dbo.Client CL
 JOIN   ( SELECT IdCliClass, Code, Description FROM dbo.Cliclass ) GRP
        ON GRP.IdCliClass = CL.iClassID
 JOIN   ( SELECT VD.IDVD, VD.iGroupID,
+                VDLN.iStockID,                          -- NEW: was not selected before
                 STK.Code AS StockCode, STK.Description_1,
                 VDLN.dEffDate, VDLN.dExpDate,
                 VDLN.fQuantity, VDLN.fPriceDisc,
@@ -360,11 +376,19 @@ SELECT
 FROM dbo.Client CL
 JOIN dbo._vw_SOPriceListPrices PR
       ON PR.iPriceListNameID = CL.iARPriceListNameID
+-- CHANGE NOTE (optimisation, no behavioural change):
+--   OUTER APPLY previously matched deals on text keys:
+--       WHERE AD.Account   = CL.Account
+--         AND AD.StockCode = PR.StockCode
+--   Now matches on IDs. Depends on _vw_SOActiveDeals exposing DCLink +
+--   iStockID (see change note on that view). To revert, swap this block
+--   back to the two text-key lines above and remove the DCLink / iStockID
+--   columns from _vw_SOActiveDeals.
 OUTER APPLY (
     SELECT TOP 1 DealType, StockCode, fPriceDisc, fPriceDiscIncl
     FROM dbo._vw_SOActiveDeals AD
-    WHERE AD.Account   = CL.Account
-      AND AD.StockCode = PR.StockCode
+    WHERE AD.DCLink   = CL.DCLink
+      AND AD.iStockID = PR.iStockID
     ORDER BY CASE AD.DealType WHEN 'Customer Deal' THEN 1 ELSE 2 END
 ) VD;
 GO

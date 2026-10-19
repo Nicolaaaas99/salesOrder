@@ -89,14 +89,14 @@ def export_orders_per_day(
             ISNULL(opd.order_count, 0) AS order_count
         FROM dbo.Client cl
         LEFT JOIN (
-            SELECT CL2.Account, COUNT(NUM.OrderNum) AS order_count
+            SELECT NUM.AccountID AS DCLink,
+                   COUNT(NUM.OrderNum) AS order_count
             FROM dbo.InvNum NUM
-            JOIN dbo.Client CL2 ON CL2.DCLink = NUM.AccountID
             WHERE NUM.DocType = 4
               AND NUM.DocState IN (1, 3, 4)
               AND CAST(NUM.{date_col} AS DATE) = :on_date
-            GROUP BY CL2.Account
-        ) opd ON opd.Account = cl.Account
+            GROUP BY NUM.AccountID
+        ) opd ON opd.DCLink = cl.DCLink
         WHERE ISNULL(cl.On_Hold, 0) = 0
           AND cl.ulARRoute IS NOT NULL
           AND LTRIM(RTRIM(cl.ulARRoute)) <> ''
@@ -178,6 +178,56 @@ def list_orders_today(
             order_count=int(r["order_count"] or 0),
         )
         for r in rows
+    ]
+
+
+@router.get("/deal-items", response_model=List[schemas.CustomerDealItem])
+def list_customer_deal_items(
+    customer_id: str = Query(...),
+    warehouse_code: Optional[str] = Query(None),
+    db: Session = Depends(get_db),
+):
+    """Stock items with an active Customer or Group Deal for the customer
+    at the rep's warehouse. Lets the Order Assistant surface dealed products
+    the customer has never bought so the rep can still offer them during the
+    call. Category comes from `StkItem.ulIIMainCategory` — the same column
+    `_vw_SOCustomerInvoiceHistory` uses, so a dealed item lands in the same
+    bucket it would land in if it had history."""
+    where = [
+        "pr.Account = :account",
+        "pr.PriceSource IN ('Customer Deal', 'Group Deal')",
+        "STK.ItemActive = 1",
+    ]
+    params: dict = {"account": customer_id.strip()}
+    if warehouse_code and warehouse_code.strip():
+        where.append("pr.WhseCode = :whse")
+        params["whse"] = warehouse_code.strip()
+
+    sql = f"""
+        SELECT DISTINCT
+            pr.StockCode               AS stock_code,
+            STK.Description_1          AS description,
+            STK.ulIIMainCategory       AS category,
+            pr.PriceSource             AS source,
+            pr.ExclPrice               AS unit_price,
+            pr.InclPrice               AS unit_price_incl
+        FROM dbo._vw_SOCustomerPrice pr
+        JOIN dbo.StkItem STK ON STK.StockLink = pr.iStockID
+        WHERE {' AND '.join(where)}
+        ORDER BY pr.StockCode
+    """
+    rows = db.execute(text(sql), params).mappings().all()
+    return [
+        schemas.CustomerDealItem(
+            stock_code=(r["stock_code"] or "").strip(),
+            description=(r["description"] or "").strip(),
+            category=(r["category"] or "Uncategorized").strip() or "Uncategorized",
+            source=(r["source"] or "Price List"),
+            unit_price=float(r["unit_price"] or 0),
+            unit_price_incl=float(r["unit_price_incl"] or 0),
+        )
+        for r in rows
+        if r["stock_code"]
     ]
 
 

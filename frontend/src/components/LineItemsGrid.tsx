@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Lock, Unlock } from "lucide-react";
 import type { Warehouse, TaxType } from "../api/types";
 import { api } from "../api/client";
@@ -195,6 +195,31 @@ export function LineItemsGrid({
   const prevLineCount = useRef(lines.length);
   const editedInputs = useRef<WeakSet<HTMLElement>>(new WeakSet());
 
+  // Flash state for the "already on the order" row cue. Mirrors the draft
+  // panel's behaviour: rep tries to add a duplicate stock → the existing
+  // row flashes blue and gets focused instead of a second line being
+  // created. flashRowKey bumps on every duplicate attempt so the CSS
+  // animation restarts even for rapid repeat picks.
+  const [flashRowIdx, setFlashRowIdx] = useState<number | null>(null);
+  const [flashRowKey, setFlashRowKey] = useState(0);
+  function flashExistingRow(idx: number) {
+    setFlashRowIdx(idx);
+    setFlashRowKey((k) => k + 1);
+    // Scroll the row into view and move the keyboard caret to its Qty cell
+    // so the rep can adjust immediately.
+    requestAnimationFrame(() => {
+      const row = tbodyRef.current?.children[idx] as HTMLTableRowElement | undefined;
+      if (!row) return;
+      row.scrollIntoView({ block: "nearest", behavior: "smooth" });
+      const qty = row.querySelector<HTMLInputElement>("td[data-qty] input");
+      if (qty) {
+        qty.focus();
+        qty.setSelectionRange(qty.value.length, qty.value.length);
+      }
+    });
+    setTimeout(() => setFlashRowIdx(null), 2000);
+  }
+
   function focusRowCol(rowIdx: number, colIdx?: number) {
     const rows = tbodyRef.current?.children;
     const row = rows?.[rowIdx] as HTMLTableRowElement | undefined;
@@ -373,14 +398,32 @@ export function LineItemsGrid({
               const lineDisplayed = taxMode === "Inclusive" ? lineIncl : lineExcl;
               const hasItem = !!line.stock_code;
               const cellsDisabled = !hasItem;
+              const isFlashing = flashRowIdx === i;
               return (
-                <tr key={i}>
+                <tr
+                  // Remount the row on each duplicate attempt so the CSS
+                  // animation restarts, even when the rep picks the same
+                  // dup twice.
+                  key={isFlashing ? `flash-${flashRowKey}-${i}` : i}
+                  className={isFlashing ? "row-flash-blue" : undefined}
+                >
                   <td className="num">{i + 1}</td>
                   <td>ST</td>
                   <td>
                     <ItemPicker
                       value={line.stock_code}
                       onSelect={(item) => {
+                        // Duplicate guard: this stock is already on another
+                        // line → don't create a duplicate, flash the existing
+                        // row and focus its Qty cell instead. Same UX as
+                        // the Order Assistant draft panel.
+                        const dupIdx = lines.findIndex(
+                          (l, idx) => idx !== i && l.stock_code === item.code,
+                        );
+                        if (dupIdx >= 0) {
+                          flashExistingRow(dupIdx);
+                          return;
+                        }
                         const linked = item.warehouse_codes ?? [];
                         // If the user already picked a warehouse on this row
                         // and it's still valid for the new item, keep it.
@@ -495,7 +538,7 @@ export function LineItemsGrid({
                   <td className="num">
                     {hasItem && line.pack_size > 1 ? `× ${line.pack_size}` : ""}
                   </td>
-                  <td>
+                  <td data-qty>
                     <div className="flex items-center gap-0.5">
                       <NumberCell
                         className="cell-input num"

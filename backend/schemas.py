@@ -285,6 +285,15 @@ class HistoricalOrder(BaseModel):
     totalInclAmount: float = 0.0
 
 
+class CustomerDealItem(BaseModel):
+    stock_code: str
+    description: str
+    category: str = "Uncategorized"
+    source: str = "Price List"       # 'Customer Deal' | 'Group Deal'
+    unit_price: float = 0.0
+    unit_price_incl: float = 0.0
+
+
 class OrderSuggestion(BaseModel):
     stock_code: str
     description: str

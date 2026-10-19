@@ -276,7 +276,7 @@ export function DraftOrderPanel({
                     key={isFlashing ? `flash-${flashRowKey}-${i}` : i}
                     className={
                       "draft-row border-b border-gray-100 align-top cursor-text" +
-                      (isFlashing ? " draft-row-flash-blue" : "")
+                      (isFlashing ? " row-flash-blue" : "")
                     }
                     onClick={(e) => {
                       // Click anywhere in the row that isn't itself an interactive

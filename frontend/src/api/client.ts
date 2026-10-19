@@ -17,6 +17,7 @@ import type {
   HistoryCustomer,
   CustomerOrderCount,
   HistoricalOrder,
+  CustomerDealItem,
   OrderSuggestion,
 } from "./types";
 
@@ -232,6 +233,16 @@ export const api = {
   listHistoryOrders: (customerId: string) =>
     http
       .get<HistoricalOrder[]>("/history/orders", { params: { customer_id: customerId } })
+      .then((r) => r.data),
+
+  listCustomerDealItems: (customerId: string, warehouseCode?: string | null) =>
+    http
+      .get<CustomerDealItem[]>("/history/deal-items", {
+        params: {
+          customer_id: customerId,
+          ...(warehouseCode ? { warehouse_code: warehouseCode } : {}),
+        },
+      })
       .then((r) => r.data),
 
   listOrderSuggestions: (

@@ -190,6 +190,15 @@ export type HistoricalOrder = {
   totalInclAmount: number;
 };
 
+export type CustomerDealItem = {
+  stock_code: string;
+  description: string;
+  category: string;
+  source: string; // 'Customer Deal' | 'Group Deal'
+  unit_price: number;
+  unit_price_incl: number;
+};
+
 export type OrderSuggestion = {
   stock_code: string;
   description: string;

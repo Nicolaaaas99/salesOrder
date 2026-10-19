@@ -316,12 +316,50 @@ export function OrderAssistantScreen({ onOpenOrder }: OrderAssistantProps = {}) 
       setIsLoadingOrders(true);
       setError(null);
       try {
-        const [ordersData, suggestionsData, detail] = await Promise.all([
+        const [ordersData, suggestionsData, detail, dealItems] = await Promise.all([
           api.listHistoryOrders(selectedCustomer.value),
           api.listOrderSuggestions(selectedCustomer.value, undefined, undefined, defaultWarehouseCode),
           api.getCustomer(selectedCustomer.value).catch(() => null),
+          api
+            .listCustomerDealItems(selectedCustomer.value, defaultWarehouseCode)
+            .catch(() => []),
         ]);
-        setOrders(ordersData);
+
+        // Inject synthetic 0-qty "orders" for dealed stocks the customer
+        // has never purchased, so the HistoryGrid still surfaces them
+        // (with their category + deal badge) and the rep can offer them.
+        const stocksInHistory = new Set<string>();
+        ordersData.forEach((o) =>
+          o.items.forEach((it) => it.stockCode && stocksInHistory.add(it.stockCode)),
+        );
+        const todayIso = today();
+        const dealOnlyOrders = dealItems
+          .filter((d) => d.stock_code && !stocksInHistory.has(d.stock_code))
+          .map((d, i) => ({
+            orderNum: `__deal_${d.stock_code}_${i}`,
+            orderDate: todayIso,
+            route: "",
+            customerName: "",
+            items: [
+              {
+                stockCode: d.stock_code,
+                description: d.description,
+                category: d.category,
+                quantity: 0,
+                exclAmount: 0,
+                vat: 0,
+                inclAmount: 0,
+                onOrder: false,
+              },
+            ],
+            itemCount: 1,
+            totalQuantity: 0,
+            totalExclAmount: 0,
+            totalVat: 0,
+            totalInclAmount: 0,
+          }));
+
+        setOrders([...ordersData, ...dealOnlyOrders]);
         setSuggestions(suggestionsData);
         setCustomerDetail(detail);
 
@@ -338,6 +376,9 @@ export function OrderAssistantScreen({ onOpenOrder }: OrderAssistantProps = {}) 
         ordersData.forEach((o) =>
           o.items.forEach((it) => it.stockCode && codes.add(it.stockCode))
         );
+        // Deal-only stocks need pricing + source too so the Deal badge
+        // and the resolved price flow through the same path as history.
+        dealItems.forEach((d) => d.stock_code && codes.add(d.stock_code));
         if (codes.size > 0) {
           try {
             const map = await api.getPackSizes([...codes]);
