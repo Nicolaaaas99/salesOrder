@@ -7,6 +7,7 @@ import { LoginScreen } from "./components/LoginScreen";
 import { SessionDateModal } from "./components/SessionDateModal";
 import { DefaultWarehouseModal } from "./components/DefaultWarehouseModal";
 import { AuthProvider, useAuth } from "./context/AuthContext";
+import { useAutoReloadOnNewVersion } from "./utils/autoReload";
 
 type View = "assistant" | "order" | "overview";
 
@@ -25,6 +26,10 @@ export default function App() {
 }
 
 function AppShell() {
+  // Any mounted session polls /version.json and auto-reloads on a new
+  // build — removes the need for users to manually hard-refresh after a
+  // deploy. See utils/autoReload.ts.
+  useAutoReloadOnNewVersion();
   const { token, sessionDate, defaultWarehouseCode } = useAuth();
   if (!token) return <LoginScreen />;
   if (!defaultWarehouseCode) return <DefaultWarehouseModal />;
