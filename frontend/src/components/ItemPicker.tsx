@@ -100,7 +100,17 @@ export function ItemPicker({ value, onSelect }: Props) {
           setOpen(true);
         }}
         onKeyDown={(e) => {
-          if (e.key === "Tab" && open && isTyping && (query as string).trim() && results.length > 0) {
+          // Enter + Tab both commit the top match so the rep can add an item
+          // without reaching for the mouse. Enter also prevents the browser's
+          // default (form submit) just in case.
+          if (
+            (e.key === "Enter" || e.key === "Tab") &&
+            open &&
+            isTyping &&
+            (query as string).trim() &&
+            results.length > 0
+          ) {
+            if (e.key === "Enter") e.preventDefault();
             const top = results[0];
             onSelect(top);
             setQuery(null);

@@ -27,6 +27,10 @@ type AuthContextValue = AuthState & {
   login: (username: string, password: string) => Promise<void>;
   logout: () => void;
   setSessionDate: (date: string) => void;
+  /** Persists the agent's chosen default warehouse to the backend
+   *  (_rtblAgents.iDefWhseId) and syncs local state. Called by the
+   *  DefaultWarehouseModal on first login. */
+  setDefaultWarehouseCode: (code: string) => Promise<void>;
 };
 
 const AuthContext = createContext<AuthContextValue | null>(null);
@@ -98,6 +102,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setState((prev) => ({ ...prev, sessionDate: date }));
   }, []);
 
+  const setDefaultWarehouseCode = useCallback(async (code: string) => {
+    const res = await authApi.setDefaultWarehouse(code);
+    sessionStorage.setItem("auth_default_warehouse", res.default_warehouse_code);
+    setState((prev) => ({
+      ...prev,
+      defaultWarehouseCode: res.default_warehouse_code,
+    }));
+  }, []);
+
   // On first mount with a cached token, re-fetch /auth/me so the per-session
   // tenant config (default warehouse, force-ext-order-num) stays fresh — e.g.
   // an admin flipping the Evolution setting while the rep's session is open
@@ -145,7 +158,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, []);
 
   return (
-    <AuthContext.Provider value={{ ...state, login, logout, setSessionDate }}>
+    <AuthContext.Provider
+      value={{ ...state, login, logout, setSessionDate, setDefaultWarehouseCode }}
+    >
       {children}
     </AuthContext.Provider>
   );

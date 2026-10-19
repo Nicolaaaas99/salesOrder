@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Select from "react-select";
 import AsyncSelect from "react-select/async";
-import { Truck, Users, XCircle, User, Phone, Mail } from "lucide-react";
+import { Truck, Users, XCircle, Check } from "lucide-react";
 import { api } from "../api/client";
 import type {
   CustomerDetail,
@@ -15,11 +15,13 @@ import { HistoryGrid } from "./HistoryGrid";
 import { DraftOrderPanel, type DraftLine } from "./DraftOrderPanel";
 import { OrdersModal } from "./OrdersModal";
 import { OrderSummaryModal } from "./OrderSummaryModal";
+import { CustomerContactStrip } from "./CustomerContactStrip";
 import { productKey, type CategoryProduct } from "../utils/history";
-import { today } from "../utils/date";
 import { makeEmptyLine, pickDefaultWarehouse, snapToPack } from "./LineItemsGrid";
 import { SalesOrderScreen } from "./SalesOrderScreen";
 import { useAuth } from "../context/AuthContext";
+import { today } from "../utils/date";
+import { worstDeliveryTier } from "../utils/deliveryAge";
 
 type Option = { value: string; label: string };
 
@@ -114,7 +116,14 @@ function draftFromInventoryItem(
   };
 }
 
-export function OrderAssistantScreen() {
+type OrderAssistantProps = {
+  /** Switches to the Sales Order Entry tab with the given order pre-loaded.
+   *  Supplied by App.tsx so the "Edit this order" button on the summary
+   *  modal routes through the same path as Route Overview. */
+  onOpenOrder?: (orderNo: string) => void;
+};
+
+export function OrderAssistantScreen({ onOpenOrder }: OrderAssistantProps = {}) {
   const { defaultWarehouseCode } = useAuth();
   const [routes, setRoutes] = useState<Option[]>([]);
   const [selectedRoute, setSelectedRoute] = useState<Option | null>(null);
@@ -127,11 +136,11 @@ export function OrderAssistantScreen() {
   // pending pick here while asking for confirmation.
   const [pendingCustomerPick, setPendingCustomerPick] = useState<Option | null>(null);
 
-  // Orders-today modal state for the SELECTED customer. Opens from the pill
-  // in the draft panel; is view-only (no edit).
-  const [showOrdersToday, setShowOrdersToday] = useState(false);
-  const [ordersTodayList, setOrdersTodayList] = useState<SalesOrderSearchResult[]>([]);
-  const [isLoadingOrdersToday, setIsLoadingOrdersToday] = useState(false);
+  // Unprocessed sales orders for the SELECTED customer (any date, DocState=1).
+  // Count feeds the pill next to "Existing orders" in the credit area; list
+  // is shown in the view-only orders modal when the pill is clicked.
+  const [unprocessedOrders, setUnprocessedOrders] = useState<SalesOrderSearchResult[]>([]);
+  const [showUnprocessed, setShowUnprocessed] = useState(false);
   const [viewingSummaryOf, setViewingSummaryOf] = useState<string | null>(null);
 
   const [customerDetail, setCustomerDetail] = useState<CustomerDetail | null>(
@@ -152,6 +161,25 @@ export function OrderAssistantScreen() {
   // Object identity bumps whenever a line is added/merged, so the DraftOrderPanel
   // can focus the Qty cell at the given index each time (not just when length grows).
   const [focusTarget, setFocusTarget] = useState<{ idx: number } | null>(null);
+  // Imperative "please scroll the following category header into view" trigger.
+  const [focusCategory, setFocusCategory] = useState<{ name: string; bumpKey: number } | null>(null);
+  // Imperative "mark this row as picked" trigger — set alongside focusCategory
+  // on an in-history pick, so the row inside shows the blue highlight the
+  // moment the rep manually opens the category.
+  const [focusStockCode, setFocusStockCode] = useState<{ code: string; bumpKey: number } | null>(null);
+  // Persistent set of categories that need the rep's attention. Written by
+  // picker-blocks (one category) and Continue-blocks (all unopened); entries
+  // drop as the user opens each category.
+  const [pickedCategories, setPickedCategories] = useState<Set<string> | null>(null);
+  // Categories the rep has already opened at least once for this customer.
+  // Resets when the customer changes. Used by the Continue gate.
+  const [openedCategories, setOpenedCategories] = useState<Set<string>>(new Set());
+  // Shown briefly when Continue is blocked, pointing at the highlighted
+  // categories. Clears on next state change.
+  const [continueBlockMsg, setContinueBlockMsg] = useState<string | null>(null);
+  // "We blocked that pick — add it from the history" message under the picker.
+  // Cleared on the next successful add.
+  const [blockedPick, setBlockedPick] = useState<{ code: string; description: string; category: string } | null>(null);
   const [finalizeOpen, setFinalizeOpen] = useState(false);
   const [finalizeSessionKey, setFinalizeSessionKey] = useState(0);
 
@@ -177,18 +205,22 @@ export function OrderAssistantScreen() {
     })();
   }, []);
 
-  const refreshOrdersToday = useCallback(async (routeValue: string | undefined) => {
-    if (!routeValue) {
-      setOrdersTodayMap(new Map());
-      return;
-    }
+  // Fetched globally (no route scope) so the "placed today" check mark and
+  // confirmation modal work even before the rep picks a route. Called on mount
+  // and after every successful order placement.
+  const refreshOrdersToday = useCallback(async () => {
     try {
-      const data = await api.listCustomerOrdersToday(routeValue);
+      const data = await api.listCustomerOrdersToday();
       setOrdersTodayMap(new Map(data.map((d) => [d.account, d.order_count])));
     } catch {
       setOrdersTodayMap(new Map());
     }
   }, []);
+
+  // Prime the map once on mount so same-day badges work out of the gate.
+  useEffect(() => {
+    refreshOrdersToday();
+  }, [refreshOrdersToday]);
 
   // One cache entry per route — fetched the first time the AsyncSelect's
   // loader needs the route's customer list, then reused for subsequent
@@ -202,11 +234,7 @@ export function OrderAssistantScreen() {
   // onChange so we can distinguish "typed in customer dropdown" (keep
   // customer) from "user clicked the X" (clear customer).
   useEffect(() => {
-    if (!selectedRoute) {
-      refreshOrdersToday(undefined);
-      return;
-    }
-    refreshOrdersToday(selectedRoute.value);
+    if (!selectedRoute) return;
     let cancelled = false;
     (async () => {
       let list = routeCustomersCacheRef.current.get(selectedRoute.value);
@@ -227,7 +255,7 @@ export function OrderAssistantScreen() {
     return () => {
       cancelled = true;
     };
-  }, [selectedRoute, refreshOrdersToday]);
+  }, [selectedRoute]);
 
   // AsyncSelect loader. For the route case we fetch once per route (cached in
   // the ref above) and filter in-memory — one network call per route change,
@@ -267,8 +295,17 @@ export function OrderAssistantScreen() {
       setPriceSources(new Map());
       setCustomerDetail(null);
       setDraftLines([]);
+      setOpenedCategories(new Set());
+      setPickedCategories(null);
+      setBlockedPick(null);
+      setContinueBlockMsg(null);
       return;
     }
+    // Fresh customer — rep hasn't reviewed any categories yet.
+    setOpenedCategories(new Set());
+    setPickedCategories(null);
+    setBlockedPick(null);
+    setContinueBlockMsg(null);
 
     (async () => {
       setIsLoadingOrders(true);
@@ -364,6 +401,46 @@ export function OrderAssistantScreen() {
   }, [suggestions, draftLines]);
 
   const defaultTaxTypeId = customerDetail?.default_tax_type_id ?? null;
+
+  // stock_code → drafted qty. Powers the "This Order" column in the grid and
+  // suppresses the problem-row highlight once a qty is on the draft.
+  const draftQuantities = useMemo(() => {
+    const m = new Map<string, number>();
+    for (const l of draftLines) {
+      if (!l.stock_code) continue;
+      m.set(l.stock_code, (m.get(l.stock_code) ?? 0) + (l.quantity || 0));
+    }
+    return m;
+  }, [draftLines]);
+
+  // Items the customer has purchased before. Picking one of these in the
+  // Item Picker is blocked — the rep must go through the history grid so
+  // they see the pattern, deals, and suggestion before adding.
+  //
+  // Mirrors the filter in `aggregateOrders` (utils/history.ts) that drops
+  // crate and 999000 lines from the grid — otherwise their category would
+  // appear in the "unopened" set but have no row for the rep to open,
+  // locking the Continue button forever.
+  const historyIndex = useMemo(() => {
+    const stocks = new Set<string>();
+    const stockToCategory = new Map<string, string>();
+    for (const o of orders) {
+      for (const l of o.items) {
+        if (!l.stockCode) continue;
+        if (
+          l.stockCode.includes("999000") ||
+          l.description.toLowerCase().includes("crate")
+        ) {
+          continue;
+        }
+        stocks.add(l.stockCode);
+        if (!stockToCategory.has(l.stockCode) && l.category) {
+          stockToCategory.set(l.stockCode, l.category);
+        }
+      }
+    }
+    return { stocks, stockToCategory };
+  }, [orders]);
 
   const addLine = useCallback(
     (line: DraftLine) => {
@@ -511,36 +588,130 @@ export function OrderAssistantScreen() {
 
   const handleAddItem = useCallback(
     (item: InventoryItem) => {
+      // Enforce "add in-history items from the history grid". The point of
+      // the app is that reps review each customer's purchase cadence before
+      // adding — the picker is only for genuinely new products.
+      if (historyIndex.stocks.has(item.code)) {
+        const category = historyIndex.stockToCategory.get(item.code) ?? "";
+        setBlockedPick({ code: item.code, description: item.description, category });
+        if (category) {
+          setPickedCategories((prev) => {
+            const next = new Set(prev ?? []);
+            next.add(category);
+            return next;
+          });
+          setFocusCategory((prev) => ({
+            name: category,
+            bumpKey: (prev?.bumpKey ?? 0) + 1,
+          }));
+          setFocusStockCode((prev) => ({
+            code: item.code,
+            bumpKey: (prev?.bumpKey ?? 0) + 1,
+          }));
+        }
+        return;
+      }
+      // New product — safe to add straight from the picker.
       addLine(draftFromInventoryItem(item, 0, defaultTaxTypeId, defaultWarehouseCode));
+      setBlockedPick(null);
     },
-    [addLine, defaultTaxTypeId, defaultWarehouseCode]
+    [addLine, defaultTaxTypeId, defaultWarehouseCode, historyIndex]
   );
+
+  // Record the category as reviewed and drop it from the "needs attention"
+  // set so the blue highlight disappears automatically.
+  const handleCategoryOpened = useCallback((name: string) => {
+    setOpenedCategories((prev) => {
+      if (prev.has(name)) return prev;
+      const next = new Set(prev);
+      next.add(name);
+      return next;
+    });
+    setPickedCategories((prev) => {
+      if (!prev || !prev.has(name)) return prev;
+      const next = new Set(prev);
+      next.delete(name);
+      return next.size > 0 ? next : null;
+    });
+    setContinueBlockMsg(null);
+  }, []);
+
+  // Categories (from history) the rep hasn't opened for this customer yet.
+  const unopenedCategories = useMemo(() => {
+    const all = new Set<string>();
+    historyIndex.stockToCategory.forEach((c) => c && all.add(c));
+    const out: string[] = [];
+    all.forEach((c) => {
+      if (!openedCategories.has(c)) out.push(c);
+    });
+    return out;
+  }, [historyIndex, openedCategories]);
 
   const handleContinue = useCallback(() => {
     if (!customerDetail || draftLines.length === 0) return;
+    // Gate: the rep must have opened every category in the customer's
+    // history at least once before placing the order. The blue highlight
+    // on each unopened category points them at what's left to review.
+    if (unopenedCategories.length > 0) {
+      setPickedCategories(new Set(unopenedCategories));
+      setFocusCategory((prev) => ({
+        name: unopenedCategories[0],
+        bumpKey: (prev?.bumpKey ?? 0) + 1,
+      }));
+      setContinueBlockMsg(
+        unopenedCategories.length === 1
+          ? "Review the highlighted category before continuing."
+          : `Review the ${unopenedCategories.length} highlighted categories before continuing.`,
+      );
+      return;
+    }
+    setContinueBlockMsg(null);
     setFinalizeOpen(true);
-  }, [customerDetail, draftLines.length]);
+  }, [customerDetail, draftLines.length, unopenedCategories]);
 
   const handleFinalizeClose = useCallback(() => setFinalizeOpen(false), []);
 
-  // Fetch today's orders for the selected customer when the modal opens.
-  useEffect(() => {
-    if (!showOrdersToday || !selectedCustomer) {
-      setOrdersTodayList([]);
+  // Fetch all unprocessed orders (any date, DocState=1) for the selected
+  // customer. Runs when the customer changes so the pill count next to
+  // "Existing orders" is ready the moment the credit area renders. Also
+  // callable after a cancel so the modal + badge drop the vanished order.
+  const refreshUnprocessedOrders = useCallback(async () => {
+    if (!selectedCustomer) {
+      setUnprocessedOrders([]);
       return;
     }
-    (async () => {
-      setIsLoadingOrdersToday(true);
-      try {
-        const data = await api.listOrdersByOrderDate(selectedCustomer.value, today());
-        setOrdersTodayList(data);
-      } catch {
-        setOrdersTodayList([]);
-      } finally {
-        setIsLoadingOrdersToday(false);
-      }
-    })();
-  }, [showOrdersToday, selectedCustomer]);
+    try {
+      const data = await api.searchSalesOrders({
+        account: selectedCustomer.value,
+        states: [1],
+      });
+      setUnprocessedOrders(data);
+    } catch {
+      setUnprocessedOrders([]);
+    }
+  }, [selectedCustomer]);
+
+  useEffect(() => {
+    refreshUnprocessedOrders();
+  }, [refreshUnprocessedOrders]);
+
+  // Keep the Order Assistant in sync with cross-user / cross-tab changes:
+  //   • `orders:mutated` fires from this app whenever an order is created,
+  //     updated, cancelled, or has its delivery date changed.
+  //   • `focus` catches the "another rep cancelled while I was elsewhere"
+  //     case — tabbing back to the window re-fetches everything.
+  useEffect(() => {
+    const refreshAll = () => {
+      refreshOrdersToday();
+      refreshUnprocessedOrders();
+    };
+    window.addEventListener("orders:mutated", refreshAll);
+    window.addEventListener("focus", refreshAll);
+    return () => {
+      window.removeEventListener("orders:mutated", refreshAll);
+      window.removeEventListener("focus", refreshAll);
+    };
+  }, [refreshOrdersToday, refreshUnprocessedOrders]);
 
   const handleFinalizePlaced = useCallback(() => {
     // Soft reload: close the finalize sheet and clear the customer selection,
@@ -554,10 +725,10 @@ export function OrderAssistantScreen() {
     setFinalizeSessionKey((k) => k + 1);
     // Refresh the "orders today" badges so the just-placed order shows up next
     // to the customer immediately.
-    refreshOrdersToday(selectedRoute?.value);
+    refreshOrdersToday();
     // No second success modal — SalesOrderScreen already showed one with the
     // actual order number before it fired onPlaced.
-  }, [refreshOrdersToday, selectedRoute]);
+  }, [refreshOrdersToday]);
 
   return (
     <div className="h-full bg-gray-50 p-2 flex flex-col">
@@ -593,16 +764,16 @@ export function OrderAssistantScreen() {
         </div>
       )}
 
-      {showOrdersToday && selectedCustomer && (
+      {showUnprocessed && selectedCustomer && (
         <OrdersModal
           customer={{
             id: selectedCustomer.value,
             display: selectedCustomer.label.replace(/^[^—]+—\s*/, ""),
           }}
-          date={today()}
-          orders={ordersTodayList}
-          isLoading={isLoadingOrdersToday}
-          onClose={() => setShowOrdersToday(false)}
+          date="all unprocessed"
+          orders={unprocessedOrders}
+          isLoading={false}
+          onClose={() => setShowUnprocessed(false)}
           onViewOrder={(no) => setViewingSummaryOf(no)}
         />
       )}
@@ -611,7 +782,29 @@ export function OrderAssistantScreen() {
         <OrderSummaryModal
           orderNo={viewingSummaryOf}
           onClose={() => setViewingSummaryOf(null)}
-          // No onEdit — Order Assistant context is view-only, no "go to source".
+          onEdit={
+            onOpenOrder
+              ? (no) => {
+                  onOpenOrder(no);
+                  setViewingSummaryOf(null);
+                  setShowUnprocessed(false);
+                }
+              : undefined
+          }
+          onCancel={() => {
+            setViewingSummaryOf(null);
+            setShowUnprocessed(false);
+            // Refresh everything the cancelled order touches so the UI drops
+            // it immediately: the unprocessed list / badge for this customer,
+            // and the "orders today" map (which may have included it).
+            refreshUnprocessedOrders();
+            refreshOrdersToday();
+          }}
+          onDeliveryDateChanged={() => {
+            // Delivery date change doesn't move the order out of
+            // Unprocessed, so just refresh the lists that display the date.
+            refreshUnprocessedOrders();
+          }}
         />
       )}
 
@@ -655,6 +848,18 @@ export function OrderAssistantScreen() {
               defaultOptions
               loadOptions={loadCustomerOptions}
               value={selectedCustomer}
+              styles={{
+                ...selectStyles,
+                option: (base: any, state: any) => {
+                  const placed = (ordersTodayMap.get((state.data as Option).value) ?? 0) > 0;
+                  return {
+                    ...selectStyles.option(base, state),
+                    backgroundColor: state.isFocused
+                      ? placed ? "#a7f3d0" : "#eff6ff"
+                      : placed ? "#d1fae5" : "white",
+                  };
+                },
+              }}
               onChange={(opt) => {
                 const next = opt as Option | null;
                 if (!next) {
@@ -673,12 +878,14 @@ export function OrderAssistantScreen() {
                 const o = opt as Option;
                 const count = ordersTodayMap.get(o.value) ?? 0;
                 return (
-                  <div className="flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-2 min-w-0">
                     <span className="truncate">{o.label}</span>
                     {count > 0 && (
-                      <span className="flex-shrink-0 text-[10px] font-semibold bg-emerald-100 text-emerald-800 border border-emerald-300 px-1.5 py-0.5 rounded-full">
-                        {count} today
-                      </span>
+                      <Check
+                        className="flex-shrink-0 w-6 h-6 text-emerald-600"
+                        strokeWidth={3.5}
+                        aria-label="Order placed today"
+                      />
                     )}
                   </div>
                 );
@@ -686,63 +893,16 @@ export function OrderAssistantScreen() {
               placeholder={
                 selectedRoute ? "Search customer in route..." : "Search any customer..."
               }
-              styles={selectStyles}
               isClearable
             />
           </div>
         </div>
 
         {customerDetail && (
-          <div className="bg-white rounded border px-3 py-1.5 shadow-sm flex items-center gap-4 text-xs flex-shrink-0">
-            <span className="flex items-center gap-1 text-gray-700 min-w-0">
-              <User className="w-3 h-3 text-gray-400 flex-shrink-0" />
-              <span className="font-semibold truncate" title={customerDetail.contact_name || "—"}>
-                {customerDetail.contact_name || "—"}
-              </span>
-            </span>
-            <span className="flex items-center gap-1 text-gray-700 min-w-0">
-              <Phone className="w-3 h-3 text-gray-400 flex-shrink-0" />
-              {customerDetail.contact_tel ? (
-                <a
-                  href={`tel:${customerDetail.contact_tel}`}
-                  className="font-mono hover:text-blue-600 truncate"
-                  title={`Phone 1: ${customerDetail.contact_tel}`}
-                >
-                  {customerDetail.contact_tel}
-                </a>
-              ) : (
-                <span className="text-gray-400">—</span>
-              )}
-            </span>
-            <span className="flex items-center gap-1 text-gray-700 min-w-0">
-              <Phone className="w-3 h-3 text-gray-400 flex-shrink-0" />
-              {customerDetail.contact_tel2 ? (
-                <a
-                  href={`tel:${customerDetail.contact_tel2}`}
-                  className="font-mono hover:text-blue-600 truncate"
-                  title={`Phone 2: ${customerDetail.contact_tel2}`}
-                >
-                  {customerDetail.contact_tel2}
-                </a>
-              ) : (
-                <span className="text-gray-400">—</span>
-              )}
-            </span>
-            <span className="flex items-center gap-1 text-gray-700 min-w-0 flex-1">
-              <Mail className="w-3 h-3 text-gray-400 flex-shrink-0" />
-              {customerDetail.contact_email ? (
-                <a
-                  href={`mailto:${customerDetail.contact_email}`}
-                  className="hover:text-blue-600 truncate"
-                  title={customerDetail.contact_email}
-                >
-                  {customerDetail.contact_email}
-                </a>
-              ) : (
-                <span className="text-gray-400">—</span>
-              )}
-            </span>
-          </div>
+          <CustomerContactStrip
+            customer={customerDetail}
+            onUpdated={setCustomerDetail}
+          />
         )}
 
         {error && (
@@ -768,6 +928,11 @@ export function OrderAssistantScreen() {
             priceSources={priceSources}
             onAddToOrder={handleAddToOrder}
             onAddAllSuggested={handleAddAllSuggested}
+            draftQuantities={draftQuantities}
+            focusCategory={focusCategory ?? undefined}
+            focusStockCode={focusStockCode ?? undefined}
+            pickedCategories={pickedCategories}
+            onCategoryOpened={handleCategoryOpened}
             heightStyle="100%"
           />
 
@@ -782,10 +947,12 @@ export function OrderAssistantScreen() {
               onContinue={handleContinue}
               taxTypes={taxTypes}
               focusTarget={focusTarget}
-              ordersTodayCount={
-                selectedCustomer ? ordersTodayMap.get(selectedCustomer.value) : undefined
-              }
-              onShowOrdersToday={() => setShowOrdersToday(true)}
+              unprocessedCount={unprocessedOrders.length}
+              unprocessedWorstTier={worstDeliveryTier(unprocessedOrders, today())}
+              onShowUnprocessed={() => setShowUnprocessed(true)}
+              blockedPick={blockedPick}
+              onDismissBlocked={() => setBlockedPick(null)}
+              continueBlockMsg={continueBlockMsg}
             />
           </div>
         </div>

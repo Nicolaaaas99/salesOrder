@@ -33,6 +33,18 @@ DOC_STATE_LABELS = {
 }
 
 
+def _resolve_agent_id(db: Session, username: str) -> Optional[int]:
+    """Look up the Evolution agent's idAgents from the username on the token
+    so cancel / delivery-date updates can stamp iINVNUMAgentID on InvNum.
+    Returns None if the user isn't registered as an active agent (we still
+    perform the update — the audit column just stays untouched)."""
+    row = db.execute(
+        text("SELECT idAgents FROM dbo._rtblAgents WHERE cAgentName = :name AND bAgentActive = 1"),
+        {"name": (username or "").strip()},
+    ).mappings().first()
+    return int(row["idAgents"]) if row and row["idAgents"] is not None else None
+
+
 def _to_date(v) -> Optional[date]:
     if v is None:
         return None
@@ -164,6 +176,7 @@ SEARCH_SQL = """
         MAX(inv.Description)   AS description,
         MAX(inv.InvDate)       AS invoice_date,
         MAX(inv.OrderDate)     AS order_date,
+        MAX(inv.DeliveryDate)  AS delivery_date,
         MAX(inv.OrdTotIncl)    AS total_incl,
         MAX(c.Account)         AS customer_account,
         MAX(c.Name)            AS customer_name
@@ -229,6 +242,7 @@ def search_sales_orders(
             description=r["description"] or "",
             invoice_date=_to_date(r["invoice_date"]),
             order_date=_to_date(r["order_date"]),
+            delivery_date=_to_date(r["delivery_date"]),
             customer_account=r["customer_account"] or "",
             customer_name=r["customer_name"] or "",
             doc_state=int(r["doc_state"] or 0),
@@ -264,6 +278,7 @@ def list_orders_by_order_date(
             inv.Description   AS description,
             inv.InvDate       AS invoice_date,
             inv.OrderDate     AS order_date,
+            inv.DeliveryDate  AS delivery_date,
             inv.DocState      AS doc_state,
             inv.OrdTotIncl    AS total_incl,
             c.Account         AS customer_account,
@@ -289,6 +304,7 @@ def list_orders_by_order_date(
             description=r["description"] or "",
             invoice_date=_to_date(r["invoice_date"]),
             order_date=_to_date(r["order_date"]),
+            delivery_date=_to_date(r["delivery_date"]),
             customer_account=r["customer_account"] or "",
             customer_name=r["customer_name"] or "",
             doc_state=int(r["doc_state"] or 0),
@@ -488,3 +504,150 @@ def update_order(
         raise
     except Exception as e:
         raise HTTPException(500, f"Failed to update sales order: {e}")
+
+
+@router.patch("/{order_no}/delivery-date", response_model=schemas.SalesOrderDetail)
+def update_delivery_date(
+    order_no: str,
+    payload: schemas.UpdateDeliveryDateRequest,
+    db: Session = Depends(get_db),
+    username: str = Depends(get_current_user),
+):
+    """Reschedule an unprocessed order by just moving its delivery date.
+    Used by the summary modal when the rep opens an order whose delivery
+    date has already passed — full editing is disabled in that case but a
+    reschedule is still allowed. Full editing of future orders goes through
+    the Sales Order Entry PUT path."""
+    header = db.execute(
+        text(
+            "SELECT DocState FROM InvNum WHERE OrderNum = :order_no AND DocType = 4"
+        ),
+        {"order_no": order_no},
+    ).mappings().first()
+    if not header:
+        raise HTTPException(404, f"Sales order '{order_no}' not found")
+    current_state = int(header["DocState"] or 0)
+    if current_state != 1:
+        raise HTTPException(
+            400,
+            f"Sales order '{order_no}' has state "
+            f"{DOC_STATE_LABELS.get(current_state, 'Unknown')} "
+            f"and cannot be rescheduled. Only Unprocessed orders can be rescheduled.",
+        )
+
+    agent_id = _resolve_agent_id(db, username)
+    try:
+        db.execute(
+            text(
+                """
+                UPDATE InvNum
+                SET DeliveryDate   = :new_date,
+                    iINVNUMAgentID = COALESCE(:agent_id, iINVNUMAgentID)
+                WHERE OrderNum = :order_no
+                  AND DocType = 4
+                  AND DocState = 1
+                """
+            ),
+            {
+                "new_date": payload.delivery_date,
+                "order_no": order_no,
+                "agent_id": agent_id,
+            },
+        )
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(500, f"Failed to reschedule sales order: {e}")
+
+    logger.info(
+        "update_delivery_date: order_no=%s new_date=%s by %s",
+        order_no,
+        payload.delivery_date,
+        username,
+    )
+    return _load_sales_order(order_no, db)
+
+
+@router.post("/{order_no}/cancel", response_model=schemas.CancelOrderResponse)
+def cancel_order(
+    order_no: str,
+    db: Session = Depends(get_db),
+    username: str = Depends(get_current_user),
+):
+    """Cancel an unprocessed sales order (DocState 1 → 7) and recompute the
+    QtyOnSO column on _etblStockQtys so stock-on-order reflects the drop.
+    Only Unprocessed orders are cancellable — Partially Processed and later
+    states have already created shipments and must be reversed in Evolution."""
+    header = db.execute(
+        text(
+            "SELECT DocState FROM InvNum WHERE OrderNum = :order_no AND DocType = 4"
+        ),
+        {"order_no": order_no},
+    ).mappings().first()
+    if not header:
+        raise HTTPException(404, f"Sales order '{order_no}' not found")
+    current_state = int(header["DocState"] or 0)
+    if current_state != 1:
+        raise HTTPException(
+            400,
+            f"Sales order '{order_no}' has state "
+            f"{DOC_STATE_LABELS.get(current_state, 'Unknown')} "
+            f"and cannot be cancelled. Only Unprocessed orders can be cancelled.",
+        )
+
+    agent_id = _resolve_agent_id(db, username)
+    try:
+        db.execute(
+            text(
+                """
+                UPDATE InvNum
+                SET DocState       = 7,
+                    iINVNUMAgentID = COALESCE(:agent_id, iINVNUMAgentID)
+                WHERE OrderNum = :order_no
+                  AND DocType = 4
+                  AND DocState = 1
+                """
+            ),
+            {"order_no": order_no, "agent_id": agent_id},
+        )
+
+        # Recompute QtyOnSO across all stock/warehouse combos with open SO
+        # activity (DocState 1 or 3). Mirrors the SQL script the business
+        # supplied — see note in the PR description about the INNER JOIN
+        # leaving a combo with no remaining open lines un-reset.
+        db.execute(
+            text(
+                """
+                UPDATE QTY
+                SET QtyOnSO = SO.SOQty
+                FROM _etblStockQtys QTY
+                JOIN (
+                    SELECT iStockCodeID, iWarehouseID,
+                           SUM(fQuantity - fQtyProcessed) AS SOQty
+                    FROM _btblInvoiceLines LIN
+                    JOIN (
+                        SELECT AutoIndex
+                        FROM InvNum
+                        WHERE DocType = 4
+                          AND DocState IN (1, 3)
+                    ) NUM ON NUM.AutoIndex = LIN.iInvoiceID
+                    GROUP BY iWarehouseID, iStockCodeID
+                ) SO ON SO.iStockCodeID = QTY.StockID
+                    AND SO.iWarehouseID = QTY.WhseID
+                """
+            )
+        )
+
+        db.commit()
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(500, f"Failed to cancel sales order: {e}")
+
+    logger.info("cancel_order: order_no=%s cancelled by %s", order_no, username)
+    return schemas.CancelOrderResponse(
+        order_no=order_no,
+        doc_state=7,
+        doc_state_label=DOC_STATE_LABELS.get(7, "Cancelled"),
+    )

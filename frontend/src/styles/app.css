@@ -1,3 +1,27 @@
+/* Focus marker on the row the item picker just added — reuses the blue that
+   used to flag suggested rows so it matches how draft-order lines are
+   indicated. Applied to every td so it survives Tailwind bg utilities and
+   the sticky left col (which inherits background). Clears when the item
+   leaves the draft or another history row is actioned. */
+.history-row-picked > td {
+  background-color: #eff6ff !important;  /* blue-50 — soft fill */
+}
+.history-row-picked > td:first-child {
+  box-shadow: inset 4px 0 0 #3b82f6;     /* blue-500 bar on the left */
+}
+
+/* Persistent blue highlight on category headers that need the rep's
+   attention — set by the item picker when an in-history pick is rejected,
+   and by Continue-to-order when categories haven't been opened yet. Clears
+   automatically when the category is opened. Uses the same blue scale as
+   the picked-row highlight so the two feel like one language. */
+.history-category-picked > td {
+  background-color: #eff6ff !important;  /* blue-50 */
+}
+.history-category-picked > td:first-child {
+  box-shadow: inset 4px 0 0 #3b82f6;     /* blue-500 bar */
+}
+
 :root {
   --bg: #f6f7fb;
   --panel: #ffffff;

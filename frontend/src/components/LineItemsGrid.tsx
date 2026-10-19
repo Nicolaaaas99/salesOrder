@@ -505,9 +505,20 @@ export function LineItemsGrid({
                         <button
                           type="button"
                           disabled={cellsDisabled}
-                          onClick={() =>
-                            updateLine(i, { pack_override: !line.pack_override })
-                          }
+                          onClick={() => {
+                            const nextOverride = !line.pack_override;
+                            // Re-locking (override off) must snap any off-pack
+                            // qty — otherwise the rep could unlock, type an
+                            // off-pack value, re-lock, and leave the row looking
+                            // like a locked-pack order with the wrong qty.
+                            const nextQty = nextOverride
+                              ? line.quantity
+                              : snapToPack(line.quantity, line.pack_size);
+                            updateLine(i, {
+                              pack_override: nextOverride,
+                              quantity: nextQty,
+                            });
+                          }}
                           title={
                             line.pack_override
                               ? "Pack size override is ON — click to re-enable pack snapping"
@@ -542,13 +553,16 @@ export function LineItemsGrid({
                     <NumberCell
                       className="cell-input num"
                       value={displayPrice(line, taxTypes, taxMode)}
-                      disabled={cellsDisabled || line.price_locked}
+                      // Price is read-only: the Price List / Customer Deal /
+                      // Group Deal resolver is the single source of truth.
+                      // Reps shouldn't be able to override it on the fly.
+                      disabled
                       title={
                         line.is_fallback_warehouse
                           ? `Price from a different warehouse — your DC (${defaultWarehouseCode ?? "n/a"}) has no price list entry for this stock`
                           : line.price_locked
                           ? `Price from ${line.price_source}`
-                          : undefined
+                          : "Prices are managed by the Price List — not editable here"
                       }
                       onChange={(v) =>
                         updateLine(i, priceEditFromDisplay(v, line, taxTypes, taxMode))

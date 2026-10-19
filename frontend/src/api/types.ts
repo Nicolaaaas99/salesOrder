@@ -92,6 +92,7 @@ export type SalesOrderSearchResult = {
   description: string;
   invoice_date: string | null;
   order_date: string | null;
+  delivery_date: string | null;
   customer_account: string;
   customer_name: string;
   doc_state: number;

@@ -112,7 +112,7 @@ SELECT
     C.ulARRoute AS Route,
     C.Physical1, C.Physical2, C.Physical3, C.Physical4, C.Physical5, C.PhysicalPC,
     C.Post1,     C.Post2,     C.Post3,     C.Post4,     C.Post5,     C.PostPC,
-    C.Contact_Person, C.Telephone, C.Facsimile, C.EMail,
+    C.Contact_Person, C.Telephone, C.Telephone2, C.EMail,
     C.iDefTaxTypeID,
     C.Credit_Limit,
     ISNULL(C.CheckTerms, 0)         AS CheckTerms,

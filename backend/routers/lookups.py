@@ -98,7 +98,7 @@ def _build_customer_detail(row) -> schemas.CustomerDetail:
         ),
         contact_name=g("Contact_Person", "") or "",
         contact_tel=g("Telephone", "") or "",
-        contact_tel2=g("Facsimile", "") or "",
+        contact_tel2=g("Telephone2", "") or "",
         contact_email=g("EMail", "") or "",
         default_tax_type_id=int(def_tax) if def_tax else None,
         credit_limit=credit_limit,
@@ -121,6 +121,45 @@ def get_customer(account: str, db: Session = Depends(get_db)):
     row = db.execute(text(CUSTOMER_CREDIT_SQL), {"account": account}).mappings().first()
     if not row:
         raise HTTPException(404, f"Customer '{account}' not found")
+    return _build_customer_detail(row)
+
+
+@router.patch("/customers/{account}/contact", response_model=schemas.CustomerDetail)
+def update_customer_contact(
+    account: str,
+    payload: schemas.CustomerContactUpdate,
+    db: Session = Depends(get_db),
+):
+    """Update the Client's contact person and two telephone numbers. The rep
+    uses the inline-edit strip in the Order Assistant to keep these in sync
+    with what the customer tells them during the call."""
+    exists = db.execute(
+        text("SELECT 1 FROM dbo.Client WHERE Account = :account"),
+        {"account": account},
+    ).first()
+    if not exists:
+        raise HTTPException(404, f"Customer '{account}' not found")
+
+    db.execute(
+        text(
+            """
+            UPDATE dbo.Client
+            SET Contact_Person = :name,
+                Telephone      = :tel,
+                Telephone2     = :tel2
+            WHERE Account = :account
+            """
+        ),
+        {
+            "account": account,
+            "name": (payload.contact_name or "").strip(),
+            "tel": (payload.contact_tel or "").strip(),
+            "tel2": (payload.contact_tel2 or "").strip(),
+        },
+    )
+    db.commit()
+
+    row = db.execute(text(CUSTOMER_CREDIT_SQL), {"account": account}).mappings().first()
     return _build_customer_detail(row)
 
 
@@ -170,6 +209,21 @@ def list_warehouses(db: Session = Depends(get_db)):
     sql = """
         SELECT Code AS code, Description AS description
         FROM dbo._vw_SOWarehouses
+        ORDER BY Code
+    """
+    rows = db.execute(text(sql)).mappings().all()
+    return [schemas.Warehouse(**r) for r in rows]
+
+
+@router.get("/warehouses/default-choices", response_model=List[schemas.Warehouse])
+def list_warehouse_default_choices(db: Session = Depends(get_db)):
+    """Only the DC warehouses a telesales agent is allowed to pick as their
+    default. Mirrors the WhseLink filter on _vw_SOAgentDefaultWhse so the
+    first-login prompt can't offer invalid DCs."""
+    sql = """
+        SELECT Code AS code, Description AS description
+        FROM dbo._vw_SOWarehouses
+        WHERE WhseLink IN (48, 49)
         ORDER BY Code
     """
     rows = db.execute(text(sql)).mappings().all()

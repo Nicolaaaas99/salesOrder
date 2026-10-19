@@ -1,5 +1,5 @@
 import { useEffect, useRef } from "react";
-import { ArrowRight, Trash2, Plus, ListOrdered, Lock, Unlock } from "lucide-react";
+import { ArrowRight, Trash2, Plus, Lock, Unlock, AlertCircle, X } from "lucide-react";
 import type {
   CustomerDetail,
   InventoryItem,
@@ -16,6 +16,7 @@ import {
 import { CreditStatus } from "./CreditStatus";
 import { ItemPicker } from "./ItemPicker";
 import { NumberCell } from "./NumberCell";
+import { snapToPack } from "./LineItemsGrid";
 
 export type DraftLine = LineRow;
 
@@ -31,10 +32,24 @@ type Props = {
   /** Object identity bumps whenever a line is added/merged; the Qty cell at
    *  `idx` is then focused + scrolled into view. */
   focusTarget?: { idx: number } | null;
-  /** When set, the credit area shows a green "N today" pill. Clicking it
-   *  calls `onShowOrdersToday`. */
-  ordersTodayCount?: number;
-  onShowOrdersToday?: () => void;
+  /** Count of unprocessed sales orders for this customer (any date). When
+   *  > 0, a clickable pill is shown next to the "Existing orders" line in
+   *  the credit status area. */
+  unprocessedCount?: number;
+  /** Tier of the oldest/worst unprocessed order's delivery date — tints the
+   *  count badge so an overdue order makes the pill red. */
+  unprocessedWorstTier?: import("../utils/deliveryAge").DeliveryAgeTier;
+  onShowUnprocessed?: () => void;
+  /** Set by the parent when the item picker rejects an in-history pick.
+   *  Renders a short notice above the picker telling the rep to add it from
+   *  the history grid instead. Cleared automatically on the next successful
+   *  add, or manually via `onDismissBlocked`. */
+  blockedPick?: { code: string; description: string; category: string } | null;
+  onDismissBlocked?: () => void;
+  /** Shown briefly when Continue is blocked because the rep hasn't opened
+   *  every category in the history yet. The blue highlight on each
+   *  unopened category is the primary signal; this is just a text nudge. */
+  continueBlockMsg?: string | null;
 };
 
 const taxMode: TaxMode = "Exclusive";
@@ -49,8 +64,12 @@ export function DraftOrderPanel({
   onContinue,
   taxTypes,
   focusTarget,
-  ordersTodayCount,
-  onShowOrdersToday,
+  unprocessedCount,
+  unprocessedWorstTier,
+  onShowUnprocessed,
+  blockedPick,
+  onDismissBlocked,
+  continueBlockMsg,
 }: Props) {
   const totals = orderTotals(lines, taxTypes, taxMode, 0);
 
@@ -204,9 +223,20 @@ export function DraftOrderPanel({
                         {line.pack_size > 1 && (
                           <button
                             type="button"
-                            onClick={() =>
-                              onUpdateLine(i, { pack_override: !line.pack_override })
-                            }
+                            onClick={() => {
+                              const nextOverride = !line.pack_override;
+                              // Re-locking (override off) must snap any off-pack
+                              // qty — otherwise the rep could unlock, type an
+                              // off-pack value, re-lock, and leave the row
+                              // looking locked but holding a non-pack qty.
+                              const nextQty = nextOverride
+                                ? line.quantity
+                                : snapToPack(line.quantity, line.pack_size);
+                              onUpdateLine(i, {
+                                pack_override: nextOverride,
+                                quantity: nextQty,
+                              });
+                            }}
                             title={
                               line.pack_override
                                 ? "Pack size override is ON — click to re-enable pack snapping"
@@ -252,21 +282,17 @@ export function DraftOrderPanel({
                         onChange={(v) =>
                           onUpdateLine(i, priceEditFromDisplay(v, line, taxTypes, taxMode))
                         }
-                        disabled={line.price_locked}
+                        // Price is read-only — Price List / Deals resolver
+                        // is the single source of truth. Reps can't override.
+                        disabled
                         title={
                           line.is_fallback_warehouse
                             ? "Price from a different warehouse — this stock has no price list entry at your DC"
                             : line.price_locked
                             ? `Price from ${line.price_source}`
-                            : undefined
+                            : "Prices are managed by the Price List — not editable here"
                         }
-                        className={`w-full text-right border rounded px-1 py-0.5 text-xs focus:outline-none ${
-                          line.price_locked
-                            ? "bg-gray-100 border-gray-200 text-gray-700 cursor-not-allowed"
-                            : line.unit_price <= 0
-                              ? "bg-red-50 border-red-400 focus:border-red-500"
-                              : "bg-white border-gray-200 focus:border-blue-500"
-                        }`}
+                        className="w-full text-right border rounded px-1 py-0.5 text-xs bg-gray-100 border-gray-200 text-gray-700 cursor-not-allowed focus:outline-none"
                         placeholder=""
                       />
                       {line.is_fallback_warehouse && (
@@ -294,6 +320,34 @@ export function DraftOrderPanel({
           </table>
         )}
       </div>
+
+      {blockedPick && (
+        <div className="mx-2 mt-1.5 mb-5 border border-blue-200 bg-blue-50 rounded shadow-sm flex items-center gap-2 px-2.5 py-1.5 text-[11px] text-blue-900">
+          <AlertCircle className="w-3.5 h-3.5 text-blue-600 flex-shrink-0" />
+          <div className="flex-1 min-w-0 truncate">
+            <span className="font-mono font-semibold">{blockedPick.code}</span>
+            {blockedPick.category ? (
+              <>
+                {" is in "}
+                <span className="font-semibold">{blockedPick.category}</span>
+                {" — add from history"}
+              </>
+            ) : (
+              " is already in history"
+            )}
+          </div>
+          {onDismissBlocked && (
+            <button
+              type="button"
+              onClick={onDismissBlocked}
+              className="text-blue-500 hover:text-blue-800 flex-shrink-0"
+              title="Dismiss"
+            >
+              <X className="w-3 h-3" />
+            </button>
+          )}
+        </div>
+      )}
 
       <div className="border-t border-gray-200 bg-white px-2 py-1.5 draft-add-item flex items-center gap-2">
         <span className="flex items-center gap-1 text-xs font-semibold text-blue-600 shrink-0">
@@ -342,23 +396,24 @@ export function DraftOrderPanel({
 
       {customer && (
         <div className="border-t border-gray-200 px-2 py-2">
-          <CreditStatus customer={customer} currentOrderIncl={totals.incl} compact />
-          {ordersTodayCount !== undefined && ordersTodayCount > 0 && onShowOrdersToday && (
-            <div className="mt-2 flex justify-end">
-              <button
-                onClick={onShowOrdersToday}
-                className="inline-flex items-center gap-1 text-[10px] font-semibold bg-emerald-100 text-emerald-800 border border-emerald-300 px-2 py-0.5 rounded-full hover:bg-emerald-200"
-                title="View orders placed today for this customer"
-              >
-                <ListOrdered className="w-3 h-3" />
-                {ordersTodayCount} today
-              </button>
-            </div>
-          )}
+          <CreditStatus
+            customer={customer}
+            currentOrderIncl={totals.incl}
+            compact
+            unprocessedCount={unprocessedCount}
+            unprocessedWorstTier={unprocessedWorstTier}
+            onShowUnprocessed={onShowUnprocessed}
+          />
         </div>
       )}
 
       <div className="border-t border-gray-200 p-2">
+        {continueBlockMsg && (
+          <div className="mb-2 border border-blue-200 bg-blue-50 rounded shadow-sm flex items-center gap-2 px-2.5 py-1.5 text-[11px] text-blue-900">
+            <AlertCircle className="w-3.5 h-3.5 text-blue-600 flex-shrink-0" />
+            <span className="flex-1">{continueBlockMsg}</span>
+          </div>
+        )}
         <button
           onClick={onContinue}
           disabled={!canContinue}

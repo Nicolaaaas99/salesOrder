@@ -100,3 +100,44 @@ def me(username: str = Depends(get_current_user), db: Session = Depends(get_db))
         default_warehouse_code=_default_warehouse_for(db, username),
         force_ext_order_num=_force_ext_order_num(db),
     )
+
+
+@router.post("/default-warehouse", response_model=schemas.SetDefaultWarehouseResponse)
+def set_default_warehouse(
+    payload: schemas.SetDefaultWarehouseRequest,
+    username: str = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Set the logged-in telesales agent's default warehouse. Resolves the
+    warehouse code to its WhseLink via _vw_SOWarehouses, then writes it to
+    _rtblAgents.iDefWhseId for the row where cAgentName matches the token's
+    username. Called from the DefaultWarehouseModal prompt on first login."""
+    code = (payload.code or "").strip()
+    if not code:
+        raise HTTPException(400, "Warehouse code is required")
+
+    whse = db.execute(
+        text("SELECT WhseLink FROM dbo._vw_SOWarehouses WHERE Code = :code"),
+        {"code": code},
+    ).mappings().first()
+    if not whse:
+        raise HTTPException(404, f"Warehouse '{code}' not found")
+
+    agent = db.execute(
+        text("SELECT idAgents FROM dbo._rtblAgents WHERE cAgentName = :name AND bAgentActive = 1"),
+        {"name": username},
+    ).mappings().first()
+    if not agent:
+        raise HTTPException(
+            404,
+            f"No active agent record found for '{username}'. "
+            "Ask an administrator to register this operator as a telesales agent.",
+        )
+
+    db.execute(
+        text("UPDATE dbo._rtblAgents SET iDefWhseId = :whse_id WHERE idAgents = :agent_id"),
+        {"whse_id": whse["WhseLink"], "agent_id": agent["idAgents"]},
+    )
+    db.commit()
+
+    return schemas.SetDefaultWarehouseResponse(default_warehouse_code=code)

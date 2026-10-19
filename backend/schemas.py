@@ -24,6 +24,14 @@ class MeResponse(BaseModel):
     force_ext_order_num: bool = False
 
 
+class SetDefaultWarehouseRequest(BaseModel):
+    code: str
+
+
+class SetDefaultWarehouseResponse(BaseModel):
+    default_warehouse_code: str
+
+
 class CustomerSummary(BaseModel):
     account: str
     name: str
@@ -96,6 +104,12 @@ class Warehouse(BaseModel):
     description: str
 
 
+class CustomerContactUpdate(BaseModel):
+    contact_name: str = ""
+    contact_tel: str = ""
+    contact_tel2: str = ""
+
+
 class TaxType(BaseModel):
     id: int
     code: str
@@ -118,7 +132,9 @@ class SalesOrderLineInput(BaseModel):
     description: Optional[str] = Field(None, max_length=100)
     warehouse_code: Optional[str] = None
     quantity: float = Field(gt=0)
-    unit_price: float = Field(gt=0)
+    # Zero-price lines are allowed (crates, samples, promos). Quantity still
+    # must be positive — a zero-qty line is a no-op.
+    unit_price: float = Field(ge=0)
     tax_type_id: Optional[int] = None
     discount_percent: float = 0.0
     project_code: Optional[str] = None
@@ -143,12 +159,23 @@ class SalesOrderCreateResponse(BaseModel):
     invoice_no: Optional[str] = None
 
 
+class CancelOrderResponse(BaseModel):
+    order_no: str
+    doc_state: int
+    doc_state_label: str
+
+
+class UpdateDeliveryDateRequest(BaseModel):
+    delivery_date: date
+
+
 class SalesOrderSearchResult(BaseModel):
     order_no: str
     external_order: str = ""
     description: str = ""
     invoice_date: Optional[date] = None
     order_date: Optional[date] = None
+    delivery_date: Optional[date] = None
     customer_account: str = ""
     customer_name: str = ""
     doc_state: int = 0

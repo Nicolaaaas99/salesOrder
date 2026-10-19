@@ -85,6 +85,10 @@ export const auth = {
         force_ext_order_num: boolean;
       }>("/auth/me")
       .then((r) => r.data),
+  setDefaultWarehouse: (code: string) =>
+    http
+      .post<{ default_warehouse_code: string }>("/auth/default-warehouse", { code })
+      .then((r) => r.data),
 };
 
 export const api = {
@@ -94,10 +98,23 @@ export const api = {
   getCustomer: (account: string) =>
     http.get<CustomerDetail>(`/lookups/customers/${encodeURIComponent(account)}`).then((r) => r.data),
 
+  updateCustomerContact: (
+    account: string,
+    payload: { contact_name: string; contact_tel: string; contact_tel2: string },
+  ) =>
+    http
+      .patch<CustomerDetail>(
+        `/lookups/customers/${encodeURIComponent(account)}/contact`,
+        payload,
+      )
+      .then((r) => r.data),
+
   searchInventory: (q: string) =>
     http.get<InventoryItem[]>("/lookups/inventory", { params: { q, limit: 50 } }).then((r) => r.data),
 
   listWarehouses: () => http.get<Warehouse[]>("/lookups/warehouses").then((r) => r.data),
+  listDefaultWarehouseChoices: () =>
+    http.get<Warehouse[]>("/lookups/warehouses/default-choices").then((r) => r.data),
   listTaxTypes: () => http.get<TaxType[]>("/lookups/tax-types").then((r) => r.data),
   listProjects: () => http.get<Project[]>("/lookups/projects").then((r) => r.data),
   searchProjects: (q: string) =>
@@ -153,6 +170,21 @@ export const api = {
       .put<SalesOrderCreateResponse>(`/sales-orders/${encodeURIComponent(orderNo)}`, payload)
       .then((r) => r.data),
 
+  cancelSalesOrder: (orderNo: string) =>
+    http
+      .post<{ order_no: string; doc_state: number; doc_state_label: string }>(
+        `/sales-orders/${encodeURIComponent(orderNo)}/cancel`,
+      )
+      .then((r) => r.data),
+
+  updateSalesOrderDeliveryDate: (orderNo: string, deliveryDate: string) =>
+    http
+      .patch<SalesOrderDetail>(
+        `/sales-orders/${encodeURIComponent(orderNo)}/delivery-date`,
+        { delivery_date: deliveryDate },
+      )
+      .then((r) => r.data),
+
   // ---------- History (telesales dashboard) ----------
   listHistoryRoutes: () =>
     http.get<HistoryRoute[]>("/history/routes").then((r) => r.data),
@@ -163,13 +195,17 @@ export const api = {
       .then((r) => r.data),
 
   listCustomerOrdersToday: (
-    route: string,
+    route?: string | null,
     date?: string,
     by: "order" | "delivery" = "order",
   ) =>
     http
       .get<CustomerOrderCount[]>("/history/orders-today", {
-        params: { route, by, ...(date ? { date } : {}) },
+        params: {
+          by,
+          ...(route ? { route } : {}),
+          ...(date ? { date } : {}),
+        },
       })
       .then((r) => r.data),
 

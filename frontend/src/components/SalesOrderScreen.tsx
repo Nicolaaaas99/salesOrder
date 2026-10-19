@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { api } from "../api/client";
 import type {
   CustomerDetail,
@@ -19,7 +19,7 @@ import { SalesOrderSearchModal } from "./SalesOrderSearchModal";
 import { CreditStatus } from "./CreditStatus";
 import { useAuth } from "../context/AuthContext";
 import { nextBusinessDay, today } from "../utils/date";
-import { fmtCurrency } from "../utils/format";
+import { fmtCurrency, extractErrorMsg } from "../utils/format";
 
 type EditingState = {
   order_no: string;
@@ -145,12 +145,25 @@ export function SalesOrderScreen({
     return initialLinesFor(seedCustomer?.default_tax_type_id ?? null);
   });
   const lines = isControlled ? (controlledLines as LineRow[]) : internalLines;
+  // Mirror `lines` into a ref so controlled-mode functional updaters always
+  // see the latest value, even when fired from stale async-callback closures
+  // (e.g. an item picker's price fetch resolving after the next render —
+  // without this, the resolve would reset `lines` to pre-pick state and the
+  // just-picked line would vanish).
+  const linesRef = useRef<LineRow[]>(lines);
+  useEffect(() => {
+    linesRef.current = lines;
+  }, [lines]);
+
   const setLines = (updater: LineRow[] | ((prev: LineRow[]) => LineRow[])) => {
     if (isControlled) {
       const next =
         typeof updater === "function"
-          ? (updater as (p: LineRow[]) => LineRow[])(controlledLines as LineRow[])
+          ? (updater as (p: LineRow[]) => LineRow[])(linesRef.current)
           : updater;
+      // Keep the ref in sync with what the parent will have after the next
+      // render — rapid-fire updaters in the same tick must see each other.
+      linesRef.current = next;
       onControlledLinesChange!(next);
     } else {
       // React handles functional-form staleness for us.
@@ -327,9 +340,11 @@ export function SalesOrderScreen({
       setErrorMsg("Add at least one line with an item.");
       return;
     }
-    const badLine = filledLines.find((l) => l.quantity <= 0 || l.unit_price <= 0);
+    // Zero-price lines are allowed (promos, samples, free lines). Quantity
+    // still has to be positive — a zero-qty line is a no-op.
+    const badLine = filledLines.find((l) => l.quantity <= 0);
     if (badLine) {
-      setErrorMsg(`Line "${badLine.stock_code}" must have quantity and price greater than 0.`);
+      setErrorMsg(`Line "${badLine.stock_code}" must have a quantity greater than 0.`);
       return;
     }
 
@@ -374,6 +389,9 @@ export function SalesOrderScreen({
       const res = isUpdate
         ? await api.updateOrder(editing!.order_no, payload)
         : await api.placeOrder(payload);
+      // Global signal so any list / badge the order touches in other screens
+      // (Order Assistant, Route Overview) refreshes immediately.
+      window.dispatchEvent(new CustomEvent("orders:mutated"));
       setSuccessMsg({
         title: isUpdate ? "Sales Order Updated" : "Sales Order Created",
         body: isUpdate
@@ -381,8 +399,7 @@ export function SalesOrderScreen({
           : `Order ${res.order_no} has been created in Evolution.`,
       });
     } catch (e: any) {
-      const detail = e?.response?.data?.detail ?? e?.message ?? "Unknown error";
-      setErrorMsg(String(detail));
+      setErrorMsg(extractErrorMsg(e, "Failed to save sales order"));
     } finally {
       setSubmitting(false);
     }

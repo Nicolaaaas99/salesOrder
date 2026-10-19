@@ -142,29 +142,36 @@ def export_orders_per_day(
 
 @router.get("/orders-today", response_model=List[schemas.CustomerOrderCount])
 def list_orders_today(
-    route: str = Query(...),
+    route: Optional[str] = Query(None),
     on_date: date = Query(default_factory=date.today, alias="date"),
     by: str = Query("order", pattern="^(order|delivery)$"),
     db: Session = Depends(get_db),
 ):
-    """Order counts per customer on the given route for a single calendar day.
-    Defaults to today. `by=order` (default) counts by OrderDate — used by the
-    Order Assistant pill. `by=delivery` counts by DeliveryDate — used by the
-    Route Overview summary."""
+    """Order counts per customer for a single calendar day. Defaults to today.
+    `by=order` (default) counts by OrderDate — used by the Order Assistant pill.
+    `by=delivery` counts by DeliveryDate — used by the Route Overview summary.
+    `route` optional: when omitted, counts are returned across all customers
+    so the Order Assistant can show the "placed today" check mark even before
+    the rep has picked a route."""
     date_col = _date_column(by)
+    where = [
+        "NUM.DocType = 4",
+        "NUM.DocState IN (1, 3, 4)",
+        f"CAST(NUM.{date_col} AS DATE) = :on_date",
+    ]
+    params: dict = {"on_date": on_date}
+    if route and route.strip():
+        where.append("LTRIM(RTRIM(CL.ulARRoute)) = :route")
+        params["route"] = route.strip()
+
     sql = f"""
         SELECT CL.Account AS account, COUNT(NUM.OrderNum) AS order_count
         FROM dbo.InvNum NUM
         JOIN dbo.Client CL ON CL.DCLink = NUM.AccountID
-        WHERE NUM.DocType = 4
-          AND NUM.DocState IN (1, 3, 4)
-          AND LTRIM(RTRIM(CL.ulARRoute)) = :route
-          AND CAST(NUM.{date_col} AS DATE) = :on_date
+        WHERE {' AND '.join(where)}
         GROUP BY CL.Account
     """
-    rows = db.execute(
-        text(sql), {"route": route.strip(), "on_date": on_date}
-    ).mappings().all()
+    rows = db.execute(text(sql), params).mappings().all()
     return [
         schemas.CustomerOrderCount(
             account=(r["account"] or "").strip(),

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   Search,
   ChevronDown,
@@ -27,7 +27,7 @@ type Props = {
   orders: HistoricalOrder[];
   isLoading?: boolean;
   emptyMessage?: string;
-  /** If provided, adds a "Sug" + "Freq" column and shows Add buttons where a suggestion exists. */
+  /** If provided, adds a "Sug" + "This Order" column and shows Add buttons where a suggestion exists. */
   suggestions?: Map<string, OrderSuggestion>;
   /** Map of stock_code → price source ('Customer Deal' | 'Group Deal' | 'Price List' | 'None').
    *  When present, products with an active deal get a visible badge next to their name. */
@@ -42,6 +42,27 @@ type Props = {
   onAddAllSuggested?: () => void;
   /** External height override; defaults to full-viewport minus 240px. */
   heightStyle?: string;
+  /** stock_code → draft order qty. Shown in the "This Order" column and used
+   *  to drop the problem-row highlight once a qty is picked (the "falls off
+   *  the list" visual). */
+  draftQuantities?: Map<string, number>;
+  /** Imperative "set the picked row" trigger. When `bumpKey` changes, the
+   *  grid marks `code` as the picked row — the row gets the blue highlight
+   *  the moment the user opens its category. Does NOT auto-expand. */
+  focusStockCode?: { code: string; bumpKey: number };
+  /** Imperative "scroll a category header into view" trigger. When `bumpKey`
+   *  changes, the matching header is scrolled into view. Doesn't expand it. */
+  focusCategory?: { name: string; bumpKey: number };
+  /** Controlled set of category names that should carry the blue "needs
+   *  attention" highlight. Driven by the parent — the picker-block adds the
+   *  blocked item's category, and Continue-to-order adds every unreviewed
+   *  one. Entries drop automatically from the parent via `onCategoryOpened`
+   *  as the rep opens each. */
+  pickedCategories?: Set<string> | null;
+  /** Fires whenever a category is OPENED (not closed) via its toggle. The
+   *  parent uses this both to track "opened at least once in this session"
+   *  for the Continue gate and to drop the entry from `pickedCategories`. */
+  onCategoryOpened?: (category: string) => void;
 };
 
 export function HistoryGrid({
@@ -53,15 +74,19 @@ export function HistoryGrid({
   onAddToOrder,
   onAddAllSuggested,
   heightStyle = "calc(100vh - 240px)",
+  draftQuantities,
+  focusStockCode,
+  focusCategory,
+  pickedCategories,
+  onCategoryOpened,
 }: Props) {
   const [searchTerm, setSearchTerm] = useState("");
-  const [expandedCategories, setExpandedCategories] = useState<Set<string>>(
-    new Set()
-  );
+  // Accordion: only one category open at a time. `null` = all collapsed.
+  const [expandedCategory, setExpandedCategory] = useState<string | null>(null);
 
   // Collapse everything whenever a fresh dataset arrives (new route / customer).
   useEffect(() => {
-    setExpandedCategories(new Set());
+    setExpandedCategory(null);
     setSearchTerm("");
   }, [orders]);
 
@@ -110,13 +135,65 @@ export function HistoryGrid({
   }, [categories, searchTerm]);
 
   const toggleCategory = (category: string) => {
-    setExpandedCategories((prev) => {
-      const next = new Set(prev);
-      if (next.has(category)) next.delete(category);
-      else next.add(category);
+    setExpandedCategory((prev) => {
+      const next = prev === category ? null : category;
+      // Only fire on OPEN — collapses don't count towards "reviewed".
+      if (next) onCategoryOpened?.(next);
       return next;
     });
   };
+
+  const scrollRootRef = useRef<HTMLDivElement>(null);
+  // "Last picked from the item picker" row marker. The row only visibly
+  // highlights once the user opens its category — we don't auto-expand.
+  // Cleared when the item leaves the draft, when the rep actions another
+  // row, or when they click elsewhere in the grid.
+  const [pickedCode, setPickedCode] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!focusStockCode?.code) return;
+    setPickedCode(focusStockCode.code);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focusStockCode?.bumpKey]);
+
+  // Clear the marker as soon as the item is gone from the draft.
+  useEffect(() => {
+    if (pickedCode && !draftQuantities?.has(pickedCode)) {
+      setPickedCode(null);
+    }
+  }, [draftQuantities, pickedCode]);
+
+  // Any click inside the grid that doesn't land on the picked row's cells
+  // clears the marker — covers category toggles, + buttons on other rows,
+  // week cells, and empty space inside the scroll area. Fires on mousedown
+  // so the clear happens before any subsequent + onClick that re-sets it.
+  function handleGridMouseDown(e: React.MouseEvent<HTMLDivElement>) {
+    if (!pickedCode) return;
+    const target = e.target as HTMLElement;
+    const onPickedRow = !!target.closest(
+      `tr[data-stock-code="${CSS.escape(pickedCode)}"]`,
+    );
+    if (!onPickedRow) setPickedCode(null);
+  }
+
+  // When the category is open and we have a picked row, keep it in view.
+  useLayoutEffect(() => {
+    if (!pickedCode) return;
+    const row = scrollRootRef.current?.querySelector<HTMLTableRowElement>(
+      `tr[data-stock-code="${CSS.escape(pickedCode)}"]`,
+    );
+    row?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+  }, [pickedCode, expandedCategory]);
+
+  // Scroll the parent-requested category header into view (no expand).
+  useEffect(() => {
+    if (!focusCategory?.name) return;
+    const row = scrollRootRef.current?.querySelector<HTMLTableRowElement>(
+      `tr[data-category="${CSS.escape(focusCategory.name)}"]`,
+    );
+    row?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focusCategory?.bumpKey]);
 
   const showSuggestCols = !!suggestions;
   const showAddButton = !!onAddToOrder;
@@ -174,7 +251,11 @@ export function HistoryGrid({
         </div>
       </div>
 
-      <div className="flex-1 overflow-auto">
+      <div
+        ref={scrollRootRef}
+        onMouseDown={handleGridMouseDown}
+        className="flex-1 overflow-auto"
+      >
         {isLoading && (
           <div className="h-full flex flex-col items-center justify-center text-gray-500 p-4">
             <Loader2 className="w-6 h-6 animate-spin text-blue-600 mb-1" />
@@ -210,9 +291,10 @@ export function HistoryGrid({
                       </th>
                       <th
                         className="px-1 py-1 text-center font-semibold text-gray-700 text-xs border-l border-gray-300 whitespace-nowrap"
-                        style={{ width: 55 }}
+                        style={{ width: 60 }}
+                        title="Quantity currently on the draft order"
                       >
-                        Freq
+                        This Order
                       </th>
                     </>
                   )}
@@ -235,7 +317,7 @@ export function HistoryGrid({
                     category={category}
                     weeks={displayWeeks}
                     categoryData={categoryData}
-                    isExpanded={expandedCategories.has(category)}
+                    isExpanded={expandedCategory === category}
                     onToggle={toggleCategory}
                     problemItems={problemItems}
                     suggestions={suggestions}
@@ -243,6 +325,9 @@ export function HistoryGrid({
                     onAddToOrder={onAddToOrder}
                     showAddButton={showAddButton}
                     stickyLeftWidth={stickyLeftWidth}
+                    draftQuantities={draftQuantities}
+                    pickedCode={pickedCode}
+                    isPickedCategory={!!pickedCategories?.has(category)}
                   />
                 ))}
               </tbody>
@@ -277,6 +362,12 @@ type CategoryRowProps = {
   onAddToOrder?: Props["onAddToOrder"];
   showAddButton: boolean;
   stickyLeftWidth: string;
+  draftQuantities?: Map<string, number>;
+  /** Stock code last added via the item picker — gets a persistent outline. */
+  pickedCode: string | null;
+  /** This category is in the parent's `pickedCategories` set and should
+   *  carry the persistent blue "needs attention" highlight. */
+  isPickedCategory: boolean;
 };
 
 function CategoryRow({
@@ -291,6 +382,9 @@ function CategoryRow({
   onAddToOrder,
   showAddButton,
   stickyLeftWidth,
+  draftQuantities,
+  pickedCode,
+  isPickedCategory,
 }: CategoryRowProps) {
   const sortedProducts = useMemo(() => {
     return [...categoryData.products].sort((a, b) => {
@@ -322,7 +416,13 @@ function CategoryRow({
 
   return (
     <>
-      <tr className="border-b border-gray-200 bg-gray-50 hover:bg-gray-100">
+      <tr
+        data-category={category}
+        className={
+          "border-b border-gray-200 bg-gray-50 hover:bg-gray-100" +
+          (isPickedCategory ? " history-category-picked" : "")
+        }
+      >
         <td
           className="px-2 py-1 font-semibold text-gray-900 text-sm sticky left-0 bg-gray-50 z-10 border-r border-gray-200"
           style={{ width: stickyLeftWidth }}
@@ -375,7 +475,6 @@ function CategoryRow({
           const problemData = problemItems.get(key);
           const suggestion = suggestions?.get(key);
           const isProblem = !!problemData;
-          const isSuggested = !!suggestion;
           const weeksSince = problemData?.weeksSinceLastPurchase;
           const severity = problemData
             ? getProblemSeverity(problemData.weeksSinceLastPurchase)
@@ -407,8 +506,18 @@ function CategoryRow({
               ? { label: "Grp Deal", cls: "bg-sky-100 text-sky-700" }
               : null;
 
-          const rowBg = isSuggested
-            ? "bg-blue-50 border-l-4 border-l-blue-500"
+          const drafted = draftQuantities?.get(product.stockCode) ?? 0;
+          const isDrafted = drafted > 0;
+          const isPicked = pickedCode === product.stockCode;
+
+          // Blue is reserved for the picked row (see .history-row-picked).
+          // Suggested rows still surface via the Sug column and the + button
+          // on the stock code, so they don't need a row-level highlight.
+          // Problem rows keep their orange/red/yellow until a qty lands on
+          // the draft, at which point they "fall off" to white — the
+          // weeks-since badge stays as a reminder of the original state.
+          const rowBg = isDrafted
+            ? "bg-white"
             : isProblem
             ? problemRowBg
             : "bg-white";
@@ -416,7 +525,11 @@ function CategoryRow({
           return (
             <tr
               key={index}
-              className={`border-b border-gray-100 hover:bg-blue-50 ${rowBg}`}
+              data-stock-code={product.stockCode}
+              className={
+                `border-b border-gray-100 hover:bg-blue-50 ${rowBg}` +
+                (isPicked ? " history-row-picked" : "")
+              }
             >
               <td
                 className="px-2 py-1 pl-6 text-gray-700 sticky left-0 bg-inherit z-10 border-r border-gray-200"
@@ -505,9 +618,9 @@ function CategoryRow({
                     )}
                   </td>
                   <td className="px-1 py-1 text-center border-l border-gray-100">
-                    {suggestion ? (
-                      <span className="text-xs text-gray-600 font-mono">
-                        {suggestion.non_zero_weeks}/{suggestion.total_weeks}
+                    {isDrafted ? (
+                      <span className="font-mono text-sm font-bold text-emerald-700">
+                        {formatQty(drafted)}
                       </span>
                     ) : (
                       <div className="text-gray-300 text-xs">—</div>

@@ -5,9 +5,16 @@ import { OrderAssistantScreen } from "./components/OrderAssistantScreen";
 import { RouteOverviewScreen } from "./components/RouteOverviewScreen";
 import { LoginScreen } from "./components/LoginScreen";
 import { SessionDateModal } from "./components/SessionDateModal";
+import { DefaultWarehouseModal } from "./components/DefaultWarehouseModal";
 import { AuthProvider, useAuth } from "./context/AuthContext";
 
 type View = "assistant" | "order" | "overview";
+
+// Toggle the Sales Order Entry tab button on/off without touching the rest
+// of the plumbing. The view itself stays mounted so the Edit flow from
+// Order Assistant / Route Overview still routes through it; this just hides
+// the standalone tab from the navbar.
+const SHOW_SALES_ORDER_ENTRY_TAB = true;
 
 export default function App() {
   return (
@@ -18,8 +25,9 @@ export default function App() {
 }
 
 function AppShell() {
-  const { token, sessionDate } = useAuth();
+  const { token, sessionDate, defaultWarehouseCode } = useAuth();
   if (!token) return <LoginScreen />;
+  if (!defaultWarehouseCode) return <DefaultWarehouseModal />;
   if (!sessionDate) return <SessionDateModal />;
   return <AuthenticatedApp />;
 }
@@ -31,12 +39,29 @@ function AuthenticatedApp() {
   // for editing, it drops the order number here and switches us to the
   // Sales Order Entry tab. SalesOrderTab's effect picks it up and loads it.
   const [pendingOrderNo, setPendingOrderNo] = useState<string | null>(null);
+  // Remember which tab the edit was launched from so we can route the user
+  // back after they save — otherwise they'd be stranded on the Sales Order
+  // Entry landing screen.
+  const [originAfterEdit, setOriginAfterEdit] = useState<View | null>(null);
 
-  const openOrderInEntryTab = useCallback((orderNo: string) => {
-    setPendingOrderNo(orderNo);
-    setView("order");
-  }, []);
+  const openOrderInEntryTab = useCallback(
+    (orderNo: string) => {
+      setPendingOrderNo(orderNo);
+      // Only track as "needs return" when launched from assistant / overview.
+      // Opening an order from inside the Sales Order Entry tab itself should
+      // stay in that tab.
+      if (view !== "order") setOriginAfterEdit(view);
+      setView("order");
+    },
+    [view],
+  );
   const clearPendingOrder = useCallback(() => setPendingOrderNo(null), []);
+
+  const handleEditDone = useCallback(() => {
+    if (!originAfterEdit) return;
+    setView(originAfterEdit);
+    setOriginAfterEdit(null);
+  }, [originAfterEdit]);
 
   return (
     <div className="h-screen flex flex-col">
@@ -48,12 +73,14 @@ function AuthenticatedApp() {
           >
             Order Assistant
           </button>
-          <button
-            className={`app-tab ${view === "order" ? "app-tab--active" : ""}`}
-            onClick={() => setView("order")}
-          >
-            Sales Order Entry
-          </button>
+          {SHOW_SALES_ORDER_ENTRY_TAB && (
+            <button
+              className={`app-tab ${view === "order" ? "app-tab--active" : ""}`}
+              onClick={() => setView("order")}
+            >
+              Sales Order Entry
+            </button>
+          )}
           <button
             className={`app-tab ${view === "overview" ? "app-tab--active" : ""}`}
             onClick={() => setView("overview")}
@@ -85,7 +112,7 @@ function AuthenticatedApp() {
           className="h-full"
           style={{ display: view === "assistant" ? "block" : "none" }}
         >
-          <OrderAssistantScreen />
+          <OrderAssistantScreen onOpenOrder={openOrderInEntryTab} />
         </div>
         <div
           className="h-full overflow-y-auto"
@@ -94,6 +121,7 @@ function AuthenticatedApp() {
           <SalesOrderTab
             pendingOrderNo={pendingOrderNo}
             clearPendingOrder={clearPendingOrder}
+            onEditDone={originAfterEdit ? handleEditDone : undefined}
           />
         </div>
         <div

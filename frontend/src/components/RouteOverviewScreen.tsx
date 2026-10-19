@@ -62,6 +62,22 @@ export function RouteOverviewScreen({ onOpenOrder }: RouteOverviewProps = {}) {
   const [selectedRoute, setSelectedRoute] = useState<Option | null>(null);
   const [selectedDate, setSelectedDate] = useState<string>(today());
   const [customers, setCustomers] = useState<CustomerRow[]>([]);
+  // Bumped after any order mutation so all route/date-scoped fetches re-run
+  // and drop the stale row from counts, lists, and the drill-in panel.
+  const [refreshKey, setRefreshKey] = useState(0);
+
+  // Catch mutations from elsewhere in the app and other users' changes.
+  // `orders:mutated` is dispatched after cancel / delivery-date / save;
+  // `focus` catches cross-user changes when the window regains focus.
+  useEffect(() => {
+    const bump = () => setRefreshKey((k) => k + 1);
+    window.addEventListener("orders:mutated", bump);
+    window.addEventListener("focus", bump);
+    return () => {
+      window.removeEventListener("orders:mutated", bump);
+      window.removeEventListener("focus", bump);
+    };
+  }, []);
   const [search, setSearch] = useState("");
   const [orderFilter, setOrderFilter] = useState<OrderFilter>("all");
 
@@ -135,7 +151,7 @@ export function RouteOverviewScreen({ onOpenOrder }: RouteOverviewProps = {}) {
         setIsLoadingCustomers(false);
       }
     })();
-  }, [selectedRoute, selectedDate]);
+  }, [selectedRoute, selectedDate, refreshKey]);
 
   // Fetch history/suggestions/detail when drilling into a customer. Also fetch
   // the orders for the selected date so the right-side panel can list them
@@ -170,7 +186,7 @@ export function RouteOverviewScreen({ onOpenOrder }: RouteOverviewProps = {}) {
         setIsLoadingOrders(false);
       }
     })();
-  }, [drillCustomer, selectedDate]);
+  }, [drillCustomer, selectedDate, refreshKey]);
 
   // Fetch orders for the chosen customer+date when the modal opens.
   useEffect(() => {
@@ -189,7 +205,7 @@ export function RouteOverviewScreen({ onOpenOrder }: RouteOverviewProps = {}) {
         setIsLoadingOrderList(false);
       }
     })();
-  }, [viewingOrdersFor, selectedDate]);
+  }, [viewingOrdersFor, selectedDate, refreshKey]);
 
   const suggestionsMap = useMemo(() => {
     const m = new Map<string, OrderSuggestion>();
@@ -372,6 +388,19 @@ export function RouteOverviewScreen({ onOpenOrder }: RouteOverviewProps = {}) {
                 }
               : undefined
           }
+          onCancel={() => {
+            setViewingSummaryOf(null);
+            setViewingOrdersFor(null);
+            // Re-fetch the per-customer counts, the drilled-in orders panel,
+            // and the "orders on this date" modal so the cancelled order
+            // vanishes everywhere it was listed.
+            setRefreshKey((k) => k + 1);
+          }}
+          onDeliveryDateChanged={() => {
+            // Delivery date change moves the row between delivery-date-scoped
+            // panels — bump the refresh key so every list re-queries.
+            setRefreshKey((k) => k + 1);
+          }}
         />
       )}
     </div>
@@ -498,7 +527,7 @@ function RouteSummary({
                           onViewOrders({ id: c.id, display: c.display });
                         }}
                         title="View orders"
-                        className="inline-flex items-center gap-1 text-[10px] font-semibold bg-emerald-100 text-emerald-800 border border-emerald-300 px-2 py-0.5 rounded-full hover:bg-emerald-200"
+                        className="inline-flex items-center gap-1 text-[10px] font-semibold bg-amber-100 text-amber-800 border border-amber-300 px-2 py-0.5 rounded-full hover:bg-amber-200"
                       >
                         <ListOrdered className="w-3 h-3" />
                         {c.ordersOnDate}
@@ -619,7 +648,7 @@ function OrdersOnDatePanel({
           <div className="text-xs font-semibold text-gray-700 uppercase tracking-wide">Orders</div>
           <div className="text-xs text-gray-500">{date}</div>
         </div>
-        <span className="text-[10px] font-semibold bg-emerald-100 text-emerald-800 border border-emerald-300 px-2 py-0.5 rounded-full">
+        <span className="text-[10px] font-semibold bg-amber-100 text-amber-800 border border-amber-300 px-2 py-0.5 rounded-full">
           {orders.length}
         </span>
       </div>

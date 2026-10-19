@@ -9,6 +9,10 @@ import type {
 import { SalesOrderScreen } from "./SalesOrderScreen";
 import { SalesOrderSearchModal } from "./SalesOrderSearchModal";
 
+// Flip to re-enable the "Create a new order" card. Keeping the code in place
+// so flipping back is a one-line change if telesales needs manual entry again.
+const CREATE_NEW_ORDER_ENABLED = false;
+
 type Mode =
   | { kind: "landing" }
   | { kind: "searching" }
@@ -24,15 +28,30 @@ type Props = {
   pendingOrderNo?: string | null;
   /** Clear the pending order once we've consumed it so it won't re-fire. */
   clearPendingOrder?: () => void;
+  /** Called after a successful save in edit-mode WHEN the edit was launched
+   *  from another tab — App.tsx uses this to route the user back to where
+   *  they came from instead of leaving them on the Sales Order Entry landing. */
+  onEditDone?: () => void;
 };
 
-export function SalesOrderTab({ pendingOrderNo, clearPendingOrder }: Props = {}) {
+export function SalesOrderTab({
+  pendingOrderNo,
+  clearPendingOrder,
+  onEditDone,
+}: Props = {}) {
   const [mode, setMode] = useState<Mode>({ kind: "landing" });
   const [loading, setLoading] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [formSessionKey, setFormSessionKey] = useState(0);
+  // True when the current "loaded" session came from another tab's edit
+  // trigger — we route back on save instead of returning to this tab's
+  // landing. Reset whenever we re-enter "loaded" or go back to landing.
+  const [externallyLaunched, setExternallyLaunched] = useState(false);
 
-  const backToLanding = () => setMode({ kind: "landing" });
+  const backToLanding = () => {
+    setMode({ kind: "landing" });
+    setExternallyLaunched(false);
+  };
 
   // Load the pending order when another tab (e.g. Route Overview) hands us one.
   useEffect(() => {
@@ -45,6 +64,7 @@ export function SalesOrderTab({ pendingOrderNo, clearPendingOrder }: Props = {})
         const detail = await api.getSalesOrder(orderNo);
         const customer = await api.getCustomer(detail.customer_account);
         setFormSessionKey((k) => k + 1);
+        setExternallyLaunched(true);
         setMode({ kind: "loaded", detail, customer });
       } catch (e: any) {
         setErrorMsg(
@@ -69,6 +89,7 @@ export function SalesOrderTab({ pendingOrderNo, clearPendingOrder }: Props = {})
         api.getCustomer(result.customer_account),
       ]);
       setFormSessionKey((k) => k + 1);
+      setExternallyLaunched(false);
       setMode({ kind: "loaded", detail, customer });
     } catch (e: any) {
       setErrorMsg(
@@ -92,11 +113,17 @@ export function SalesOrderTab({ pendingOrderNo, clearPendingOrder }: Props = {})
   }
 
   if (mode.kind === "loaded") {
+    const routeBack =
+      externallyLaunched && onEditDone ? onEditDone : backToLanding;
     return (
       <SalesOrderScreen
         key={`loaded-${formSessionKey}`}
         initialLoadedOrder={{ detail: mode.detail, customer: mode.customer }}
         onBack={backToLanding}
+        // Fires after the user dismisses the success modal; routing back to
+        // the originating tab happens here when the edit was externally
+        // launched, otherwise we land on the Sales Order Entry home.
+        onPlaced={routeBack}
       />
     );
   }
@@ -110,24 +137,26 @@ export function SalesOrderTab({ pendingOrderNo, clearPendingOrder }: Props = {})
         </header>
 
         <div className="so-landing-cards">
-          <button
-            className="so-landing-card"
-            onClick={() => {
-              setFormSessionKey((k) => k + 1);
-              setMode({ kind: "new" });
-            }}
-          >
-            <div className="so-landing-card-icon so-landing-card-icon--new">
-              <FilePlus className="w-6 h-6" />
-            </div>
-            <div className="so-landing-card-body">
-              <h2>Create a new order</h2>
-              <p>
-                Start from a blank sales order. Pick a customer, add lines and
-                fill in the header details.
-              </p>
-            </div>
-          </button>
+          {CREATE_NEW_ORDER_ENABLED && (
+            <button
+              className="so-landing-card"
+              onClick={() => {
+                setFormSessionKey((k) => k + 1);
+                setMode({ kind: "new" });
+              }}
+            >
+              <div className="so-landing-card-icon so-landing-card-icon--new">
+                <FilePlus className="w-6 h-6" />
+              </div>
+              <div className="so-landing-card-body">
+                <h2>Create a new order</h2>
+                <p>
+                  Start from a blank sales order. Pick a customer, add lines and
+                  fill in the header details.
+                </p>
+              </div>
+            </button>
+          )}
 
           <button
             className="so-landing-card"
