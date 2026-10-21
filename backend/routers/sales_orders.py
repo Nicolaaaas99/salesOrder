@@ -2,7 +2,7 @@ import logging
 from datetime import date
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from sqlalchemy import bindparam, text
 from sqlalchemy.orm import Session
 
@@ -10,7 +10,17 @@ import schemas
 from auth import get_current_user
 from database import get_db
 from routers.lookups import CUSTOMER_CREDIT_SQL, _build_customer_detail
+from services.audit import write_order_audit
 from services.sales_order_service import create_sales_order, update_sales_order
+
+
+def _app_version(
+    x_app_version: Optional[str] = Header(None, alias="X-App-Version"),
+) -> Optional[str]:
+    """Dependency — pulls the SPA's baked build version off the request so
+    we can stamp it onto every audit row. Lets us tell which client build
+    placed an order after a reload-mismatch is reported."""
+    return (x_app_version or "").strip()[:32] or None
 
 logger = logging.getLogger(__name__)
 
@@ -113,6 +123,7 @@ def place_order(
     payload: schemas.SalesOrderCreate,
     db: Session = Depends(get_db),
     username: str = Depends(get_current_user),
+    app_version: Optional[str] = Depends(_app_version),
 ):
     if not payload.lines:
         raise HTTPException(400, "At least one line is required")
@@ -161,11 +172,17 @@ def place_order(
                 )
 
     try:
-        return create_sales_order(payload, agent_username=username)
+        result = create_sales_order(payload, agent_username=username)
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(500, f"Failed to create sales order: {e}")
+
+    write_order_audit(
+        db, result.order_no, "CREATE", username, app_version,
+        customer_account=payload.customer_account,
+    )
+    return result
 
 
 SEARCH_SQL = """
@@ -476,6 +493,7 @@ def update_order(
     payload: schemas.SalesOrderCreate,
     db: Session = Depends(get_db),
     username: str = Depends(get_current_user),
+    app_version: Optional[str] = Depends(_app_version),
 ):
     header = db.execute(
         text(
@@ -499,11 +517,17 @@ def update_order(
     _enforce_ext_order_requirement(db, payload)
 
     try:
-        return update_sales_order(order_no, payload, agent_username=username)
+        result = update_sales_order(order_no, payload, agent_username=username)
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(500, f"Failed to update sales order: {e}")
+
+    write_order_audit(
+        db, result.order_no, "UPDATE", username, app_version,
+        customer_account=payload.customer_account,
+    )
+    return result
 
 
 @router.patch("/{order_no}/delivery-date", response_model=schemas.SalesOrderDetail)
@@ -512,6 +536,7 @@ def update_delivery_date(
     payload: schemas.UpdateDeliveryDateRequest,
     db: Session = Depends(get_db),
     username: str = Depends(get_current_user),
+    app_version: Optional[str] = Depends(_app_version),
 ):
     """Reschedule an unprocessed order by just moving its delivery date.
     Used by the summary modal when the rep opens an order whose delivery
@@ -565,6 +590,7 @@ def update_delivery_date(
         payload.delivery_date,
         username,
     )
+    write_order_audit(db, order_no, "RESCHEDULE", username, app_version)
     return _load_sales_order(order_no, db)
 
 
@@ -573,6 +599,7 @@ def cancel_order(
     order_no: str,
     db: Session = Depends(get_db),
     username: str = Depends(get_current_user),
+    app_version: Optional[str] = Depends(_app_version),
 ):
     """Cancel an unprocessed sales order (DocState 1 → 7) and recompute the
     QtyOnSO column on _etblStockQtys so stock-on-order reflects the drop.
@@ -646,6 +673,7 @@ def cancel_order(
         raise HTTPException(500, f"Failed to cancel sales order: {e}")
 
     logger.info("cancel_order: order_no=%s cancelled by %s", order_no, username)
+    write_order_audit(db, order_no, "CANCEL", username, app_version)
     return schemas.CancelOrderResponse(
         order_no=order_no,
         doc_state=7,

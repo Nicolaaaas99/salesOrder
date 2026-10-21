@@ -27,6 +27,7 @@ import { SalesOrderScreen } from "./SalesOrderScreen";
 import { useAuth } from "../context/AuthContext";
 import { today } from "../utils/date";
 import { worstDeliveryTier } from "../utils/deliveryAge";
+import { useCustomerAutoRefresh } from "../utils/useCustomerAutoRefresh";
 
 type Option = { value: string; label: string };
 
@@ -88,6 +89,10 @@ function draftFromSuggestion(
     tax_type_id: s.default_tax_type_id ?? defaultTaxTypeId,
     discount_percent: 0,
     project_code: "",
+    // Flag so the rep has to actively confirm the auto-added suggested qty
+    // (via an amber dot on the draft row OR by editing the qty) before the
+    // Continue button unlocks. See DraftOrderPanel.
+    needs_confirm: true,
   };
 }
 
@@ -151,6 +156,10 @@ export function OrderAssistantScreen({ onOpenOrder }: OrderAssistantProps = {}) 
   const [customerDetail, setCustomerDetail] = useState<CustomerDetail | null>(
     null
   );
+  // Keep customerDetail in sync with Evolution while the rep works through
+  // the draft. Covers the "accounts just unblocked them in Evolution — why
+  // can't I save?" scenario without wiping the draft via a reselect.
+  useCustomerAutoRefresh(customerDetail?.account ?? null, setCustomerDetail);
   const [orders, setOrders] = useState<HistoricalOrder[]>([]);
   const [suggestions, setSuggestions] = useState<OrderSuggestion[]>([]);
   const [packSizes, setPackSizes] = useState<Map<string, number>>(new Map());
@@ -775,12 +784,13 @@ export function OrderAssistantScreen({ onOpenOrder }: OrderAssistantProps = {}) 
   }, [refreshOrdersToday, refreshUnprocessedOrders]);
 
   const handleFinalizePlaced = useCallback(() => {
-    // Soft reload: close the finalize sheet and clear the customer selection,
-    // which cascades (via the selectedCustomer effect) to reset orders,
-    // suggestions, customerDetail and draftLines. The route stays — telesales
-    // typically work a route end-to-end, so we don't force them to re-pick it.
+    // Hard reset after a successful placement — close the finalize sheet and
+    // clear BOTH the route and customer selections so the rep lands on a
+    // fully fresh start. Clearing the customer cascades (via effect) to
+    // reset orders, suggestions, customerDetail and draftLines.
     setFinalizeOpen(false);
     setSelectedCustomer(null);
+    setSelectedRoute(null);
     // Bump session key so the finalize modal remounts fresh next time (dates,
     // description, discount reset to defaults).
     setFinalizeSessionKey((k) => k + 1);

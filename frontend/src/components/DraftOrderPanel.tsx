@@ -135,11 +135,18 @@ export function DraftOrderPanel({
   const missingPrice = lines.find(
     (l) => l.stock_code && l.quantity > 0 && l.price_source === "None",
   );
+  // Suggested-qty rows that the rep hasn't acknowledged. Clearing happens
+  // automatically when they edit the qty (see onUpdateLine call in Qty cell)
+  // or when they click the amber dot. See LineRow.needs_confirm.
+  const unconfirmedCount = lines.filter(
+    (l) => l.stock_code && l.needs_confirm,
+  ).length;
   const canContinue =
     !!customer &&
     lines.length > 0 &&
     lines.every((l) => l.stock_code && l.quantity > 0) &&
-    !missingPrice;
+    !missingPrice &&
+    unconfirmedCount === 0;
 
   // Grow the Units column so larger qty values aren't truncated. Item column
   // has no explicit width — in `table-layout: fixed` it absorbs whatever's
@@ -276,7 +283,10 @@ export function DraftOrderPanel({
                     key={isFlashing ? `flash-${flashRowKey}-${i}` : i}
                     className={
                       "draft-row border-b border-gray-100 align-top cursor-text" +
-                      (isFlashing ? " row-flash-blue" : "")
+                      (isFlashing ? " row-flash-blue" : "") +
+                      // Amber left border = suggested qty, awaiting rep's
+                      // acknowledgement. Pairs with the dot in the Item cell.
+                      (line.needs_confirm ? " border-l-4 border-l-amber-400 bg-amber-50/40" : "")
                     }
                     onClick={(e) => {
                       // Click anywhere in the row that isn't itself an interactive
@@ -293,8 +303,17 @@ export function DraftOrderPanel({
                     }}
                   >
                     <td className="py-1 px-1" title={itemTitle}>
-                      <div className="font-medium text-gray-900 leading-tight truncate">
-                        {line.stock_code}
+                      <div className="font-medium text-gray-900 leading-tight truncate flex items-center gap-1">
+                        {line.needs_confirm && (
+                          <button
+                            type="button"
+                            onClick={() => onUpdateLine(i, { needs_confirm: false })}
+                            title="Suggested quantity — click to confirm, or just edit the Units cell"
+                            className="flex-shrink-0 w-3 h-3 rounded-full bg-amber-400 hover:bg-amber-500 ring-2 ring-amber-100"
+                            aria-label="Confirm suggested quantity"
+                          />
+                        )}
+                        <span className="truncate">{line.stock_code}</span>
                       </div>
                       <div className="text-gray-500 text-xs leading-tight truncate">
                         {line.item_description || line.description}
@@ -320,6 +339,7 @@ export function DraftOrderPanel({
                               onUpdateLine(i, {
                                 pack_override: nextOverride,
                                 quantity: nextQty,
+                                needs_confirm: false,
                               });
                             }}
                             title={
@@ -348,7 +368,9 @@ export function DraftOrderPanel({
                               : line.pack_size
                           }
                           cursorToEnd
-                          onChange={(v) => onUpdateLine(i, { quantity: v })}
+                          onChange={(v) =>
+                            onUpdateLine(i, { quantity: v, needs_confirm: false })
+                          }
                           className="w-full text-right border border-gray-200 rounded px-1 py-0.5 text-sm font-semibold focus:border-blue-500 focus:outline-none bg-white"
                           placeholder=""
                         />
@@ -507,7 +529,19 @@ export function DraftOrderPanel({
             </span>
           </div>
         )}
-        {continueBlockMsg && !missingPrice && (
+        {unconfirmedCount > 0 && !missingPrice && (
+          <div className="mb-2 border border-amber-200 bg-amber-50 rounded shadow-sm flex items-center gap-2 px-2.5 py-1.5 text-[11px] text-amber-900">
+            <span className="flex-shrink-0 w-3 h-3 rounded-full bg-amber-400 ring-2 ring-amber-100" />
+            <span className="flex-1">
+              <strong>{unconfirmedCount}</strong>
+              {unconfirmedCount === 1
+                ? " suggested quantity to confirm"
+                : " suggested quantities to confirm"}
+              {" — click the amber dot or edit the Units cell."}
+            </span>
+          </div>
+        )}
+        {continueBlockMsg && !missingPrice && unconfirmedCount === 0 && (
           <div
             ref={continueBlockRef}
             className="mb-2 border border-blue-200 bg-blue-50 rounded shadow-sm flex items-center gap-2 px-2.5 py-1.5 text-[11px] text-blue-900"
@@ -522,6 +556,8 @@ export function DraftOrderPanel({
           title={
             missingPrice
               ? `No Price List entry for ${missingPrice.stock_code} at your DC — add one before continuing`
+              : unconfirmedCount > 0
+              ? `${unconfirmedCount} suggested quantity${unconfirmedCount === 1 ? "" : "s"} still need confirming`
               : undefined
           }
           className={`w-full py-2 rounded font-semibold text-sm flex items-center justify-center gap-2 ${

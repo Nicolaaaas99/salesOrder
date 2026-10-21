@@ -20,6 +20,7 @@ import { CreditStatus } from "./CreditStatus";
 import { useAuth } from "../context/AuthContext";
 import { nextBusinessDay, today } from "../utils/date";
 import { fmtCurrency, extractErrorMsg } from "../utils/format";
+import { useCustomerAutoRefresh } from "../utils/useCustomerAutoRefresh";
 
 type EditingState = {
   order_no: string;
@@ -119,6 +120,16 @@ export function SalesOrderScreen({
 
   const [customer, setCustomer] = useState<CustomerDetail | null>(seedCustomer);
 
+  // Live-refresh credit limit / terms / overdue amounts from Evolution so a
+  // rep who gets blocked (OVER LIMIT / OVER TERMS) and then has accounts
+  // unblock the customer in Evolution sees the change without reselecting
+  // (which would wipe the draft). Fires on focus, every 5s, and on demand
+  // right before saving (see onPlaceOrder).
+  const { refreshNow: refreshCustomer } = useCustomerAutoRefresh(
+    customer?.account ?? null,
+    setCustomer,
+  );
+
   const [warehouses, setWarehouses] = useState<Warehouse[]>([]);
   const [taxTypes, setTaxTypes] = useState<TaxType[]>([]);
 
@@ -130,7 +141,6 @@ export function SalesOrderScreen({
   const [invoiceDate, setInvoiceDate] = useState(sessionDateDefault);
   const [deliveryDate, setDeliveryDate] = useState(sessionDateDefault);
   const [externalOrder, setExternalOrder] = useState(seed?.external_order ?? "");
-  const [defaultProject, setDefaultProject] = useState(seed?.default_project_code ?? "");
   const [documentDiscount, setDocumentDiscount] = useState(seed?.discount_percent ?? 0);
   const [description, setDescription] = useState(seed?.description || "Sales Order");
   const [taxMode, setTaxMode] = useState<TaxMode>(seed?.tax_mode ?? "Exclusive");
@@ -248,7 +258,6 @@ export function SalesOrderScreen({
     setInvoiceDate(sessionDateDefault);
     setDeliveryDate(sessionDateDefault);
     setExternalOrder("");
-    setDefaultProject("");
     setDocumentDiscount(0);
     setDescription("Sales Order");
     setTaxMode("Exclusive");
@@ -284,7 +293,6 @@ export function SalesOrderScreen({
     setInvoiceDate(sessionDateDefault);
     setDeliveryDate(sessionDateDefault);
     setExternalOrder(detail.external_order || "");
-    setDefaultProject(detail.default_project_code || "");
     setDocumentDiscount(detail.discount_percent || 0);
     setDescription(detail.description || "Sales Order");
     setTaxMode(detail.tax_mode);
@@ -297,31 +305,40 @@ export function SalesOrderScreen({
 
     if (!customer) { setErrorMsg("Select a customer first."); return; }
 
+    // Just-in-time refresh — the 5s poll and focus listener cover most cases,
+    // but we guarantee the credit/terms check runs against live Evolution
+    // state at the moment of save. Falls back to the cached detail if the
+    // fetch fails (e.g. transient network blip) so a flaky network doesn't
+    // block the rep from saving.
+    const fresh = await refreshCustomer();
+    const current = fresh ?? customer;
+
     const breakdown =
-      `Outstanding invoices: ${fmtCurrency(customer.total_outstanding)}. ` +
-      `Existing sales orders: ${fmtCurrency(customer.total_ordered)}. ` +
-      `Credit limit: ${fmtCurrency(customer.credit_limit)}.`;
+      `Outstanding invoices: ${fmtCurrency(current.total_outstanding)}. ` +
+      `Existing sales orders: ${fmtCurrency(current.total_ordered)}. ` +
+      `Credit limit: ${fmtCurrency(current.credit_limit)}.`;
 
     const isUpdate = editing?.mode === "edit" && !!editing?.order_no;
 
     // Only hard-block when the customer is flagged CheckTerms = 1. CheckTerms = 0
     // customers can place orders even if over credit/terms — the OVER LIMIT and
-    // OVER TERMS badges in the UI already warn the rep.
-    if (customer.check_terms) {
-      if (!isUpdate && customer.over_terms) {
-        const termDesc = customer.terms_days > 0 ? `${customer.terms_days} days` : "current period";
+    // OVER TERMS badges in the UI already warn the rep. `current` is the just-
+    // fetched copy so a last-second unblock in Evolution is honoured.
+    if (current.check_terms) {
+      if (!isUpdate && current.over_terms) {
+        const termDesc = current.terms_days > 0 ? `${current.terms_days} days` : "current period";
         setErrorMsg(
-          `${customer.name} is over their payment terms (${termDesc}) with ` +
-          `${fmtCurrency(customer.overdue_amount)} in overdue invoices. ` +
+          `${current.name} is over their payment terms (${termDesc}) with ` +
+          `${fmtCurrency(current.overdue_amount)} in overdue invoices. ` +
           `Sales order cannot be created.`
         );
         return;
       }
 
-      if (customer.over_credit_limit) {
+      if (current.over_credit_limit) {
         setErrorMsg(
-          `${customer.name} is already over their credit limit by ` +
-          `${fmtCurrency(-customer.available_credit)}. ${breakdown} ` +
+          `${current.name} is already over their credit limit by ` +
+          `${fmtCurrency(-current.available_credit)}. ${breakdown} ` +
           `Sales order cannot be created.`
         );
         return;
@@ -348,25 +365,25 @@ export function SalesOrderScreen({
       return;
     }
 
-    if (customer.check_terms && customer.credit_limit > 0) {
+    if (current.check_terms && current.credit_limit > 0) {
       const { incl: orderIncl } = orderTotals(filledLines, taxTypes, taxMode, documentDiscount);
-      if (orderIncl > customer.available_credit) {
+      if (orderIncl > current.available_credit) {
         setErrorMsg(
-          `This order (${fmtCurrency(orderIncl)}) would push ${customer.name} ` +
-          `over their credit limit. Available credit: ${fmtCurrency(customer.available_credit)}. ${breakdown}`
+          `This order (${fmtCurrency(orderIncl)}) would push ${current.name} ` +
+          `over their credit limit. Available credit: ${fmtCurrency(current.available_credit)}. ${breakdown}`
         );
         return;
       }
     }
 
     const payload: SalesOrderCreate = {
-      customer_account: customer.account,
+      customer_account: current.account,
       order_date: orderDate,
       due_date: dueDate,
       invoice_date: invoiceDate,
       delivery_date: deliveryDate,
       external_order: externalOrder || null,
-      default_project_code: defaultProject || null,
+      default_project_code: null,
       discount_percent: documentDiscount,
       // Always save Exclusive — `unit_price` on every line is excl by invariant.
       // The UI `taxMode` is a pure display toggle; it must NOT leak to the save.
@@ -380,7 +397,7 @@ export function SalesOrderScreen({
         unit_price: l.unit_price,
         tax_type_id: l.tax_type_id,
         discount_percent: l.discount_percent || 0,
-        project_code: l.project_code || null,
+        project_code: null,
       })),
     };
 
@@ -518,11 +535,9 @@ export function SalesOrderScreen({
           <DocumentInfoPanel
             invoiceDate={invoiceDate}
             deliveryDate={deliveryDate}
-            defaultProject={defaultProject}
             onChange={(p) => {
               if (p.invoiceDate !== undefined) setInvoiceDate(p.invoiceDate);
               if (p.deliveryDate !== undefined) setDeliveryDate(p.deliveryDate);
-              if (p.defaultProject !== undefined) setDefaultProject(p.defaultProject);
             }}
           />
         </div>

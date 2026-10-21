@@ -42,11 +42,18 @@ const http = axios.create({
 // Attach the current session token to every outbound request. We read from
 // sessionStorage on each call rather than closing over the token so that
 // login/logout take effect immediately without having to rebuild the client.
+// Also stamps X-App-Version so the backend audit log can record which build
+// the client was running when an order was placed/updated/cancelled.
+const APP_VERSION =
+  typeof __BUILD_VERSION__ === "string" ? __BUILD_VERSION__ : "";
 http.interceptors.request.use((cfg) => {
+  cfg.headers = cfg.headers ?? {};
   const token = sessionStorage.getItem("auth_token");
   if (token) {
-    cfg.headers = cfg.headers ?? {};
     (cfg.headers as any).Authorization = `Bearer ${token}`;
+  }
+  if (APP_VERSION) {
+    (cfg.headers as any)["X-App-Version"] = APP_VERSION;
   }
   return cfg;
 });

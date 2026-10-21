@@ -79,89 +79,94 @@ export function CustomerContactStrip({ customer, onUpdated }: Props) {
 
   if (isEditing) {
     return (
-      <div className="bg-white rounded border px-3 py-1.5 shadow-sm flex items-center gap-2 text-xs flex-shrink-0">
-        <span className="flex items-center gap-1 min-w-0 flex-1">
-          <User className="w-3 h-3 text-gray-400 flex-shrink-0" />
+      <div className="bg-white rounded border px-4 py-2 shadow-sm flex items-center gap-3 text-sm flex-shrink-0">
+        {/* Save / cancel sit on the left — same spot the pencil was — so the
+            rep's eye doesn't have to travel to the far side of the strip to
+            commit the edit. */}
+        <div className="flex items-center gap-1 flex-shrink-0">
+          <button
+            type="button"
+            onClick={save}
+            disabled={isSaving}
+            title="Save (Enter)"
+            className="flex items-center justify-center w-6 h-6 rounded text-emerald-700 hover:bg-emerald-50 hover:text-emerald-900 disabled:text-gray-400"
+          >
+            <Check className="w-4 h-4" strokeWidth={3} />
+          </button>
+          <button
+            type="button"
+            onClick={cancel}
+            disabled={isSaving}
+            title="Cancel (Esc)"
+            className="flex items-center justify-center w-6 h-6 rounded text-gray-500 hover:bg-gray-100 hover:text-gray-800 disabled:text-gray-300"
+          >
+            <X className="w-4 h-4" strokeWidth={3} />
+          </button>
+        </div>
+        <span className="flex items-center gap-1.5 min-w-0 flex-1">
+          <User className="w-4 h-4 text-gray-400 flex-shrink-0" />
           <input
             ref={nameInputRef}
             value={name}
             onChange={(e) => setName(e.target.value)}
             onKeyDown={onKeyDown}
             placeholder="Contact person"
-            className="border border-gray-300 rounded px-1.5 py-0.5 text-xs w-full focus:border-blue-500 focus:outline-none"
+            className="border border-gray-300 rounded px-2 py-1 text-sm w-full focus:border-blue-500 focus:outline-none"
           />
         </span>
-        <span className="flex items-center gap-1 min-w-0 flex-1">
-          <Phone className="w-3 h-3 text-gray-400 flex-shrink-0" />
+        <span className="flex items-center gap-1.5 min-w-0 flex-1">
+          <Phone className="w-4 h-4 text-gray-400 flex-shrink-0" />
           <input
             value={tel}
             onChange={(e) => setTel(e.target.value)}
             onKeyDown={onKeyDown}
             placeholder="Telephone"
-            className="border border-gray-300 rounded px-1.5 py-0.5 text-xs font-mono w-full focus:border-blue-500 focus:outline-none"
+            className="border border-gray-300 rounded px-2 py-1 text-sm font-mono w-full focus:border-blue-500 focus:outline-none"
           />
         </span>
-        <span className="flex items-center gap-1 min-w-0 flex-1">
-          <Phone className="w-3 h-3 text-gray-400 flex-shrink-0" />
+        <span className="flex items-center gap-1.5 min-w-0 flex-1">
+          <Phone className="w-4 h-4 text-gray-400 flex-shrink-0" />
           <input
             value={tel2}
             onChange={(e) => setTel2(e.target.value)}
             onKeyDown={onKeyDown}
             placeholder="Telephone 2"
-            className="border border-gray-300 rounded px-1.5 py-0.5 text-xs font-mono w-full focus:border-blue-500 focus:outline-none"
+            className="border border-gray-300 rounded px-2 py-1 text-sm font-mono w-full focus:border-blue-500 focus:outline-none"
           />
         </span>
-        <span className="flex items-center gap-1 text-gray-700 min-w-0 flex-1">
-          <Mail className="w-3 h-3 text-gray-400 flex-shrink-0" />
+        <span className="flex items-center gap-1.5 text-gray-700 min-w-0 flex-1">
+          <Mail className="w-4 h-4 text-gray-400 flex-shrink-0" />
           <span className="truncate text-gray-400" title="Email is not editable here">
             {customer.contact_email || "—"}
           </span>
         </span>
         {error && (
-          <span className="text-red-600 truncate" title={error}>
+          <span className="text-red-600 truncate text-sm" title={error}>
             {error}
           </span>
         )}
-        <button
-          type="button"
-          onClick={save}
-          disabled={isSaving}
-          title="Save (Enter)"
-          className="flex items-center gap-1 text-emerald-700 hover:text-emerald-900 disabled:text-gray-400 flex-shrink-0"
-        >
-          <Check className="w-4 h-4" strokeWidth={3} />
-        </button>
-        <button
-          type="button"
-          onClick={cancel}
-          disabled={isSaving}
-          title="Cancel (Esc)"
-          className="flex items-center gap-1 text-gray-500 hover:text-gray-800 disabled:text-gray-300 flex-shrink-0"
-        >
-          <X className="w-4 h-4" strokeWidth={3} />
-        </button>
       </div>
     );
   }
 
   return (
-    <div className="bg-white rounded border px-3 py-1.5 shadow-sm flex items-center gap-4 text-xs flex-shrink-0">
+    <div className="bg-white rounded border px-4 py-2 shadow-sm flex items-center gap-5 text-sm flex-shrink-0">
       <button
         type="button"
         onClick={() => setIsEditing(true)}
         title="Edit contact person & phones"
         className="flex-shrink-0 text-gray-400 hover:text-blue-600"
       >
-        <Pencil className="w-3.5 h-3.5" />
+        <Pencil className="w-4 h-4" />
       </button>
-      <span className="flex items-center gap-1 text-gray-700 min-w-0">
-        <User className="w-3 h-3 text-gray-400 flex-shrink-0" />
+      <span className="flex items-center gap-1.5 text-gray-700 min-w-0">
+        <User className="w-4 h-4 text-gray-400 flex-shrink-0" />
         <span className="font-semibold truncate" title={customer.contact_name || "—"}>
           {customer.contact_name || "—"}
         </span>
       </span>
-      <span className="flex items-center gap-1 text-gray-700 min-w-0">
-        <Phone className="w-3 h-3 text-gray-400 flex-shrink-0" />
+      <span className="flex items-center gap-1.5 text-gray-700 min-w-0">
+        <Phone className="w-4 h-4 text-gray-400 flex-shrink-0" />
         {customer.contact_tel ? (
           <a
             href={`tel:${customer.contact_tel}`}
@@ -174,8 +179,8 @@ export function CustomerContactStrip({ customer, onUpdated }: Props) {
           <span className="text-gray-400">—</span>
         )}
       </span>
-      <span className="flex items-center gap-1 text-gray-700 min-w-0">
-        <Phone className="w-3 h-3 text-gray-400 flex-shrink-0" />
+      <span className="flex items-center gap-1.5 text-gray-700 min-w-0">
+        <Phone className="w-4 h-4 text-gray-400 flex-shrink-0" />
         {customer.contact_tel2 ? (
           <a
             href={`tel:${customer.contact_tel2}`}
@@ -188,8 +193,8 @@ export function CustomerContactStrip({ customer, onUpdated }: Props) {
           <span className="text-gray-400">—</span>
         )}
       </span>
-      <span className="flex items-center gap-1 text-gray-700 min-w-0 flex-1">
-        <Mail className="w-3 h-3 text-gray-400 flex-shrink-0" />
+      <span className="flex items-center gap-1.5 text-gray-700 min-w-0 flex-1">
+        <Mail className="w-4 h-4 text-gray-400 flex-shrink-0" />
         {customer.contact_email ? (
           <a
             href={`mailto:${customer.contact_email}`}

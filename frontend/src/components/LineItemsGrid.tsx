@@ -5,7 +5,6 @@ import { api } from "../api/client";
 import { useAuth } from "../context/AuthContext";
 import { ItemPicker } from "./ItemPicker";
 import { NumberCell } from "./NumberCell";
-import { ProjectPicker } from "./ProjectPicker";
 import { SelectCell } from "./SelectCell";
 import { fmtNumber } from "../utils/format";
 import { resolvedPriceSource } from "../utils/history";
@@ -39,6 +38,14 @@ export type LineRow = {
    *  logged-in agent's default (i.e. the agent's DC didn't have a price list
    *  entry for this stock). Shown as a small badge next to the price input. */
   is_fallback_warehouse: boolean;
+  /** When true, the rep auto-added this line via the history grid's suggested
+   *  qty and hasn't yet acknowledged it. Rendered with an amber left border +
+   *  dot on the draft row, and gates the Continue button until confirmed.
+   *  Flips to false when the rep either edits the Qty cell OR explicitly
+   *  clicks the dot. Only set on rows that originated from a suggestion —
+   *  manual picker adds and bare history-row + clicks are confirmed from the
+   *  start. */
+  needs_confirm?: boolean;
 };
 
 export function makeEmptyLine(defaultTaxTypeId: number | null = null): LineRow {
@@ -79,16 +86,27 @@ export function snapToPack(qty: number, packSize: number): number {
 }
 
 /**
- * Pick the warehouse to pre-select on a new line. Prefers `preferred` (the
- * logged-in agent's default warehouse from `_vw_SOAgentDefaultWhse`) when the
- * stock is set up there, else the first available. Nothing warehouse-specific
- * is hardcoded on the frontend — the preference is resolved at login.
+ * Pick the warehouse to pre-select on a new line.
+ *
+ * The agent's default DC (resolved at login from `_vw_SOAgentDefaultWhse`) is
+ * the single source of truth: pricing is scoped to that DC in the backend
+ * resolver, and the line ships from the same DC. If the stock isn't set up
+ * at the agent's DC we DO NOT fall back to any other warehouse — doing so
+ * would silently ship from one DC while pricing from another (exactly the
+ * '01.HOF' vs '01.HOF_MAK' bug we hit on stock '002' at SPA299, where
+ * `_vw_SOInventory` listed the parent whse but the deal price lived at the
+ * branch). In that case the backend price lookup returns nothing and the
+ * "price not found" label blocks the save, which is the correct signal.
+ *
+ * Only when the agent has no default DC (edge case — e.g. a login without
+ * an `_vw_SOAgentDefaultWhse` entry) do we fall back to the first warehouse
+ * the stock is set up in, so a line can at least be drafted.
  */
 export function pickDefaultWarehouse(
   available: string[],
   preferred?: string | null,
 ): string {
-  if (preferred && available.includes(preferred)) return preferred;
+  if (preferred) return preferred;
   return available[0] ?? "";
 }
 
@@ -372,7 +390,7 @@ export function LineItemsGrid({
               <th style={{ width: 130 }}>Item</th>
               <th style={{ width: 190 }}>Item Description</th>
               <th style={{ width: 180 }}>Description</th>
-              <th style={{ width: 90 }}>Warehouse</th>
+              <th style={{ width: 125 }}>Warehouse</th>
               <th style={{ width: 70 }}>Avail.</th>
               <th style={{ width: 50 }}>Pack</th>
               <th style={{ width: 70 }}>Qty</th>
@@ -383,7 +401,6 @@ export function LineItemsGrid({
               <th style={{ width: 60 }}>Disc %</th>
               <th style={{ width: 100 }}>{lineTotalLabel}</th>
               <th style={{ width: 90 }}>Tax Amt</th>
-              <th style={{ width: 100 }}>Project</th>
               <th style={{ width: 28 }}></th>
             </tr>
           </thead>
@@ -515,18 +532,19 @@ export function LineItemsGrid({
                       value={line.warehouse_code || null}
                       options={warehouseOptions.filter((w) => {
                         const code = w.key as string;
-                        if (!line.warehouse_codes.includes(code)) return false;
-                        // Scope the dropdown to the agent's default warehouse
-                        // when the stock is set up there. If it isn't, fall
-                        // back to showing every warehouse the stock is in so
-                        // the line can still be placed.
-                        if (
-                          defaultWarehouseCode &&
-                          line.warehouse_codes.includes(defaultWarehouseCode)
-                        ) {
+                        // The agent's default DC is always a valid option,
+                        // even if `_vw_SOInventory` doesn't list it for this
+                        // stock — pricing happens at the DC regardless. When
+                        // the agent has a default DC we lock the dropdown to
+                        // it, so the rep can't accidentally pick a shipping
+                        // whse that doesn't match the pricing one.
+                        if (defaultWarehouseCode) {
                           return code === defaultWarehouseCode;
                         }
-                        return true;
+                        // No default DC configured — fall back to showing
+                        // every warehouse the stock is in so a line can
+                        // still be drafted.
+                        return line.warehouse_codes.includes(code);
                       })}
                       disabled={cellsDisabled || !line.is_whse_item}
                       onChange={(v) => updateLine(i, { warehouse_code: (v as string) ?? "" })}
@@ -644,14 +662,6 @@ export function LineItemsGrid({
                   </td>
                   <td className="num">{hasItem ? fmtNumber(lineDisplayed) : ""}</td>
                   <td className="num">{hasItem ? fmtNumber(lineTax) : ""}</td>
-                  <td>
-                    <ProjectPicker
-                      value={line.project_code}
-                      className="cell-input"
-                      disabled={cellsDisabled}
-                      onSelect={(code) => updateLine(i, { project_code: code })}
-                    />
-                  </td>
                   <td>
                     <button className="row-remove" onClick={() => removeLineAt(i)} title="Remove line">×</button>
                   </td>

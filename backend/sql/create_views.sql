@@ -263,13 +263,15 @@ CREATE OR ALTER VIEW dbo._vw_SOPriceListPrices AS
 SELECT
     PR.iStockID,
     PR.iPriceListNameID,
+    PN.cName             AS PriceListName,
     STK.Code             AS StockCode,
-    ISNULL(WH.Code, '0') AS WhseCode,
+    WH.Code              AS WhseCode,
     PR.fExclPrice,
     PR.fInclPrice
 FROM dbo._etblPriceListPrices PR
-JOIN dbo.StkItem STK     ON STK.StockLink = PR.iStockID
-LEFT JOIN dbo.WhseMst WH ON WH.WhseLink   = PR.iWarehouseID
+JOIN dbo._etblPriceListName PN ON PN.IDPriceListName = PR.iPriceListNameID
+JOIN dbo.StkItem STK           ON STK.StockLink      = PR.iStockID
+JOIN dbo.WhseMst WH            ON WH.WhseLink        = PR.iWarehouseID
 WHERE PR.fExclPrice > 0;
 GO
 
@@ -366,6 +368,7 @@ GO
 CREATE OR ALTER VIEW dbo._vw_SOCustomerPrice AS
 SELECT
     CL.Account,
+    PR.PriceListName,
     PR.iStockID,
     PR.StockCode,
     PR.WhseCode,
