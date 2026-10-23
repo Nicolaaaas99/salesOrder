@@ -1,3 +1,4 @@
+from datetime import date
 from typing import Dict, List, Optional
 
 from sqlalchemy import bindparam, text
@@ -10,6 +11,7 @@ def resolve_customer_prices(
     db: Session,
     account: str,
     stock_codes: List[str],
+    as_of: date,
     warehouse_code: Optional[str] = None,
 ) -> Dict[str, schemas.CustomerPrice]:
     """
@@ -18,6 +20,11 @@ def resolve_customer_prices(
     customer's price list in the rep's warehouse are omitted from the map
     (caller treats missing as source='None', price=0, which unlocks the
     manual-entry input).
+
+    `as_of` is the rep's session date — deals are only considered active if
+    their effective window straddles that date. Caller must always pass this
+    (typically from AuthContext.sessionDate) so a rep working an order dated
+    next Monday sees Monday's deal set, not today's.
 
     When `warehouse_code` is provided (typically the logged-in agent's
     default DC), ONLY prices for that warehouse are returned — we no longer
@@ -35,13 +42,15 @@ def resolve_customer_prices(
     sql = text(
         """
         SELECT StockCode, WhseCode, ExclPrice, InclPrice, PriceSource
-        FROM dbo._vw_SOCustomerPrice
+        FROM [SOAssistant].dbo._fn_SOCustomerPriceAsOf(:as_of)
         WHERE Account = :account
           AND StockCode IN :codes
         """
     ).bindparams(bindparam("codes", expanding=True))
 
-    rows = db.execute(sql, {"account": account, "codes": codes}).mappings().all()
+    rows = db.execute(
+        sql, {"account": account, "codes": codes, "as_of": as_of}
+    ).mappings().all()
 
     preferred: Dict[str, schemas.CustomerPrice] = {}
     unscoped: Dict[str, schemas.CustomerPrice] = {}

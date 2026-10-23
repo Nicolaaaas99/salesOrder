@@ -199,6 +199,67 @@ export type CustomerDealItem = {
   unit_price_incl: number;
 };
 
+// ---------- Analytics — Customer History (pivot tree) ----------
+
+export type CustomerHistoryCustomer = {
+  route: string;
+  account: string;
+  name: string;
+};
+
+export type CustomerHistorySale = {
+  route: string;
+  account: string;
+  category: string;
+  stock_code: string;
+  stock_desc: string;
+  /** Sunday-of-week ISO date (YYYY-MM-DD). */
+  week_start: string;
+  week_litres: number;
+  week_amount_incl: number;
+  last_sale_date: string | null;
+};
+
+export type CustomerHistoryResponse = {
+  routes: string[];
+  customers: CustomerHistoryCustomer[];
+  sales: CustomerHistorySale[];
+};
+
+
+// ---------- Customer contact log (route call outcomes) ----------
+
+/** Outcomes an agent can log via the Order Assistant modal. PLACED is written
+ *  server-side by the order-save path and is never submitted by the modal. */
+export type ContactOutcomeModal =
+  | "NO_ORDER"
+  | "CALLBACK"
+  | "NO_ANSWER"
+  | "REFUSED";
+
+/** Outcomes as returned by GET /contact-log/by-date — includes PLACED
+ *  because the order-save path writes it internally. */
+export type ContactOutcome = ContactOutcomeModal | "PLACED";
+
+export type ContactLogEntry = {
+  account: string;
+  outcome: ContactOutcome;
+  note: string | null;
+  follow_up_date: string | null;
+  order_no: string | null;
+  username: string;
+};
+
+export type ContactLogCreate = {
+  customer_account: string;
+  route_code?: string | null;
+  outcome: ContactOutcomeModal;
+  note?: string | null;
+  follow_up_date?: string | null;
+  source_app?: string;
+};
+
+
 export type OrderSuggestion = {
   stock_code: string;
   description: string;

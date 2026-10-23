@@ -11,6 +11,7 @@ from auth import get_current_user
 from database import get_db
 from routers.lookups import CUSTOMER_CREDIT_SQL, _build_customer_detail
 from services.audit import write_order_audit
+from services.contact_log import write_contact_log
 from services.sales_order_service import create_sales_order, update_sales_order
 
 
@@ -76,7 +77,7 @@ def _enforce_ext_order_requirement(db: Session, payload: schemas.SalesOrderCreat
     is blank, but if a stale client bypasses it we still want a clean 400."""
     try:
         row = db.execute(
-            text("SELECT ForceExtOrderNum FROM dbo._vw_SOSalesOrderConfig")
+            text("SELECT ForceExtOrderNum FROM [SOAssistant].dbo._vw_SOSalesOrderConfig")
         ).mappings().first()
     except Exception:
         return  # view missing — fail-open so orders aren't blocked by infra
@@ -181,6 +182,25 @@ def place_order(
     write_order_audit(
         db, result.order_no, "CREATE", username, app_version,
         customer_account=payload.customer_account,
+    )
+    # A placed order also counts as a PLACED outcome in the contact log so the
+    # customer's dropdown dot turns green. Route comes from the customer master
+    # — we resolve it here rather than trusting the client payload. No DB
+    # prefix: the backend connects directly to the Evolution company DB.
+    route_row = db.execute(
+        text("SELECT ulARRoute FROM dbo.Client WHERE Account = :account"),
+        {"account": payload.customer_account},
+    ).mappings().first()
+    write_contact_log(
+        db,
+        customer_account=payload.customer_account,
+        route_code=(route_row and route_row["ulARRoute"]) or None,
+        outcome="PLACED",
+        username=username,
+        source_app="SO_ASSISTANT",
+        app_version=app_version,
+        order_no=result.order_no,
+        swallow_db_errors=True,
     )
     return result
 
@@ -445,7 +465,7 @@ def _load_sales_order(order_no: str, db: Session) -> schemas.SalesOrderDetail:
                     StockCode,
                     MAX(CAST(IsWhseItem AS int))                               AS is_whse_item,
                     STRING_AGG(WhseCode, ',') WITHIN GROUP (ORDER BY WhseCode) AS warehouse_codes
-                FROM dbo._vw_SOInventory
+                FROM [SOAssistant].dbo._vw_SOInventory
                 WHERE StockCode IN :codes
                 GROUP BY StockCode
                 """

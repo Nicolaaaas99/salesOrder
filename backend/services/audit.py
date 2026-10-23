@@ -17,7 +17,7 @@ from sqlalchemy.orm import Session
 
 logger = logging.getLogger(__name__)
 
-AUDIT_TABLE = "_tb_SOOrderAssistantAudit"
+AUDIT_TABLE = "[SOAssistant].dbo._tb_SOOrderAssistantAudit"
 
 _has_doc_version: Optional[bool] = None
 
@@ -90,7 +90,7 @@ def write_order_audit(
 
         db.execute(
             text(f"""
-                INSERT INTO dbo.{AUDIT_TABLE}
+                INSERT INTO {AUDIT_TABLE}
                     (iInvNumAutoIndex, cOrderNum, cAction, iDocVersion,
                      iAgentID, cUsername, cCustomerAccount,
                      fOrderTotalIncl, cAppVersion)

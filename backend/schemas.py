@@ -88,6 +88,10 @@ class CustomerPrice(BaseModel):
 class CustomerPricesRequest(BaseModel):
     account: str
     stock_codes: List[str]
+    # Rep's session date — only deals effective on this date are applied.
+    # Frontend sends AuthContext.sessionDate; required so a rep writing an
+    # order dated e.g. next Monday sees Monday's deals, not today's.
+    as_of: date
     # Optional warehouse scope — when provided, prices are preferred from
     # this warehouse (falling back to lowest-across-warehouses if the stock
     # has no row in it). Normally set to the logged-in agent's default
@@ -292,6 +296,59 @@ class CustomerDealItem(BaseModel):
     source: str = "Price List"       # 'Customer Deal' | 'Group Deal'
     unit_price: float = 0.0
     unit_price_incl: float = 0.0
+
+
+# ---------- Analytics — Customer History (pivot tree) ----------
+
+class CustomerHistoryCustomer(BaseModel):
+    route: str
+    account: str
+    name: str
+
+
+class CustomerHistorySale(BaseModel):
+    route: str
+    account: str
+    category: str
+    stock_code: str
+    stock_desc: str
+    week_start: date
+    week_litres: float
+    week_amount_incl: float
+    last_sale_date: Optional[date] = None
+
+
+class CustomerHistoryResponse(BaseModel):
+    # Full route master (includes zero-sale routes).
+    routes: List[str] = []
+    # Full customer master per route (includes zero-sale customers so the
+    # tree can still surface stale accounts under their route).
+    customers: List[CustomerHistoryCustomer] = []
+    # Weekly aggregates — one row per (route, account, category, stock,
+    # week_start). Rolled up by the frontend into the four-level pivot.
+    sales: List[CustomerHistorySale] = []
+
+
+# ---------- Customer contact log (route call outcomes) ----------
+
+class ContactLogCreate(BaseModel):
+    customer_account: str
+    route_code: Optional[str] = None
+    # One of: NO_ORDER, CALLBACK, NO_ANSWER, REFUSED. PLACED is written
+    # internally by the order-save path and should not come from this endpoint.
+    outcome: str
+    note: Optional[str] = Field(None, max_length=200)
+    follow_up_date: Optional[date] = None
+    source_app: str = "SO_ASSISTANT"
+
+
+class ContactLogEntry(BaseModel):
+    account: str
+    outcome: str
+    note: Optional[str] = None
+    follow_up_date: Optional[date] = None
+    order_no: Optional[str] = None
+    username: str = ""
 
 
 class OrderSuggestion(BaseModel):

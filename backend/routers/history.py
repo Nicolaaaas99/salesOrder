@@ -29,7 +29,7 @@ def _week_start_sunday(d: date) -> date:
 def list_routes(db: Session = Depends(get_db)):
     sql = """
         SELECT DISTINCT LTRIM(RTRIM(Route)) AS route
-        FROM dbo._vw_SORoute
+        FROM [SOAssistant].dbo._vw_SORoute
         WHERE Route IS NOT NULL AND LTRIM(RTRIM(Route)) <> ''
         ORDER BY route
     """
@@ -41,7 +41,7 @@ def list_routes(db: Session = Depends(get_db)):
 def list_customers(route: str = Query(...), db: Session = Depends(get_db)):
     sql = """
         SELECT AccountCode, CustomerName
-        FROM dbo._vw_SOCustomers
+        FROM [SOAssistant].dbo._vw_SOCustomers
         WHERE LTRIM(RTRIM(Route)) = :route
           AND AccountCode IS NOT NULL AND LTRIM(RTRIM(AccountCode)) <> ''
           AND CustomerName IS NOT NULL
@@ -184,21 +184,23 @@ def list_orders_today(
 @router.get("/deal-items", response_model=List[schemas.CustomerDealItem])
 def list_customer_deal_items(
     customer_id: str = Query(...),
+    as_of: date = Query(...),
     warehouse_code: Optional[str] = Query(None),
     db: Session = Depends(get_db),
 ):
     """Stock items with an active Customer or Group Deal for the customer
-    at the rep's warehouse. Lets the Order Assistant surface dealed products
-    the customer has never bought so the rep can still offer them during the
-    call. Category comes from `StkItem.ulIIMainCategory` — the same column
-    `_vw_SOCustomerInvoiceHistory` uses, so a dealed item lands in the same
-    bucket it would land in if it had history."""
+    at the rep's warehouse, as of the rep's session date. Lets the Order
+    Assistant surface dealed products the customer has never bought so the
+    rep can still offer them during the call. Category comes from
+    `StkItem.ulIIMainCategory` — the same column `_vw_SOCustomerInvoiceHistory`
+    uses, so a dealed item lands in the same bucket it would land in if it
+    had history."""
     where = [
         "pr.Account = :account",
         "pr.PriceSource IN ('Customer Deal', 'Group Deal')",
         "STK.ItemActive = 1",
     ]
-    params: dict = {"account": customer_id.strip()}
+    params: dict = {"account": customer_id.strip(), "as_of": as_of}
     if warehouse_code and warehouse_code.strip():
         where.append("pr.WhseCode = :whse")
         params["whse"] = warehouse_code.strip()
@@ -211,7 +213,7 @@ def list_customer_deal_items(
             pr.PriceSource             AS source,
             pr.ExclPrice               AS unit_price,
             pr.InclPrice               AS unit_price_incl
-        FROM dbo._vw_SOCustomerPrice pr
+        FROM [SOAssistant].dbo._fn_SOCustomerPriceAsOf(:as_of) pr
         JOIN dbo.StkItem STK ON STK.StockLink = pr.iStockID
         WHERE {' AND '.join(where)}
         ORDER BY pr.StockCode
@@ -238,7 +240,7 @@ def list_orders(customer_id: str = Query(...), db: Session = Depends(get_db)):
             Route, CustomerAccName, CustomerAccount, Category,
             StockCode, StockCodeDesc,
             TxDate, Order_No, Quantity, ExclAmount, VAT, InclAmount, OnOrder
-        FROM dbo._vw_SOCustomerInvoiceHistory
+        FROM [SOAssistant].dbo._vw_SOCustomerInvoiceHistory
         WHERE CustomerAccount = :account
           AND TxDate >= DATEADD(month, -3, CAST(GETDATE() AS DATE))
     """
@@ -320,6 +322,7 @@ def list_orders(customer_id: str = Query(...), db: Session = Depends(get_db)):
 @router.get("/suggestions", response_model=List[schemas.OrderSuggestion])
 def order_suggestions(
     customer_id: str = Query(...),
+    as_of: date = Query(...),
     weeks: int = Query(6, ge=2, le=26),
     min_weeks: int = Query(3, ge=1),
     warehouse_code: Optional[str] = Query(None),
@@ -342,9 +345,10 @@ def order_suggestions(
     5. already_covered = on_order_qty + current_week_invoiced_qty.
     6. adjusted = max(0, base_median − already_covered), snapped to pack size.
     7. Dropped if snapped == 0.
-    8. Unit price = resolved from _vw_SOCustomerPrice (customer/group deal
-       beats price list). Historical median prices are NOT used — we want the
-       current live price the customer would actually be charged.
+    8. Unit price = resolved from _fn_SOCustomerPriceAsOf(:as_of) (customer/
+       group deal beats price list, deals filtered to the rep's session date).
+       Historical median prices are NOT used — we want the live price the
+       customer would actually be charged on the order being drafted.
     """
     today = date.today()
     current_week_start = _week_start_sunday(today)
@@ -366,7 +370,7 @@ def order_suggestions(
     # SO is going to be delivered no matter when its OrderDate falls.
     sql = """
         SELECT StockCode, StockCodeDesc, Category, TxDate, Quantity, ExclAmount, OnOrder
-        FROM dbo._vw_SOCustomerInvoiceHistory
+        FROM [SOAssistant].dbo._vw_SOCustomerInvoiceHistory
         WHERE CustomerAccount = :account
           AND (
                 (OnOrder = 0 AND TxDate >= :window_start AND TxDate <= :week_end)
@@ -475,7 +479,7 @@ def order_suggestions(
                     MAX(PackSize)                                               AS pack_size,
                     SUM(QtyOnHand)                                              AS available,
                     STRING_AGG(WhseCode, ',') WITHIN GROUP (ORDER BY WhseCode)  AS warehouse_codes
-                FROM dbo._vw_SOInventory
+                FROM [SOAssistant].dbo._vw_SOInventory
                 WHERE StockCode IN :codes
                 GROUP BY StockCode
                 """
@@ -516,7 +520,7 @@ def order_suggestions(
         # Both excl + incl are returned so the frontend's Tax Mode toggle can
         # display the exact Price List value without re-deriving.
         price_map = resolve_customer_prices(
-            db, customer_id, codes, warehouse_code=warehouse_code
+            db, customer_id, codes, as_of=as_of, warehouse_code=warehouse_code
         )
         for s in suggestions:
             p = price_map.get(s.stock_code)

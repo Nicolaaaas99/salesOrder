@@ -4,6 +4,8 @@ import AsyncSelect from "react-select/async";
 import { Truck, Users, XCircle, Check } from "lucide-react";
 import { api } from "../api/client";
 import type {
+  ContactLogEntry,
+  ContactOutcome,
   CustomerDetail,
   HistoricalOrder,
   InventoryItem,
@@ -11,6 +13,10 @@ import type {
   SalesOrderSearchResult,
   TaxType,
 } from "../api/types";
+import {
+  ContactOutcomeModal,
+  type ContactOutcomeSubmission,
+} from "./ContactOutcomeModal";
 import { HistoryGrid } from "./HistoryGrid";
 import { DraftOrderPanel, type DraftLine } from "./DraftOrderPanel";
 import { OrdersModal } from "./OrdersModal";
@@ -30,6 +36,26 @@ import { worstDeliveryTier } from "../utils/deliveryAge";
 import { useCustomerAutoRefresh } from "../utils/useCustomerAutoRefresh";
 
 type Option = { value: string; label: string };
+
+/** Dot colour + label for a customer in the dropdown.
+ *  Precedence:
+ *    1. PLACED (either from contact log OR Evolution has an open order
+ *       today — the latter covers orders placed before this feature went
+ *       live, or outside the app entirely)      → green
+ *    2. any other logged outcome                 → amber
+ *    3. no row, no order                         → red */
+function outcomeDot(outcome: ContactOutcome | undefined, hasOrderToday: boolean): { color: string; label: string } {
+  if (hasOrderToday || outcome === "PLACED") return { color: "#10b981", label: "Order placed" };
+  if (outcome) return { color: "#f59e0b", label: `Logged: ${outcome}` };
+  return { color: "#ef4444", label: "Not contacted" };
+}
+
+/** Row tint for the AsyncSelect option — subtle version of the dot colour. */
+function tintForOutcome(outcome: ContactOutcome | undefined, hasOrderToday: boolean, isFocused: boolean): string {
+  if (hasOrderToday || outcome === "PLACED") return isFocused ? "#a7f3d0" : "#d1fae5"; // green-200 / 100
+  if (outcome) return isFocused ? "#fde68a" : "#fef3c7";                                 // amber-200 / 100
+  return isFocused ? "#eff6ff" : "white";
+}
 
 const selectStyles = {
   control: (base: any) => ({
@@ -134,7 +160,7 @@ type OrderAssistantProps = {
 };
 
 export function OrderAssistantScreen({ onOpenOrder }: OrderAssistantProps = {}) {
-  const { defaultWarehouseCode } = useAuth();
+  const { defaultWarehouseCode, sessionDate } = useAuth();
   const [routes, setRoutes] = useState<Option[]>([]);
   const [selectedRoute, setSelectedRoute] = useState<Option | null>(null);
   const [selectedCustomer, setSelectedCustomer] = useState<Option | null>(null);
@@ -142,6 +168,30 @@ export function OrderAssistantScreen({ onOpenOrder }: OrderAssistantProps = {}) 
   // whenever the route changes and after every successful order placement so
   // the badges and confirmation modal stay accurate.
   const [ordersTodayMap, setOrdersTodayMap] = useState<Map<string, number>>(new Map());
+  // Customer → latest contact outcome logged TODAY, across ALL routes.
+  // Each customer belongs to exactly one route (Client.ulARRoute is 1:1)
+  // so a route scope would add nothing here. Fetched once on mount and
+  // after every modal save / order placement; drives the dropdown dot
+  // colour (red = no row, yellow = any non-placed outcome, green = PLACED)
+  // regardless of whether a route is picked. The counter at the top of
+  // the picker intersects this with the route's customer list client-side.
+  const [contactOutcomes, setContactOutcomes] = useState<Map<string, ContactOutcome>>(new Map());
+  // Count of customers on the current route — fed by the route-change effect
+  // once the route's customer list has loaded. Lives in state (not just the
+  // cache ref) so the "n to call" counter re-renders when the data arrives.
+  const [routeCustomerCount, setRouteCustomerCount] = useState(0);
+  // While the agent is leaving an opened customer without placing, we hold
+  // the deferred navigation here and show the modal. Resolving the modal
+  // (outcome save or "opened by mistake") runs `proceed`.
+  const [pendingLeave, setPendingLeave] = useState<{ customer: Option; proceed: () => void } | null>(null);
+  const [isSavingOutcome, setIsSavingOutcome] = useState(false);
+  // Last error from the contact-log POST — shown inside the modal so the
+  // agent sees why their save didn't go through (most often: missing
+  // INSERT permission on [SOAssistant].dbo._tb_SOCustomerContactLog).
+  const [outcomeError, setOutcomeError] = useState<string | null>(null);
+  // Set to true when the leave is caused by a successful order placement —
+  // the modal is skipped on the immediate state cascade that follows.
+  const skipNextLeaveModalRef = useRef(false);
   // When the user clicks a customer that already has orders today, we hold the
   // pending pick here while asking for confirmation.
   const [pendingCustomerPick, setPendingCustomerPick] = useState<Option | null>(null);
@@ -251,13 +301,50 @@ export function OrderAssistantScreen({ onOpenOrder }: OrderAssistantProps = {}) 
   // it synchronously without being tied to React state timing.
   const routeCustomersCacheRef = useRef<Map<string, Option[]>>(new Map());
 
+  // Pull today's contact outcomes (all routes) so the dropdown dots render
+  // correctly whether or not a route is selected. Called on mount and
+  // after every modal save / order placement so the dots stay in sync.
+  const refreshContactOutcomes = useCallback(async () => {
+    try {
+      const data = await api.listTodayOutcomes();
+      setContactOutcomes(
+        new Map(data.map((d: ContactLogEntry) => [d.account, d.outcome])),
+      );
+    } catch {
+      setContactOutcomes(new Map());
+    }
+  }, []);
+
+  useEffect(() => {
+    refreshContactOutcomes();
+  }, [refreshContactOutcomes]);
+
+  // Gate used by the Customer / Route onChange handlers. If an opened
+  // customer is being left without a placed order, the outcome modal
+  // intercepts and defers the actual navigation until the agent either
+  // picks an outcome or presses "Opened by mistake".
+  const tryLeaveCurrentCustomer = useCallback(
+    (proceed: () => void) => {
+      if (!selectedCustomer || skipNextLeaveModalRef.current) {
+        skipNextLeaveModalRef.current = false;
+        proceed();
+        return;
+      }
+      setPendingLeave({ customer: selectedCustomer, proceed });
+    },
+    [selectedCustomer],
+  );
+
   // Route change: refresh the orders-today map, and if the current customer
   // isn't in the new route's list clear them. Doesn't touch customer on
   // route-cleared (null) — that case is handled in the Route selector's
   // onChange so we can distinguish "typed in customer dropdown" (keep
   // customer) from "user clicked the X" (clear customer).
   useEffect(() => {
-    if (!selectedRoute) return;
+    if (!selectedRoute) {
+      setRouteCustomerCount(0);
+      return;
+    }
     let cancelled = false;
     (async () => {
       let list = routeCustomersCacheRef.current.get(selectedRoute.value);
@@ -271,6 +358,7 @@ export function OrderAssistantScreen({ onOpenOrder }: OrderAssistantProps = {}) 
         }
       }
       if (cancelled) return;
+      setRouteCustomerCount(list.length);
       setSelectedCustomer((prev) =>
         prev && list!.some((c) => c.value === prev.value) ? prev : null
       );
@@ -337,10 +425,10 @@ export function OrderAssistantScreen({ onOpenOrder }: OrderAssistantProps = {}) 
       try {
         const [ordersData, suggestionsData, detail, dealItems] = await Promise.all([
           api.listHistoryOrders(selectedCustomer.value),
-          api.listOrderSuggestions(selectedCustomer.value, undefined, undefined, defaultWarehouseCode),
+          api.listOrderSuggestions(selectedCustomer.value, sessionDate!, undefined, undefined, defaultWarehouseCode),
           api.getCustomer(selectedCustomer.value).catch(() => null),
           api
-            .listCustomerDealItems(selectedCustomer.value, defaultWarehouseCode)
+            .listCustomerDealItems(selectedCustomer.value, sessionDate!, defaultWarehouseCode)
             .catch(() => []),
         ]);
 
@@ -416,6 +504,7 @@ export function OrderAssistantScreen({ onOpenOrder }: OrderAssistantProps = {}) 
             const priceMap = await api.getCustomerPrices(
               selectedCustomer.value,
               [...codes],
+              sessionDate!,
               defaultWarehouseCode,
             );
             const srcMap = new Map<string, string>();
@@ -438,7 +527,7 @@ export function OrderAssistantScreen({ onOpenOrder }: OrderAssistantProps = {}) 
     })();
 
     setDraftLines([]);
-  }, [selectedCustomer]);
+  }, [selectedCustomer, sessionDate]);
 
   // Suggestion quantities tick down live as the user drafts lines for the
   // same stock code. When the remaining suggestion reaches 0, the item drops
@@ -467,6 +556,33 @@ export function OrderAssistantScreen({ onOpenOrder }: OrderAssistantProps = {}) 
     });
     return m;
   }, [suggestions, draftLines]);
+
+  // Route progress counter shown at the top of the Customer picker. Total
+  // comes from the route-customer-count state (populated once the list has
+  // loaded). "Placed" uses the same fallback as the dropdown dot — any
+  // customer with an Evolution order today counts as PLACED even without a
+  // contact-log row (handles pre-feature orders and orders placed outside
+  // this app). "Contacted" counts non-placed logged outcomes. The remainder
+  // is "to call".
+  const routeProgress = useMemo(() => {
+    const route = selectedRoute?.value ?? null;
+    const customerList = route
+      ? routeCustomersCacheRef.current.get(route)
+      : undefined;
+    let placed = 0;
+    let contacted = 0;
+    (customerList ?? []).forEach((c) => {
+      const outcome = contactOutcomes.get(c.value);
+      const hasOrderToday = (ordersTodayMap.get(c.value) ?? 0) > 0;
+      if (hasOrderToday || outcome === "PLACED") {
+        placed += 1;
+      } else if (outcome) {
+        contacted += 1;
+      }
+    });
+    const remaining = Math.max(0, routeCustomerCount - placed - contacted);
+    return { total: routeCustomerCount, placed, contacted, remaining };
+  }, [contactOutcomes, routeCustomerCount, ordersTodayMap, selectedRoute]);
 
   const defaultTaxTypeId = customerDetail?.default_tax_type_id ?? null;
 
@@ -542,7 +658,7 @@ export function OrderAssistantScreen({ onOpenOrder }: OrderAssistantProps = {}) 
         const account = customerDetail.account;
         const code = line.stock_code;
         api
-          .getCustomerPrices(account, [code], defaultWarehouseCode)
+          .getCustomerPrices(account, [code], sessionDate!, defaultWarehouseCode)
           .then((map) => {
             const p = map[code];
             // Store BOTH prices on the draft line — excl is the computational
@@ -788,21 +904,80 @@ export function OrderAssistantScreen({ onOpenOrder }: OrderAssistantProps = {}) 
     // clear BOTH the route and customer selections so the rep lands on a
     // fully fresh start. Clearing the customer cascades (via effect) to
     // reset orders, suggestions, customerDetail and draftLines.
+    //
+    // The outcome modal normally fires when a customer is deselected; mark
+    // this leave as skip-worthy so it doesn't ask "what happened?" right
+    // after the agent placed the order. PLACED is written server-side.
+    skipNextLeaveModalRef.current = true;
     setFinalizeOpen(false);
     setSelectedCustomer(null);
     setSelectedRoute(null);
     // Bump session key so the finalize modal remounts fresh next time (dates,
     // description, discount reset to defaults).
     setFinalizeSessionKey((k) => k + 1);
-    // Refresh the "orders today" badges so the just-placed order shows up next
-    // to the customer immediately.
+    // Refresh the "orders today" badges + the dropdown dots so the just-placed
+    // order shows up as green next to the customer immediately.
     refreshOrdersToday();
+    refreshContactOutcomes();
     // No second success modal — SalesOrderScreen already showed one with the
     // actual order number before it fired onPlaced.
-  }, [refreshOrdersToday]);
+  }, [refreshOrdersToday, refreshContactOutcomes]);
+
+  const handleOutcomeSubmit = useCallback(
+    async (sub: ContactOutcomeSubmission) => {
+      if (!pendingLeave) return;
+      setIsSavingOutcome(true);
+      setOutcomeError(null);
+      try {
+        await api.logContactOutcome({
+          customer_account: pendingLeave.customer.value,
+          route_code: selectedRoute?.value ?? null,
+          outcome: sub.outcome,
+          note: sub.note || null,
+          follow_up_date: sub.follow_up_date || null,
+        });
+      } catch (e: any) {
+        // Keep the modal open so the agent can see what failed and retry.
+        // The most common cause is the backend's SQL login not having
+        // INSERT on [SOAssistant].dbo._tb_SOCustomerContactLog — surface
+        // the actual server message so the admin can fix it.
+        const detail =
+          e?.response?.data?.detail ??
+          e?.message ??
+          "Save failed. Try again or press 'Opened by mistake' to exit.";
+        setOutcomeError(String(detail));
+        setIsSavingOutcome(false);
+        return;
+      }
+      setIsSavingOutcome(false);
+      const proceed = pendingLeave.proceed;
+      setPendingLeave(null);
+      refreshContactOutcomes();
+      proceed();
+    },
+    [pendingLeave, selectedRoute, refreshContactOutcomes],
+  );
+
+  const handleOutcomeMistake = useCallback(() => {
+    if (!pendingLeave) return;
+    const proceed = pendingLeave.proceed;
+    setPendingLeave(null);
+    setOutcomeError(null);
+    proceed();
+  }, [pendingLeave]);
 
   return (
     <div className="h-full bg-gray-50 p-2 flex flex-col">
+      {pendingLeave && (
+        <ContactOutcomeModal
+          customerLabel={pendingLeave.customer.label}
+          isSaving={isSavingOutcome}
+          errorMessage={outcomeError}
+          onSubmit={handleOutcomeSubmit}
+          onMistake={handleOutcomeMistake}
+        />
+      )}
+
       {pendingCustomerPick && (
         <div className="fixed inset-0 z-50 bg-black bg-opacity-30 flex items-center justify-center p-4">
           <div className="bg-white rounded shadow-lg max-w-md w-full p-4">
@@ -892,12 +1067,14 @@ export function OrderAssistantScreen({ onOpenOrder }: OrderAssistantProps = {}) 
               value={selectedRoute}
               onChange={(opt) => {
                 const next = opt as Option | null;
-                setSelectedRoute(next);
-                // User explicitly cleared the Route → clear the customer too.
-                // (Typing in the customer dropdown ALSO clears the route, but
-                // via a separate handler that intentionally keeps the customer
-                // mid-search — so this branch only runs for the X click.)
-                if (!next) setSelectedCustomer(null);
+                // Switching away from a route with an opened customer → force
+                // an outcome entry (or an "opened by mistake" escape) before
+                // the switch takes effect. Clearing the route also clears
+                // the customer, so the same gate applies.
+                tryLeaveCurrentCustomer(() => {
+                  setSelectedRoute(next);
+                  if (!next) setSelectedCustomer(null);
+                });
               }}
               placeholder="Search route..."
               isDisabled={isLoadingRoutes}
@@ -909,10 +1086,28 @@ export function OrderAssistantScreen({ onOpenOrder }: OrderAssistantProps = {}) 
           </div>
 
           <div className="bg-white rounded border p-2 shadow-sm">
-            <label className="flex items-center font-semibold text-gray-800 mb-1 text-sm">
-              <Users className="w-3 h-3 mr-1 text-green-600" />
-              Customer
-            </label>
+            <div className="flex items-center justify-between mb-1">
+              <label className="flex items-center font-semibold text-gray-800 text-sm">
+                <Users className="w-3 h-3 mr-1 text-green-600" />
+                Customer
+              </label>
+              {routeProgress.total > 0 && (
+                <div className="flex items-center gap-3 text-xs text-gray-600">
+                  <span className="inline-flex items-center gap-1">
+                    <span className="w-2 h-2 rounded-full bg-emerald-500" />
+                    {routeProgress.placed} placed
+                  </span>
+                  <span className="inline-flex items-center gap-1">
+                    <span className="w-2 h-2 rounded-full bg-amber-500" />
+                    {routeProgress.contacted} contacted
+                  </span>
+                  <span className="inline-flex items-center gap-1">
+                    <span className="w-2 h-2 rounded-full bg-red-500" />
+                    {routeProgress.remaining} to call
+                  </span>
+                </div>
+              )}
+            </div>
             <AsyncSelect
               key={selectedRoute?.value ?? "all"}
               cacheOptions={!!selectedRoute}
@@ -922,38 +1117,50 @@ export function OrderAssistantScreen({ onOpenOrder }: OrderAssistantProps = {}) 
               styles={{
                 ...selectStyles,
                 option: (base: any, state: any) => {
-                  const placed = (ordersTodayMap.get((state.data as Option).value) ?? 0) > 0;
+                  const account = (state.data as Option).value;
+                  const outcome = contactOutcomes.get(account);
+                  const hasOrderToday = (ordersTodayMap.get(account) ?? 0) > 0;
+                  const tint = tintForOutcome(outcome, hasOrderToday, state.isFocused);
                   return {
                     ...selectStyles.option(base, state),
-                    backgroundColor: state.isFocused
-                      ? placed ? "#a7f3d0" : "#eff6ff"
-                      : placed ? "#d1fae5" : "white",
+                    backgroundColor: tint,
                   };
                 },
               }}
               onChange={(opt) => {
                 const next = opt as Option | null;
-                if (!next) {
-                  setSelectedCustomer(null);
-                  setSelectedRoute(null);     // clearing the customer also clears the route
-                  return;
-                }
-                const count = ordersTodayMap.get(next.value) ?? 0;
-                if (count > 0 && next.value !== selectedCustomer?.value) {
-                  setPendingCustomerPick(next);
-                  return;
-                }
-                setSelectedCustomer(next);
+                if (next && next.value === selectedCustomer?.value) return;
+                tryLeaveCurrentCustomer(() => {
+                  if (!next) {
+                    setSelectedCustomer(null);
+                    setSelectedRoute(null);     // clearing the customer also clears the route
+                    return;
+                  }
+                  const count = ordersTodayMap.get(next.value) ?? 0;
+                  if (count > 0 && next.value !== selectedCustomer?.value) {
+                    setPendingCustomerPick(next);
+                    return;
+                  }
+                  setSelectedCustomer(next);
+                });
               }}
               formatOptionLabel={(opt) => {
                 const o = opt as Option;
-                const count = ordersTodayMap.get(o.value) ?? 0;
+                const outcome = contactOutcomes.get(o.value);
+                const hasOrderToday = (ordersTodayMap.get(o.value) ?? 0) > 0;
+                const dot = outcomeDot(outcome, hasOrderToday);
+                const isGreen = hasOrderToday || outcome === "PLACED";
                 return (
                   <div className="flex items-center gap-2 min-w-0">
+                    <span
+                      className="flex-shrink-0 inline-block w-2.5 h-2.5 rounded-full"
+                      style={{ backgroundColor: dot.color }}
+                      aria-label={dot.label}
+                    />
                     <span className="truncate">{o.label}</span>
-                    {count > 0 && (
+                    {isGreen && (
                       <Check
-                        className="flex-shrink-0 w-6 h-6 text-emerald-600"
+                        className="flex-shrink-0 w-5 h-5 text-emerald-600 ml-auto"
                         strokeWidth={3.5}
                         aria-label="Order placed today"
                       />

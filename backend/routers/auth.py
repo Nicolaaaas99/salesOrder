@@ -28,7 +28,7 @@ def _default_warehouse_for(db: Session, agent_username: str) -> Optional[str]:
     if not name:
         return None
     row = db.execute(
-        text("SELECT WhseCode FROM dbo._vw_SOAgentDefaultWhse WHERE cAgentName = :name"),
+        text("SELECT WhseCode FROM [SOAssistant].dbo._vw_SOAgentDefaultWhse WHERE cAgentName = :name"),
         {"name": name},
     ).mappings().first()
     code = (row and row["WhseCode"]) or None
@@ -41,7 +41,7 @@ def _force_ext_order_num(db: Session) -> bool:
     orders can still be placed if the config isn't set up)."""
     try:
         row = db.execute(
-            text("SELECT ForceExtOrderNum FROM dbo._vw_SOSalesOrderConfig")
+            text("SELECT ForceExtOrderNum FROM [SOAssistant].dbo._vw_SOSalesOrderConfig")
         ).mappings().first()
         return bool(row and row["ForceExtOrderNum"])
     except Exception:
@@ -117,7 +117,7 @@ def set_default_warehouse(
         raise HTTPException(400, "Warehouse code is required")
 
     whse = db.execute(
-        text("SELECT WhseLink FROM dbo._vw_SOWarehouses WHERE Code = :code"),
+        text("SELECT WhseLink FROM [SOAssistant].dbo._vw_SOWarehouses WHERE Code = :code"),
         {"code": code},
     ).mappings().first()
     if not whse:

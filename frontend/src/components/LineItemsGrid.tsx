@@ -207,7 +207,7 @@ type FocusTarget = { row: number; col?: number };
 export function LineItemsGrid({
   lines, warehouses, taxTypes, defaultTaxTypeId, taxMode, customerAccount, onChange,
 }: Props) {
-  const { defaultWarehouseCode } = useAuth();
+  const { defaultWarehouseCode, sessionDate } = useAuth();
   const tbodyRef = useRef<HTMLTableSectionElement>(null);
   const focusTarget = useRef<FocusTarget | null>(null);
   const prevLineCount = useRef(lines.length);
@@ -476,7 +476,7 @@ export function LineItemsGrid({
                         if (customerAccount) {
                           const pickedCode = item.code;
                           api
-                            .getCustomerPrices(customerAccount, [pickedCode], defaultWarehouseCode)
+                            .getCustomerPrices(customerAccount, [pickedCode], sessionDate!, defaultWarehouseCode)
                             .then((map) => {
                               const p = map[pickedCode];
                               // Store both prices — unit_price = excl is the

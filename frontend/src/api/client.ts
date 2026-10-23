@@ -1,5 +1,8 @@
 import axios from "axios";
 import type {
+  ContactLogCreate,
+  ContactLogEntry,
+  CustomerHistoryResponse,
   CustomerSummary,
   CustomerDetail,
   CustomerPrice,
@@ -132,12 +135,14 @@ export const api = {
   getCustomerPrices: (
     account: string,
     stockCodes: string[],
+    asOf: string,
     warehouseCode?: string | null,
   ) =>
     http
       .post<Record<string, CustomerPrice>>("/lookups/customer-prices", {
         account,
         stock_codes: stockCodes,
+        as_of: asOf,
         warehouse_code: warehouseCode ?? null,
       })
       .then((r) => r.data),
@@ -242,18 +247,53 @@ export const api = {
       .get<HistoricalOrder[]>("/history/orders", { params: { customer_id: customerId } })
       .then((r) => r.data),
 
-  listCustomerDealItems: (customerId: string, warehouseCode?: string | null) =>
+  listCustomerDealItems: (
+    customerId: string,
+    asOf: string,
+    warehouseCode?: string | null,
+  ) =>
     http
       .get<CustomerDealItem[]>("/history/deal-items", {
         params: {
           customer_id: customerId,
+          as_of: asOf,
           ...(warehouseCode ? { warehouse_code: warehouseCode } : {}),
         },
       })
       .then((r) => r.data),
 
+  // ---------- Customer contact log ----------
+  /** Latest outcome per customer for the given day across ALL routes
+   *  (default: today). Customers are 1:1 with their route so route-scoped
+   *  filtering adds no discrimination value here — the frontend uses this
+   *  to colour every dropdown dot regardless of whether a route is picked
+   *  yet. The counter at the top of the picker filters client-side by
+   *  intersecting with the current route's customer list. */
+  listTodayOutcomes: (date?: string) =>
+    http
+      .get<ContactLogEntry[]>("/contact-log/by-date", {
+        params: { ...(date ? { date } : {}) },
+      })
+      .then((r) => r.data),
+
+  logContactOutcome: (payload: ContactLogCreate) =>
+    http.post<{ id: number; outcome: string }>("/contact-log", payload).then((r) => r.data),
+
+  // ---------- Analytics ----------
+  /** Full dataset for the Customer History pivot. One weekly-aggregated
+   *  row per (route, customer, category, stock, week) for the trailing N
+   *  weeks, plus the complete route + customer master so zero-sale rows
+   *  still appear in the tree. */
+  getCustomerHistory: (weeks = 12) =>
+    http
+      .get<CustomerHistoryResponse>("/route-overview/customer-history", {
+        params: { weeks },
+      })
+      .then((r) => r.data),
+
   listOrderSuggestions: (
     customerId: string,
+    asOf: string,
     weeks = 6,
     minWeeks = 3,
     warehouseCode?: string | null,
@@ -262,6 +302,7 @@ export const api = {
       .get<OrderSuggestion[]>("/history/suggestions", {
         params: {
           customer_id: customerId,
+          as_of: asOf,
           weeks,
           min_weeks: minWeeks,
           ...(warehouseCode ? { warehouse_code: warehouseCode } : {}),

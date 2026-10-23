@@ -90,7 +90,7 @@ function AuthenticatedApp() {
             className={`app-tab ${view === "overview" ? "app-tab--active" : ""}`}
             onClick={() => setView("overview")}
           >
-            Route Overview
+            Analytics
           </button>
         </div>
 

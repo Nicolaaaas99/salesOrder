@@ -537,7 +537,6 @@ export function DraftOrderPanel({
               {unconfirmedCount === 1
                 ? " suggested quantity to confirm"
                 : " suggested quantities to confirm"}
-              {" — click the amber dot or edit the Units cell."}
             </span>
           </div>
         )}

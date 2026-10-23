@@ -27,7 +27,7 @@ def list_customers(
 ):
     sql = """
         SELECT TOP (:limit) AccountCode AS account, CustomerName AS name
-        FROM dbo._vw_SOCustomers
+        FROM [SOAssistant].dbo._vw_SOCustomers
         WHERE AccountCode IS NOT NULL
           AND CustomerName IS NOT NULL
           AND (:like IS NULL OR AccountCode LIKE :like OR CustomerName LIKE :like)
@@ -50,7 +50,7 @@ def list_customers(
 
 
 CUSTOMER_CREDIT_SQL = """
-    SELECT * FROM dbo._vw_SOCustomerDetail WHERE Account = :account
+    SELECT * FROM [SOAssistant].dbo._vw_SOCustomerDetail WHERE Account = :account
 """
 
 
@@ -180,7 +180,7 @@ def list_inventory(
             MAX(PackSize)                                        AS pack_size,
             SUM(QtyOnHand)                                       AS available,
             STRING_AGG(WhseCode, ',') WITHIN GROUP (ORDER BY WhseCode) AS warehouse_codes
-        FROM dbo._vw_SOInventory
+        FROM [SOAssistant].dbo._vw_SOInventory
         WHERE (:like IS NULL OR StockCode LIKE :like OR StockDesc LIKE :like)
         GROUP BY StockCode
         ORDER BY StockCode
@@ -208,7 +208,7 @@ def list_inventory(
 def list_warehouses(db: Session = Depends(get_db)):
     sql = """
         SELECT Code AS code, Description AS description
-        FROM dbo._vw_SOWarehouses
+        FROM [SOAssistant].dbo._vw_SOWarehouses
         ORDER BY Code
     """
     rows = db.execute(text(sql)).mappings().all()
@@ -222,7 +222,7 @@ def list_warehouse_default_choices(db: Session = Depends(get_db)):
     first-login prompt can't offer invalid DCs."""
     sql = """
         SELECT Code AS code, Description AS description
-        FROM dbo._vw_SOWarehouses
+        FROM [SOAssistant].dbo._vw_SOWarehouses
         WHERE WhseLink IN (48, 49)
         ORDER BY Code
     """
@@ -238,7 +238,7 @@ def list_tax_types(db: Session = Depends(get_db)):
             Code        AS code,
             Description AS description,
             Rate        AS rate
-        FROM dbo._vw_SOTaxTypes
+        FROM [SOAssistant].dbo._vw_SOTaxTypes
         ORDER BY Code
     """
     rows = db.execute(text(sql)).mappings().all()
@@ -263,7 +263,7 @@ def list_projects(
         SELECT TOP (:limit)
             ProjectCode AS code,
             ProjectName AS description
-        FROM dbo._vw_SOProjects
+        FROM [SOAssistant].dbo._vw_SOProjects
         WHERE (:like IS NULL OR ProjectCode LIKE :like OR ProjectName LIKE :like)
         ORDER BY ProjectCode
     """
@@ -289,7 +289,7 @@ def get_pack_sizes(
     sql = text(
         """
         SELECT StockCode, MAX(PackSize) AS pack_size
-        FROM dbo._vw_SOInventory
+        FROM [SOAssistant].dbo._vw_SOInventory
         WHERE StockCode IN :codes
         GROUP BY StockCode
         """
@@ -315,7 +315,11 @@ def get_customer_prices(
     if not account:
         raise HTTPException(400, "account is required")
     return resolve_customer_prices(
-        db, account, payload.stock_codes, warehouse_code=payload.warehouse_code
+        db,
+        account,
+        payload.stock_codes,
+        as_of=payload.as_of,
+        warehouse_code=payload.warehouse_code,
     )
 
 
@@ -323,7 +327,7 @@ def get_customer_prices(
 def list_settlement_terms(db: Session = Depends(get_db)):
     sql = """
         SELECT Code AS code, Description AS description
-        FROM dbo._vw_SOSettlementTerms
+        FROM [SOAssistant].dbo._vw_SOSettlementTerms
         ORDER BY Code
     """
     rows = db.execute(text(sql)).mappings().all()

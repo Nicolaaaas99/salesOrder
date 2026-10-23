@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(Invoke-RestMethod -Uri \"http://localhost:8001/lookups/inventory?limit=3\" -TimeoutSec 5)",
+      "Bash(python -c \"from routers import lookups, history; print\\('routers ok'\\)\")",
+      "Bash(python -c \"import config; from routers import debug, lookups, history; import connection; print\\('ok'\\)\")",
+      "Bash(.venv/Scripts/python.exe -c \"from routers import debug; print\\('ok'\\)\")",
+      "Bash(.venv/Scripts/python.exe -c \"from services.sales_order_service import _get_customer_branch_code, _set_active_branch, _probe_branch_api, create_sales_order, update_sales_order; print\\('ok'\\)\")",
+      "Bash(.venv/Scripts/python.exe -c \"from services import sales_order_service; print\\('ok'\\)\")"
+    ]
+  }
+}

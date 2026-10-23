@@ -29,7 +29,7 @@ def db_info(db: Session = Depends(get_db)):
     ).mappings().first()
 
     views = db.execute(
-        text("SELECT name FROM sys.views WHERE name LIKE '_vw_SO%' ORDER BY name")
+        text("SELECT name FROM [SOAssistant].sys.views WHERE name LIKE '_vw_SO%' ORDER BY name")
     ).mappings().all()
 
     return {
