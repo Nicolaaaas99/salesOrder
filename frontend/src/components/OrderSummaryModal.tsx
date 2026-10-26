@@ -194,12 +194,27 @@ export function OrderSummaryModal({
                 <HeaderCell label="Tax Mode" value={detail.tax_mode} />
               </div>
 
+              {(() => {
+                // Grow the Qty column based on the largest quantity on the
+                // order so big numbers aren't truncated. Mirrors the
+                // DraftOrderPanel / LineItemsGrid growth heuristic.
+                const maxQtyDigits = Math.max(
+                  2,
+                  ...detail.lines.map((l) => String(Math.floor(l.quantity || 0)).length),
+                );
+                const qtyColumnPx = Math.max(60, maxQtyDigits * 11 + 30);
+                return (
               <table className="w-full text-xs border-collapse">
                 <thead className="bg-gray-100 sticky top-0 z-10">
                   <tr className="text-gray-700 border-b border-gray-300">
                     <th className="text-left px-3 py-1.5 font-semibold">Stock</th>
                     <th className="text-left px-3 py-1.5 font-semibold">Description</th>
-                    <th className="text-right px-3 py-1.5 font-semibold">Qty</th>
+                    <th
+                      className="text-right px-3 py-1.5 font-semibold whitespace-nowrap"
+                      style={{ width: qtyColumnPx }}
+                    >
+                      Qty
+                    </th>
                     <th className="text-right px-3 py-1.5 font-semibold">Price (excl)</th>
                     <th className="text-right px-3 py-1.5 font-semibold">Price (incl)</th>
                     <th className="text-right px-3 py-1.5 font-semibold">Line Total (incl)</th>
@@ -215,7 +230,10 @@ export function OrderSummaryModal({
                         <td className="px-3 py-1.5 text-gray-700 truncate max-w-[22rem]">
                           {l.item_description || l.description}
                         </td>
-                        <td className="px-3 py-1.5 text-right font-mono text-gray-900">
+                        <td
+                          className="px-3 py-1.5 text-right font-mono text-gray-900 whitespace-nowrap"
+                          style={{ width: qtyColumnPx }}
+                        >
                           {l.quantity.toLocaleString()}
                           {offPack && (
                             <div
@@ -254,6 +272,8 @@ export function OrderSummaryModal({
                   </tr>
                 </tfoot>
               </table>
+                );
+              })()}
             </>
           )}
         </div>

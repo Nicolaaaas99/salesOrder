@@ -199,31 +199,36 @@ export type CustomerDealItem = {
   unit_price_incl: number;
 };
 
-// ---------- Analytics — Customer History (pivot tree) ----------
+// ---------- Analytics — Customer History (lazy-loaded pivot) ----------
 
-export type CustomerHistoryCustomer = {
-  route: string;
-  account: string;
-  name: string;
+export type PivotLevel = "routes" | "customers" | "categories" | "stocks";
+
+export type PivotWeekCell = {
+  amount: number;
+  litres: number;
 };
 
-export type CustomerHistorySale = {
-  route: string;
-  account: string;
-  category: string;
-  stock_code: string;
-  stock_desc: string;
-  /** Sunday-of-week ISO date (YYYY-MM-DD). */
-  week_start: string;
-  week_litres: number;
-  week_amount_incl: number;
+export type PivotRow = {
+  key: string;
+  label: string;
+  sublabel: string | null;
+  has_children: boolean;
+  /** Keyed by Sunday-of-week ISO date (YYYY-MM-DD). */
+  weekly: Record<string, PivotWeekCell>;
+  total_amount: number;
+  total_litres: number;
   last_sale_date: string | null;
 };
 
-export type CustomerHistoryResponse = {
-  routes: string[];
-  customers: CustomerHistoryCustomer[];
-  sales: CustomerHistorySale[];
+export type PivotLevelResponse = {
+  level: PivotLevel;
+  rows: PivotRow[];
+};
+
+export type PivotLevelFilters = {
+  route?: string;
+  account?: string;
+  category?: string;
 };
 
 

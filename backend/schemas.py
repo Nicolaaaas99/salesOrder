@@ -298,35 +298,28 @@ class CustomerDealItem(BaseModel):
     unit_price_incl: float = 0.0
 
 
-# ---------- Analytics — Customer History (pivot tree) ----------
+# ---------- Analytics — Customer History (lazy-loaded pivot) ----------
 
-class CustomerHistoryCustomer(BaseModel):
-    route: str
-    account: str
-    name: str
+class PivotWeekCell(BaseModel):
+    amount: float
+    litres: float
 
 
-class CustomerHistorySale(BaseModel):
-    route: str
-    account: str
-    category: str
-    stock_code: str
-    stock_desc: str
-    week_start: date
-    week_litres: float
-    week_amount_incl: float
+class PivotRow(BaseModel):
+    key: str                              # route code / account / category name / stock code
+    label: str
+    sublabel: Optional[str] = None        # customer name / stock description
+    has_children: bool
+    # Keyed by Sunday-of-week ISO date (YYYY-MM-DD).
+    weekly: dict[str, PivotWeekCell] = {}
+    total_amount: float = 0.0
+    total_litres: float = 0.0
     last_sale_date: Optional[date] = None
 
 
-class CustomerHistoryResponse(BaseModel):
-    # Full route master (includes zero-sale routes).
-    routes: List[str] = []
-    # Full customer master per route (includes zero-sale customers so the
-    # tree can still surface stale accounts under their route).
-    customers: List[CustomerHistoryCustomer] = []
-    # Weekly aggregates — one row per (route, account, category, stock,
-    # week_start). Rolled up by the frontend into the four-level pivot.
-    sales: List[CustomerHistorySale] = []
+class PivotLevelResponse(BaseModel):
+    level: str                            # "routes" | "customers" | "categories" | "stocks"
+    rows: List[PivotRow] = []
 
 
 # ---------- Customer contact log (route call outcomes) ----------

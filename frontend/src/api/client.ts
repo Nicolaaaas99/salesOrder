@@ -2,7 +2,9 @@ import axios from "axios";
 import type {
   ContactLogCreate,
   ContactLogEntry,
-  CustomerHistoryResponse,
+  PivotLevel,
+  PivotLevelFilters,
+  PivotLevelResponse,
   CustomerSummary,
   CustomerDetail,
   CustomerPrice,
@@ -280,14 +282,23 @@ export const api = {
     http.post<{ id: number; outcome: string }>("/contact-log", payload).then((r) => r.data),
 
   // ---------- Analytics ----------
-  /** Full dataset for the Customer History pivot. One weekly-aggregated
-   *  row per (route, customer, category, stock, week) for the trailing N
-   *  weeks, plus the complete route + customer master so zero-sale rows
-   *  still appear in the tree. */
-  getCustomerHistory: (weeks = 12) =>
+  /** One level of the Customer History pivot. Returns pre-aggregated weekly
+   *  rows for just that slice of the tree, so expand clicks are fast and
+   *  the initial load (level=routes) is tiny. */
+  getCustomerHistoryLevel: (
+    level: PivotLevel,
+    filters: PivotLevelFilters = {},
+    weeks = 12,
+  ) =>
     http
-      .get<CustomerHistoryResponse>("/route-overview/customer-history", {
-        params: { weeks },
+      .get<PivotLevelResponse>("/route-overview/customer-history", {
+        params: {
+          level,
+          weeks,
+          ...(filters.route ? { route: filters.route } : {}),
+          ...(filters.account ? { account: filters.account } : {}),
+          ...(filters.category ? { category: filters.category } : {}),
+        },
       })
       .then((r) => r.data),
 

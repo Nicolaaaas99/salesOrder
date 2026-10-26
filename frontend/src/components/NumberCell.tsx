@@ -16,6 +16,10 @@ type Props = {
    *  immediately. Doesn't affect keyboard focus (tab/arrow) which already lands
    *  at the end by default. */
   cursorToEnd?: boolean;
+  /** If true, selects the whole value on click AND on keyboard focus — one
+   *  backspace / typed digit replaces the lot. Takes precedence over
+   *  `cursorToEnd` when both are set. */
+  selectOnFocus?: boolean;
 };
 
 const MAX_DECIMALS = 2;
@@ -37,7 +41,7 @@ function snapToStep(n: number, step: number): number {
   return packs * step;
 }
 
-export function NumberCell({ value, onChange, className, placeholder = "0", disabled, title, snapStep, cursorToEnd }: Props) {
+export function NumberCell({ value, onChange, className, placeholder = "0", disabled, title, snapStep, cursorToEnd, selectOnFocus }: Props) {
   // Round `value` before stringifying so float noise like 11.200999999999999
   // doesn't make it into the input text.
   const [text, setText] = useState<string>(() => {
@@ -80,6 +84,13 @@ export function NumberCell({ value, onChange, className, placeholder = "0", disa
     el.setSelectionRange(end, end);
   }
 
+  // Highlights the whole value so one keystroke replaces it. Fires on both
+  // mouse click AND programmatic/keyboard focus so tab-in behaves the same
+  // as click.
+  function selectAll(el: HTMLInputElement) {
+    el.select();
+  }
+
   return (
     <input
       className={className}
@@ -90,7 +101,19 @@ export function NumberCell({ value, onChange, className, placeholder = "0", disa
       disabled={disabled}
       title={title}
       onBlur={onBlur}
-      onMouseUp={cursorToEnd ? (e) => moveCaretToEnd(e.currentTarget) : undefined}
+      onFocus={selectOnFocus ? (e) => selectAll(e.currentTarget) : undefined}
+      onMouseUp={
+        selectOnFocus
+          ? (e) => {
+              // Browsers deselect on mouseup after a focus-triggered select.
+              // Preventing default + re-selecting keeps the highlight visible.
+              e.preventDefault();
+              selectAll(e.currentTarget);
+            }
+          : cursorToEnd
+          ? (e) => moveCaretToEnd(e.currentTarget)
+          : undefined
+      }
       onChange={(e) => {
         const raw = e.target.value;
         if (raw !== "" && !inputPattern.test(raw)) return;

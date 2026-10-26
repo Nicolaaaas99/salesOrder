@@ -155,9 +155,11 @@ export function DraftOrderPanel({
     2,
     ...lines.map((l) => String(Math.floor(l.quantity || 0)).length),
   );
-  // 10 px per digit + 20 px for input padding / borders, floored at 45 px
-  // (the original width) so short-digit orders look identical to before.
-  const unitsColumnPx = Math.max(45, maxUnitsDigits * 10 + 20);
+  // 11 px per digit + 30 px slack (input padding + border + a little room
+  // for the caret), floored at 45 px so short-digit orders look identical
+  // to before. Previous formula (10+20) was clipping the leading digit on
+  // 5-digit quantities under OS DPI scaling.
+  const unitsColumnPx = Math.max(45, maxUnitsDigits * 11 + 30);
 
   // Focus the Qty cell at `focusTarget.idx` whenever the parent signals an
   // add/merge. Scrolls the row into view too, so re-adding a stock that's
@@ -367,11 +369,11 @@ export function DraftOrderPanel({
                               ? undefined
                               : line.pack_size
                           }
-                          cursorToEnd
+                          selectOnFocus
                           onChange={(v) =>
                             onUpdateLine(i, { quantity: v, needs_confirm: false })
                           }
-                          className="w-full text-right border border-gray-200 rounded px-1 py-0.5 text-sm font-semibold focus:border-blue-500 focus:outline-none bg-white"
+                          className="w-full text-right border border-gray-200 rounded px-1 py-0.5 text-sm font-semibold focus:border-blue-500 focus:outline-none bg-white tabular-nums"
                           placeholder=""
                         />
                       </div>

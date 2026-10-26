@@ -1,12 +1,12 @@
 import { useState } from "react";
-import { Truck } from "lucide-react";
+import { History, Truck } from "lucide-react";
 import { RouteDeliveriesScreen } from "./RouteDeliveriesScreen";
+import { RouteCustomerHistoryScreen } from "./RouteCustomerHistoryScreen";
 
-/** Hub landing for the Analytics tab. The Customer Sales History, Contact
- *  Log, and Agent Performance cards are intentionally hidden for the first
- *  deploy — only Deliveries is exposed. Restore them by re-adding the
- *  corresponding HubCards (and their routing branches) when ready. */
-type View = "hub" | "deliveries";
+/** Hub landing for the Analytics tab. Contact Log and Agent Performance
+ *  cards remain hidden until those phases are built — add them back here
+ *  when ready. */
+type View = "hub" | "deliveries" | "customer-history";
 
 type Props = {
   /** Pass-through for the Deliveries screen's edit flow — opens a sales
@@ -20,6 +20,9 @@ export function RouteOverviewScreen({ onOpenOrder }: Props = {}) {
 
   if (view === "deliveries") {
     return <RouteDeliveriesScreen onOpenOrder={onOpenOrder} onBack={backToHub} />;
+  }
+  if (view === "customer-history") {
+    return <RouteCustomerHistoryScreen onBack={backToHub} />;
   }
 
   return (
@@ -37,6 +40,13 @@ export function RouteOverviewScreen({ onOpenOrder }: Props = {}) {
             title="Deliveries"
             description="Order counts per customer on a given date."
             onClick={() => setView("deliveries")}
+          />
+          <HubCard
+            icon={<History className="w-6 h-6" />}
+            iconClass="bg-emerald-100 text-emerald-700"
+            title="Customer Sales History"
+            description="Route → customer → category → stock pivot of weekly sales."
+            onClick={() => setView("customer-history")}
           />
         </div>
       </div>

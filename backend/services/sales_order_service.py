@@ -39,7 +39,22 @@ def _dump_properties(obj, label: str):
             print(f"  {p.Name}: {p.PropertyType.Name}")
     except Exception as e:
         print(f"  (error: {e})")
-    print(f"[sales-order] === end {label} properties ===\n")
+    print(f"[sales-order] === end {label} properties ===")
+    # Methods too — the "Confirm Qty" field turned out to be a direct
+    # ToProcess property, but if we ever hit a workflow field that only
+    # moves via a method (e.g. so.Confirm()), the method dump is where
+    # we'd spot it.
+    try:
+        methods = sorted({
+            m.Name for m in obj.GetType().GetMethods()
+            if not m.IsSpecialName and m.DeclaringType.Name != "Object"
+        })
+        print(f"[sales-order] === {label} .NET methods ===")
+        for name in methods:
+            print(f"  {name}")
+        print(f"[sales-order] === end {label} methods ===\n")
+    except Exception as e:
+        print(f"[sales-order]   (methods error: {e})\n")
 
 
 def _dump_so_once(obj):
@@ -211,6 +226,15 @@ def _apply_lines(so, payload: schemas.SalesOrderCreate, SDK):
 
         od.Quantity         = float(line.quantity)
         od.UnitSellingPrice = float(line.unit_price)
+
+        # Pre-confirm the whole line. Evolution stores a separate "to
+        # process" quantity (fQtyToProcess on _btblInvoiceLines) that's
+        # independent of the ordered quantity — until it's set, the SO
+        # waits for a manual confirmation step before the line can be
+        # released/invoiced. The SDK property is simply `ToProcess`
+        # (the SOP UI labels this column as both "Process" and
+        # "Confirm Qty" in different modes — same underlying field).
+        _try_set(od, "ToProcess", float(line.quantity))
 
         if line.discount_percent:
             _set_first(od,
@@ -442,21 +466,29 @@ def _try_set_tax_type(od, tax_id: int, SDK):
     print(f"[sales-order] could not set TaxType={tax_id!r}")
 
 
-def dump_salesorder_properties() -> list:
+def _dump_type_members(obj) -> dict:
+    """Return properties AND public instance methods (sans getters/setters) so
+    we can tell the difference between a settable field and a 'Confirm()'-
+    style action method."""
+    try:
+        t = obj.GetType()
+        props = [{"name": p.Name, "type": p.PropertyType.Name} for p in t.GetProperties()]
+        methods = sorted({
+            m.Name for m in t.GetMethods()
+            if not m.IsSpecialName and m.DeclaringType != object
+        })
+        return {"properties": props, "methods": methods}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def dump_salesorder_properties() -> dict:
     SDK = get_sdk()
     so = SDK.SalesOrder()
-    try:
-        return [{"name": p.Name, "type": p.PropertyType.Name}
-                for p in so.GetType().GetProperties()]
-    except Exception as e:
-        return [{"error": str(e)}]
+    return _dump_type_members(so)
 
 
-def dump_orderdetail_properties() -> list:
+def dump_orderdetail_properties() -> dict:
     SDK = get_sdk()
     od = SDK.OrderDetail()
-    try:
-        return [{"name": p.Name, "type": p.PropertyType.Name}
-                for p in od.GetType().GetProperties()]
-    except Exception as e:
-        return [{"error": str(e)}]
+    return _dump_type_members(od)

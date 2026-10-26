@@ -1,9 +1,10 @@
-import { useEffect, useMemo, useState } from "react";
-import { ArrowLeft, ChevronDown, ChevronRight, XCircle } from "lucide-react";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { ArrowLeft, ChevronDown, ChevronRight, Loader2, XCircle } from "lucide-react";
 import { api } from "../api/client";
 import type {
-  CustomerHistoryCustomer,
-  CustomerHistorySale,
+  PivotLevel,
+  PivotLevelFilters,
+  PivotRow,
 } from "../api/types";
 import { formatWeekLabel, getWeekRange, type WeekRange } from "../utils/history";
 
@@ -15,28 +16,9 @@ type RouteCustomerHistoryProps = {
   onBack?: () => void;
 };
 
-type NodeLevel = "route" | "customer" | "category" | "stock";
-
-type TreeNode = {
-  level: NodeLevel;
-  /** Hierarchical key — used for expand-state tracking and React keys.
-   *  Format: `route|account|category|stock` with trailing empty segments
-   *  dropped. */
-  key: string;
-  /** Primary display label — route code / account / category / stock code. */
-  label: string;
-  /** Secondary display line below the label (customer name, stock desc). */
-  sublabel?: string;
-  weeklyAmount: Record<string, number>;
-  weeklyLitres: Record<string, number>;
-  totalAmount: number;
-  totalLitres: number;
-  lastDelivery: Date | null;
-  children: TreeNode[];
-};
-
 /** Twelve Sunday-based week ranges, newest first. Matches the Order
- *  Assistant's week definition exactly so the labels stay consistent. */
+ *  Assistant's week definition so column headers stay consistent across
+ *  the app. */
 function buildWeekColumnsDesc(): WeekRange[] {
   const weeks: WeekRange[] = [];
   const cursor = new Date(getWeekRange(new Date().toISOString()).start);
@@ -73,249 +55,211 @@ function fmtNum(n: number): string {
   return n.toLocaleString(undefined, { maximumFractionDigits: 0 });
 }
 
-/** Build the full tree once per sales/customer payload. Rolls aggregates
- *  up from the leaf (stock) rows so every level has its own totals. */
-function buildTree(
-  routes: string[],
-  customers: CustomerHistoryCustomer[],
-  sales: CustomerHistorySale[],
-): TreeNode[] {
-  // Pre-create a stable route list so zero-sale routes still appear.
-  const routeOrder = routes.length > 0 ? routes : [];
+// ---------------------------------------------------------------------------
+// Cache keys + hierarchy helpers
+// ---------------------------------------------------------------------------
 
-  // Keyed buckets at every depth so we can accumulate as we iterate sales.
-  const routeMap = new Map<string, TreeNode>();
-  const customerMap = new Map<string, TreeNode>();
-  const categoryMap = new Map<string, TreeNode>();
-  const stockMap = new Map<string, TreeNode>();
+/** Opaque key under which a given level+filters response is cached in state.
+ *  Collapsing + re-expanding a row doesn't refetch because the cache stays. */
+function cacheKey(level: PivotLevel, f: PivotLevelFilters): string {
+  switch (level) {
+    case "routes":
+      return "routes";
+    case "customers":
+      return `customers|${f.route}`;
+    case "categories":
+      return `categories|${f.route}|${f.account}`;
+    case "stocks":
+      return `stocks|${f.route}|${f.account}|${f.category}`;
+  }
+}
 
-  const emptyWeekMap = (): Record<string, number> => ({});
+/** Hierarchical id for a rendered row — used for expand-state and the React
+ *  key. Collisions are impossible because parent-level values are prepended. */
+function rowIdOf(f: PivotLevelFilters, rowKey: string): string {
+  return [f.route, f.account, f.category, rowKey].filter(Boolean).join("|");
+}
 
-  const makeRoute = (route: string): TreeNode => ({
-    level: "route",
-    key: route,
-    label: route,
-    weeklyAmount: emptyWeekMap(),
-    weeklyLitres: emptyWeekMap(),
-    totalAmount: 0,
-    totalLitres: 0,
-    lastDelivery: null,
-    children: [],
-  });
-
-  // Seed routes in the master order so even zero-sale routes appear.
-  routeOrder.forEach((r) => {
-    if (!routeMap.has(r)) {
-      const node = makeRoute(r);
-      routeMap.set(r, node);
-    }
-  });
-
-  // Seed customers so zero-sale customers appear under their route.
-  customers.forEach((c) => {
-    const route = c.route;
-    if (!route) return;
-    if (!routeMap.has(route)) routeMap.set(route, makeRoute(route));
-    const custKey = `${route}|${c.account}`;
-    if (!customerMap.has(custKey)) {
-      const node: TreeNode = {
-        level: "customer",
-        key: custKey,
-        label: c.account,
-        sublabel: c.name,
-        weeklyAmount: emptyWeekMap(),
-        weeklyLitres: emptyWeekMap(),
-        totalAmount: 0,
-        totalLitres: 0,
-        lastDelivery: null,
-        children: [],
+/** Child level + filters for the given parent row. Returns null for stock
+ *  rows (leaves). */
+function childContext(
+  parentLevel: PivotLevel,
+  parentFilters: PivotLevelFilters,
+  parentRowKey: string,
+): { level: PivotLevel; filters: PivotLevelFilters } | null {
+  switch (parentLevel) {
+    case "routes":
+      return { level: "customers", filters: { route: parentRowKey } };
+    case "customers":
+      return {
+        level: "categories",
+        filters: { route: parentFilters.route, account: parentRowKey },
       };
-      customerMap.set(custKey, node);
-      routeMap.get(route)!.children.push(node);
-    }
-  });
-
-  // Fold sales into the tree, creating category/stock nodes on first touch
-  // and rolling the amounts into every ancestor along the way.
-  sales.forEach((s) => {
-    const weekKey = getWeekRange(s.week_start).key;
-    const custKey = `${s.route}|${s.account}`;
-    const catKey = `${custKey}|${s.category}`;
-    const stockKey = `${catKey}|${s.stock_code}`;
-
-    // Backfill nodes that might not exist (sale for a customer not in the
-    // customer master, or a route with no customer-master entry).
-    if (!routeMap.has(s.route)) routeMap.set(s.route, makeRoute(s.route));
-    if (!customerMap.has(custKey)) {
-      const node: TreeNode = {
-        level: "customer",
-        key: custKey,
-        label: s.account,
-        weeklyAmount: emptyWeekMap(),
-        weeklyLitres: emptyWeekMap(),
-        totalAmount: 0,
-        totalLitres: 0,
-        lastDelivery: null,
-        children: [],
+    case "categories":
+      return {
+        level: "stocks",
+        filters: {
+          route: parentFilters.route,
+          account: parentFilters.account,
+          category: parentRowKey,
+        },
       };
-      customerMap.set(custKey, node);
-      routeMap.get(s.route)!.children.push(node);
-    }
-    if (!categoryMap.has(catKey)) {
-      const node: TreeNode = {
-        level: "category",
-        key: catKey,
-        label: s.category,
-        weeklyAmount: emptyWeekMap(),
-        weeklyLitres: emptyWeekMap(),
-        totalAmount: 0,
-        totalLitres: 0,
-        lastDelivery: null,
-        children: [],
-      };
-      categoryMap.set(catKey, node);
-      customerMap.get(custKey)!.children.push(node);
-    }
-    if (!stockMap.has(stockKey)) {
-      // stock_desc is "CODE-Description" from the base view — strip the
-      // prefix so the sublabel is just the description.
-      const descOnly = s.stock_desc.startsWith(s.stock_code + "-")
-        ? s.stock_desc.slice(s.stock_code.length + 1)
-        : s.stock_desc;
-      const node: TreeNode = {
-        level: "stock",
-        key: stockKey,
-        label: s.stock_code,
-        sublabel: descOnly,
-        weeklyAmount: emptyWeekMap(),
-        weeklyLitres: emptyWeekMap(),
-        totalAmount: 0,
-        totalLitres: 0,
-        lastDelivery: null,
-        children: [],
-      };
-      stockMap.set(stockKey, node);
-      categoryMap.get(catKey)!.children.push(node);
-    }
+    case "stocks":
+      return null;
+  }
+}
 
-    const lastSale = s.last_sale_date ? new Date(s.last_sale_date) : null;
-    const ancestors = [
-      stockMap.get(stockKey)!,
-      categoryMap.get(catKey)!,
-      customerMap.get(custKey)!,
-      routeMap.get(s.route)!,
-    ];
-    ancestors.forEach((n) => {
-      n.weeklyAmount[weekKey] = (n.weeklyAmount[weekKey] || 0) + s.week_amount_incl;
-      n.weeklyLitres[weekKey] = (n.weeklyLitres[weekKey] || 0) + s.week_litres;
-      n.totalAmount += s.week_amount_incl;
-      n.totalLitres += s.week_litres;
-      if (lastSale && (!n.lastDelivery || lastSale > n.lastDelivery)) {
-        n.lastDelivery = lastSale;
+// ---------------------------------------------------------------------------
+// Tree flattening
+// ---------------------------------------------------------------------------
+
+type VisibleRow = {
+  row: PivotRow;
+  depth: number;
+  rowId: string;
+  level: PivotLevel;
+  filters: PivotLevelFilters;
+};
+
+/** Walk the lazily-loaded cache into a flat list of rendered rows, respecting
+ *  the current expand state. Rows whose children haven't loaded yet (either
+ *  mid-fetch or never requested) just render as a single row — children slot
+ *  in when the fetch completes. */
+function flattenVisible(
+  cache: Map<string, PivotRow[]>,
+  expanded: Set<string>,
+): VisibleRow[] {
+  const out: VisibleRow[] = [];
+  const walk = (
+    level: PivotLevel,
+    filters: PivotLevelFilters,
+    depth: number,
+  ) => {
+    const rows = cache.get(cacheKey(level, filters));
+    if (!rows) return;
+    for (const row of rows) {
+      const rowId = rowIdOf(filters, row.key);
+      out.push({ row, depth, rowId, level, filters });
+      if (expanded.has(rowId) && row.has_children) {
+        const child = childContext(level, filters, row.key);
+        if (child) walk(child.level, child.filters, depth + 1);
       }
-    });
-  });
-
-  // Return routes in the master order.
-  const seen = new Set<string>();
-  const out: TreeNode[] = [];
-  routeOrder.forEach((r) => {
-    if (routeMap.has(r)) {
-      out.push(routeMap.get(r)!);
-      seen.add(r);
-    }
-  });
-  routeMap.forEach((node, r) => {
-    if (!seen.has(r)) out.push(node);
-  });
-
-  // Within each parent, sort children: customers by stalest last-delivery
-  // first (same signal as before); categories/stocks by total desc so the
-  // biggest-selling ones surface at the top.
-  const sortChildren = (nodes: TreeNode[], level: NodeLevel) => {
-    nodes.forEach((n) => sortChildren(n.children, levelBelow(level)));
-    if (level === "route") {
-      nodes.sort((a, b) => {
-        if (!a.lastDelivery && !b.lastDelivery) return a.label.localeCompare(b.label);
-        if (!a.lastDelivery) return -1;
-        if (!b.lastDelivery) return 1;
-        return a.lastDelivery.getTime() - b.lastDelivery.getTime();
-      });
-    } else if (level === "customer" || level === "category") {
-      nodes.sort((a, b) => b.totalAmount - a.totalAmount);
     }
   };
-  const levelBelow = (l: NodeLevel): NodeLevel =>
-    l === "route" ? "customer" : l === "customer" ? "category" : l === "category" ? "stock" : "stock";
-  sortChildren(out, "route");
-
-  // Routes themselves: biggest first (so the busy ones are on top).
-  out.sort((a, b) => b.totalAmount - a.totalAmount);
-
+  walk("routes", {}, 0);
   return out;
 }
 
-/** Flatten the tree into the visible row list, respecting expand state.
- *  Each visible row carries its depth so the UI can indent it. */
-function flattenVisible(
-  tree: TreeNode[],
-  expanded: Set<string>,
-): { node: TreeNode; depth: number }[] {
-  const rows: { node: TreeNode; depth: number }[] = [];
-  const walk = (nodes: TreeNode[], depth: number) => {
-    nodes.forEach((n) => {
-      rows.push({ node: n, depth });
-      if (expanded.has(n.key) && n.children.length > 0) {
-        walk(n.children, depth + 1);
-      }
-    });
-  };
-  walk(tree, 0);
-  return rows;
-}
+// ---------------------------------------------------------------------------
+// Screen
+// ---------------------------------------------------------------------------
 
 export function RouteCustomerHistoryScreen({ onBack }: RouteCustomerHistoryProps = {}) {
-  const [data, setData] = useState<{
-    routes: string[];
-    customers: CustomerHistoryCustomer[];
-    sales: CustomerHistorySale[];
-  } | null>(null);
-  const [isLoading, setIsLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [metric, setMetric] = useState<Metric>("amount");
+  const [cache, setCache] = useState<Map<string, PivotRow[]>>(new Map());
+  const [loadingKeys, setLoadingKeys] = useState<Set<string>>(new Set());
+  const [errorsByKey, setErrorsByKey] = useState<Map<string, string>>(new Map());
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const [metric, setMetric] = useState<Metric>("amount");
+  const [topLevelError, setTopLevelError] = useState<string | null>(null);
 
   const weekCols = useMemo(() => buildWeekColumnsDesc(), []);
 
-  useEffect(() => {
-    (async () => {
-      setIsLoading(true);
-      setError(null);
+  /** Fetch a level's rows if we don't already have them cached. Writes
+   *  loading/error state keyed by cacheKey so the UI can show per-row
+   *  spinners and messages. */
+  const ensureLoaded = useCallback(
+    async (level: PivotLevel, filters: PivotLevelFilters) => {
+      const key = cacheKey(level, filters);
+      // Snapshot checks against latest state via functional updates below;
+      // the early-outs here are a cheap guard against duplicate fetches
+      // when the user double-clicks a row.
+      let alreadyCached = false;
+      let alreadyLoading = false;
+      setCache((prev) => {
+        alreadyCached = prev.has(key);
+        return prev;
+      });
+      setLoadingKeys((prev) => {
+        alreadyLoading = prev.has(key);
+        return prev;
+      });
+      if (alreadyCached || alreadyLoading) return;
+
+      setLoadingKeys((prev) => {
+        const next = new Set(prev);
+        next.add(key);
+        return next;
+      });
+      setErrorsByKey((prev) => {
+        if (!prev.has(key)) return prev;
+        const next = new Map(prev);
+        next.delete(key);
+        return next;
+      });
+
       try {
-        const resp = await api.getCustomerHistory(WEEKS);
-        setData(resp);
+        const resp = await api.getCustomerHistoryLevel(level, filters, WEEKS);
+        setCache((prev) => new Map(prev).set(key, resp.rows));
       } catch (e: any) {
-        setError(`Failed to load customer history: ${e?.message ?? e}`);
+        const msg =
+          e?.response?.data?.detail ??
+          e?.message ??
+          "Failed to load. Try again.";
+        setErrorsByKey((prev) => new Map(prev).set(key, String(msg)));
       } finally {
-        setIsLoading(false);
+        setLoadingKeys((prev) => {
+          const next = new Set(prev);
+          next.delete(key);
+          return next;
+        });
       }
-    })();
-  }, []);
-
-  const tree = useMemo(
-    () => (data ? buildTree(data.routes, data.customers, data.sales) : []),
-    [data],
+    },
+    [],
   );
-  const rows = useMemo(() => flattenVisible(tree, expanded), [tree, expanded]);
 
-  const toggle = (key: string) => {
-    setExpanded((prev) => {
-      const next = new Set(prev);
-      if (next.has(key)) next.delete(key);
-      else next.add(key);
-      return next;
-    });
-  };
+  // Prime the top-level load.
+  useEffect(() => {
+    ensureLoaded("routes", {}).catch((e) =>
+      setTopLevelError(e?.message ?? "Failed to load routes."),
+    );
+  }, [ensureLoaded]);
+
+  const toggle = useCallback(
+    (visible: VisibleRow) => {
+      const { rowId, row, level, filters } = visible;
+      const wasExpanded = expanded.has(rowId);
+      setExpanded((prev) => {
+        const next = new Set(prev);
+        if (wasExpanded) next.delete(rowId);
+        else next.add(rowId);
+        return next;
+      });
+      if (wasExpanded || !row.has_children) return;
+      const child = childContext(level, filters, row.key);
+      if (child) ensureLoaded(child.level, child.filters);
+    },
+    [expanded, ensureLoaded],
+  );
+
+  const retry = useCallback(
+    (level: PivotLevel, filters: PivotLevelFilters) => {
+      const key = cacheKey(level, filters);
+      setErrorsByKey((prev) => {
+        const next = new Map(prev);
+        next.delete(key);
+        return next;
+      });
+      ensureLoaded(level, filters);
+    },
+    [ensureLoaded],
+  );
+
+  const visibleRows = useMemo(
+    () => flattenVisible(cache, expanded),
+    [cache, expanded],
+  );
+
+  const topLoading = loadingKeys.has("routes") && !cache.has("routes");
 
   return (
     <div className="h-full bg-gray-50 p-2 flex flex-col">
@@ -332,8 +276,6 @@ export function RouteCustomerHistoryScreen({ onBack }: RouteCustomerHistoryProps
           </div>
         )}
 
-        {/* Top bar: metric toggle only (no route selector any more — the
-            tree starts at All Routes). */}
         <div className="flex items-end gap-2 flex-shrink-0">
           <div className="bg-white rounded border p-2 shadow-sm">
             <label className="block font-semibold text-gray-800 mb-1 text-xs">Show</label>
@@ -360,23 +302,24 @@ export function RouteCustomerHistoryScreen({ onBack }: RouteCustomerHistoryProps
           </div>
 
           <div className="text-xs text-gray-500 pb-1">
-            Click a row to expand · Route → Customer → Category → Stock
+            Click a row to drill in · Route → Customer → Category → Stock
           </div>
         </div>
 
-        {error && (
+        {topLevelError && (
           <div className="p-1 bg-red-100 border border-red-300 text-red-800 rounded flex items-center text-xs flex-shrink-0">
             <XCircle className="w-3 h-3 mr-1 flex-shrink-0" />
-            <span>{error}</span>
+            <span>{topLevelError}</span>
           </div>
         )}
 
         <div className="bg-white rounded border shadow-sm flex-1 min-h-0 flex flex-col overflow-hidden">
-          {isLoading ? (
+          {topLoading ? (
             <div className="h-full flex items-center justify-center text-gray-500 text-sm">
-              Loading…
+              <Loader2 className="w-4 h-4 animate-spin mr-2" />
+              Loading routes…
             </div>
-          ) : rows.length === 0 ? (
+          ) : visibleRows.length === 0 ? (
             <div className="h-full flex items-center justify-center text-gray-500 text-sm">
               No data.
             </div>
@@ -406,15 +349,19 @@ export function RouteCustomerHistoryScreen({ onBack }: RouteCustomerHistoryProps
                   </tr>
                 </thead>
                 <tbody>
-                  {rows.map(({ node, depth }) => (
-                    <PivotRow
-                      key={node.key}
-                      node={node}
-                      depth={depth}
+                  {visibleRows.map((v) => (
+                    <PivotRowView
+                      key={v.rowId}
+                      visible={v}
+                      isExpanded={expanded.has(v.rowId)}
                       metric={metric}
                       weekCols={weekCols}
-                      isExpanded={expanded.has(node.key)}
-                      onToggle={() => toggle(node.key)}
+                      cache={cache}
+                      loadingKeys={loadingKeys}
+                      errorsByKey={errorsByKey}
+                      onToggle={toggle}
+                      onRetry={retry}
+                      colSpan={3 + weekCols.length}
                     />
                   ))}
                 </tbody>
@@ -427,98 +374,144 @@ export function RouteCustomerHistoryScreen({ onBack }: RouteCustomerHistoryProps
   );
 }
 
-function PivotRow({
-  node,
-  depth,
-  metric,
-  weekCols,
-  isExpanded,
-  onToggle,
-}: {
-  node: TreeNode;
-  depth: number;
+// ---------------------------------------------------------------------------
+// Row renderer
+// ---------------------------------------------------------------------------
+
+type PivotRowViewProps = {
+  visible: VisibleRow;
+  isExpanded: boolean;
   metric: Metric;
   weekCols: WeekRange[];
-  isExpanded: boolean;
-  onToggle: () => void;
-}) {
-  const canExpand = node.children.length > 0;
-  const since = daysSince(node.lastDelivery);
-  const map = metric === "amount" ? node.weeklyAmount : node.weeklyLitres;
-  const total = metric === "amount" ? node.totalAmount : node.totalLitres;
+  cache: Map<string, PivotRow[]>;
+  loadingKeys: Set<string>;
+  errorsByKey: Map<string, string>;
+  onToggle: (v: VisibleRow) => void;
+  onRetry: (level: PivotLevel, filters: PivotLevelFilters) => void;
+  colSpan: number;
+};
+
+function PivotRowView({
+  visible,
+  isExpanded,
+  metric,
+  weekCols,
+  cache,
+  loadingKeys,
+  errorsByKey,
+  onToggle,
+  onRetry,
+  colSpan,
+}: PivotRowViewProps) {
+  const { row, depth, level, filters } = visible;
+  const canExpand = row.has_children;
+  const since = row.last_sale_date ? daysSince(new Date(row.last_sale_date)) : null;
+  const lastDate = row.last_sale_date ? new Date(row.last_sale_date) : null;
+  const map = metric === "amount" ? "amount" : "litres";
+  const total = metric === "amount" ? row.total_amount : row.total_litres;
 
   const rowShade =
-    node.level === "route"
+    level === "routes"
       ? "bg-slate-50 font-semibold"
-      : node.level === "customer"
+      : level === "customers"
       ? "bg-white font-medium"
-      : node.level === "category"
+      : level === "categories"
       ? "bg-white"
       : "bg-white text-gray-700";
 
   const labelTone =
-    node.level === "route"
+    level === "routes"
       ? "text-gray-900"
-      : node.level === "customer"
+      : level === "customers"
       ? "font-mono text-gray-900"
-      : node.level === "category"
+      : level === "categories"
       ? "text-gray-800"
       : "font-mono text-gray-800";
 
+  // Child-fetch state for the loading spinner / inline error row.
+  const child = canExpand ? childContext(level, filters, row.key) : null;
+  const childKey = child ? cacheKey(child.level, child.filters) : null;
+  const childLoading = childKey ? loadingKeys.has(childKey) && !cache.has(childKey) : false;
+  const childError = childKey ? errorsByKey.get(childKey) ?? null : null;
+
   return (
-    <tr
-      onClick={canExpand ? onToggle : undefined}
-      className={`border-b border-gray-100 ${rowShade} ${
-        canExpand ? "cursor-pointer hover:bg-blue-50/60" : ""
-      }`}
-    >
-      <td className="px-2 py-1 sticky left-0 bg-inherit">
-        <div className="flex items-start gap-1" style={{ paddingLeft: `${depth * 14}px` }}>
-          <span className="w-3.5 flex-shrink-0 pt-0.5">
-            {canExpand ? (
-              isExpanded ? (
-                <ChevronDown className="w-3.5 h-3.5 text-gray-500" />
-              ) : (
-                <ChevronRight className="w-3.5 h-3.5 text-gray-500" />
-              )
-            ) : null}
-          </span>
-          <div className="min-w-0">
-            <div className={labelTone}>{node.label}</div>
-            {node.sublabel && (
-              <div className="text-[9px] text-gray-500 truncate max-w-[14rem]">
-                {node.sublabel}
-              </div>
-            )}
+    <>
+      <tr
+        onClick={canExpand ? () => onToggle(visible) : undefined}
+        className={`border-b border-gray-100 ${rowShade} ${
+          canExpand ? "cursor-pointer hover:bg-blue-50/60" : ""
+        }`}
+      >
+        <td className="px-2 py-1 sticky left-0 bg-inherit">
+          <div className="flex items-start gap-1" style={{ paddingLeft: `${depth * 14}px` }}>
+            <span className="w-3.5 flex-shrink-0 pt-0.5">
+              {canExpand ? (
+                childLoading ? (
+                  <Loader2 className="w-3.5 h-3.5 text-gray-400 animate-spin" />
+                ) : isExpanded ? (
+                  <ChevronDown className="w-3.5 h-3.5 text-gray-500" />
+                ) : (
+                  <ChevronRight className="w-3.5 h-3.5 text-gray-500" />
+                )
+              ) : null}
+            </span>
+            <div className="min-w-0">
+              <div className={labelTone}>{row.label}</div>
+              {row.sublabel && (
+                <div className="text-[9px] text-gray-500 truncate max-w-[14rem]">
+                  {row.sublabel}
+                </div>
+              )}
+            </div>
           </div>
-        </div>
-      </td>
-      <td className="px-2 py-1 whitespace-nowrap">
-        {node.lastDelivery ? (
-          <>
-            <div className="text-gray-900">{fmtDate(node.lastDelivery)}</div>
-            <div className={`text-[9px] ${staleTextClass(since)}`}>{(since ?? 0)}d</div>
-          </>
-        ) : (
-          <div className="text-red-600 font-semibold">Never</div>
-        )}
-      </td>
-      <td className="px-2 py-1 text-right font-mono font-semibold text-gray-900">
-        {total === 0 ? "·" : fmtNum(total)}
-      </td>
-      {weekCols.map((w) => {
-        const v = map[w.key] || 0;
-        return (
-          <td
-            key={w.key}
-            className={`px-2 py-1 text-right font-mono ${
-              v === 0 ? "text-gray-300" : v < 0 ? "text-red-600" : "text-gray-800"
-            }`}
-          >
-            {v === 0 ? "·" : fmtNum(v)}
+        </td>
+        <td className="px-2 py-1 whitespace-nowrap">
+          {lastDate ? (
+            <>
+              <div className="text-gray-900">{fmtDate(lastDate)}</div>
+              <div className={`text-[9px] ${staleTextClass(since)}`}>{(since ?? 0)}d</div>
+            </>
+          ) : (
+            <div className="text-red-600 font-semibold">Never</div>
+          )}
+        </td>
+        <td className="px-2 py-1 text-right font-mono font-semibold text-gray-900">
+          {total === 0 ? "·" : fmtNum(total)}
+        </td>
+        {weekCols.map((w) => {
+          const cell = row.weekly[w.key];
+          const v = cell ? cell[map] : 0;
+          return (
+            <td
+              key={w.key}
+              className={`px-2 py-1 text-right font-mono ${
+                v === 0 ? "text-gray-300" : v < 0 ? "text-red-600" : "text-gray-800"
+              }`}
+            >
+              {v === 0 ? "·" : fmtNum(v)}
+            </td>
+          );
+        })}
+      </tr>
+
+      {/* Inline "children failed to load" row with a Retry button. Keeps
+          the error adjacent to the parent so the context is obvious. */}
+      {isExpanded && childError && child && (
+        <tr className="bg-red-50 border-b border-red-200">
+          <td colSpan={colSpan} className="px-2 py-1 text-xs text-red-800">
+            <div className="flex items-center gap-2" style={{ paddingLeft: `${(depth + 1) * 14 + 20}px` }}>
+              <XCircle className="w-3.5 h-3.5 flex-shrink-0" />
+              <span className="flex-1 truncate">{childError}</span>
+              <button
+                onClick={() => onRetry(child.level, child.filters)}
+                className="text-blue-600 hover:text-blue-800 underline"
+              >
+                Retry
+              </button>
+            </div>
           </td>
-        );
-      })}
-    </tr>
+        </tr>
+      )}
+    </>
   );
 }

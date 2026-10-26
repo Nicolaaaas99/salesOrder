@@ -370,7 +370,7 @@ button { font-family: inherit; }
 }
 .cell-input:hover:not(:disabled) { border-color: var(--border); background: white; }
 .cell-input:focus { outline: none; border-color: var(--accent); background: white; }
-.cell-input.num { text-align: right; }
+.cell-input.num { text-align: right; font-variant-numeric: tabular-nums; }
 .cell-input:disabled { color: var(--muted); background: #f1f2f5; cursor: not-allowed; }
 
 .draft-add-item .cell-input {

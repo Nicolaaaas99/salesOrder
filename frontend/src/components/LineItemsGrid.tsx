@@ -323,6 +323,17 @@ export function LineItemsGrid({
 
     if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
       if (!(target instanceof HTMLInputElement)) return;
+      // If the input is showing a text selection (fresh focus with
+      // `selectOnFocus`, or a Ctrl+A), the first arrow key just collapses
+      // the selection to the appropriate end so the user can keep typing
+      // / backspacing from there. A second press then falls through to
+      // the usual column-nav behaviour.
+      if (target.selectionStart !== target.selectionEnd) {
+        const end = e.key === "ArrowRight" ? target.value.length : 0;
+        target.setSelectionRange(end, end);
+        e.preventDefault();
+        return;
+      }
       if (editedInputs.current.has(target)) return;
       e.preventDefault();
       navigateSideways(row, cell, e.key === "ArrowLeft" ? -1 : 1);
@@ -378,6 +389,18 @@ export function LineItemsGrid({
   const lineTotalLabel = taxMode === "Inclusive" ? "Line Incl" : "Line Excl";
   const lastLineHasItem = lines.length > 0 && !!lines[lines.length - 1].stock_code;
 
+  // Grow the Qty column so even large quantities stay fully visible as the
+  // rep types. Measurements: .cell-input has 6px horizontal padding; the TD
+  // adds 5px — so 22 px of chrome before any digits. Each monospace digit
+  // at 12 px font is ~8 px, so 11 px/digit + 34 px padding gives slack even
+  // on OS DPI scaling. Floored at the original 70 px so short-digit orders
+  // look identical to before.
+  const maxQtyDigits = Math.max(
+    2,
+    ...lines.map((l) => String(Math.floor(l.quantity || 0)).length),
+  );
+  const qtyColumnPx = Math.max(70, maxQtyDigits * 11 + 34);
+
   return (
     <section className="panel grid-panel">
       <header className="panel-header">Lines</header>
@@ -393,7 +416,7 @@ export function LineItemsGrid({
               <th style={{ width: 125 }}>Warehouse</th>
               <th style={{ width: 70 }}>Avail.</th>
               <th style={{ width: 50 }}>Pack</th>
-              <th style={{ width: 70 }}>Qty</th>
+              <th style={{ width: qtyColumnPx }}>Qty</th>
               <th style={{ width: 50 }}>UOM</th>
               <th style={{ width: 100 }}>{priceLabel}</th>
               <th style={{ width: 80 }}>Tax</th>
@@ -560,6 +583,7 @@ export function LineItemsGrid({
                         className="cell-input num"
                         value={line.quantity}
                         disabled={cellsDisabled}
+                        selectOnFocus
                         snapStep={
                           line.pack_override || line.pack_size <= 1
                             ? undefined
