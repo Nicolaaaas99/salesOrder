@@ -1,7 +1,7 @@
 from fastapi import FastAPI, APIRouter
 from fastapi.middleware.cors import CORSMiddleware
 
-from routers import auth, lookups, sales_orders, debug, history, contact_log, route_overview
+from routers import auth, lookups, sales_orders, debug, history, contact_log, analytics, targets, admin
 from connection import connect
 
 app = FastAPI(title="Sales Order API")
@@ -21,7 +21,9 @@ api.include_router(sales_orders.router)
 api.include_router(debug.router)
 api.include_router(history.router)
 api.include_router(contact_log.router)
-api.include_router(route_overview.router)
+api.include_router(analytics.router)
+api.include_router(targets.router)
+api.include_router(admin.router)
 app.include_router(api)
 
 

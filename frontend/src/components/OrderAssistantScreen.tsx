@@ -22,7 +22,9 @@ import { DraftOrderPanel, type DraftLine } from "./DraftOrderPanel";
 import { OrdersModal } from "./OrdersModal";
 import { OrderSummaryModal } from "./OrderSummaryModal";
 import { CustomerContactStrip } from "./CustomerContactStrip";
+import { PerformanceStrip, notifyPerformanceRefresh } from "./PerformanceStrip";
 import {
+  aggregateOrders,
   productKey,
   isCrateStock,
   resolvedPriceSource,
@@ -822,16 +824,20 @@ export function OrderAssistantScreen({ onOpenOrder }: OrderAssistantProps = {}) 
     setContinueBlockMsg(null);
   }, []);
 
-  // Categories (from history) the rep hasn't opened for this customer yet.
-  const unopenedCategories = useMemo(() => {
-    const all = new Set<string>();
-    historyIndex.stockToCategory.forEach((c) => c && all.add(c));
-    const out: string[] = [];
-    all.forEach((c) => {
-      if (!openedCategories.has(c)) out.push(c);
-    });
-    return out;
-  }, [historyIndex, openedCategories]);
+  // Categories the Continue gate requires the rep to open. Must be
+  // the exact set the HistoryGrid displays — otherwise the gate can
+  // demand an "unopenable" category (one that historyIndex knows
+  // about but the grid never renders because of filtering / empty-
+  // category "Uncategorized" bucketing). Deriving from the same
+  // `aggregateOrders` call the grid uses keeps the two in lockstep.
+  const displayedCategories = useMemo(
+    () => Object.keys(aggregateOrders(orders).categories),
+    [orders],
+  );
+  const unopenedCategories = useMemo(
+    () => displayedCategories.filter((c) => !openedCategories.has(c)),
+    [displayedCategories, openedCategories],
+  );
 
   const handleContinue = useCallback(() => {
     if (!customerDetail || draftLines.length === 0) return;
@@ -935,7 +941,17 @@ export function OrderAssistantScreen({ onOpenOrder }: OrderAssistantProps = {}) 
           outcome: sub.outcome,
           note: sub.note || null,
           follow_up_date: sub.follow_up_date || null,
+          // The session date is the delivery date the rep is prepping
+          // for. Stamping it onto the row lets the Deliveries report
+          // filter by delivery day (not call day) — so a NO_ORDER logged
+          // today for a tomorrow-delivery call list shows up when the
+          // report is scoped to tomorrow.
+          delivery_date: sessionDate ?? null,
         });
+        // Bump the performance strip — a new call → distinct-customer
+        // count could tick up. Order save already dispatches the
+        // orders:mutated event the strip listens to separately.
+        notifyPerformanceRefresh();
       } catch (e: any) {
         // Keep the modal open so the agent can see what failed and retry.
         // The most common cause is the backend's SQL login not having
@@ -1055,78 +1071,72 @@ export function OrderAssistantScreen({ onOpenOrder }: OrderAssistantProps = {}) 
       )}
 
       <div className="max-w-[1600px] mx-auto w-full flex-1 min-h-0 flex flex-col gap-2">
-        {/* Top bar: route + customer */}
-        <div className="grid grid-cols-2 gap-2 flex-shrink-0">
-          <div className="bg-white rounded border p-2 shadow-sm">
-            <label className="flex items-center font-semibold text-gray-800 mb-1 text-sm">
-              <Truck className="w-3 h-3 mr-1 text-blue-600" />
-              Route
-            </label>
-            <Select
-              options={routes}
-              value={selectedRoute}
-              onChange={(opt) => {
-                const next = opt as Option | null;
-                // Switching away from a route with an opened customer → force
-                // an outcome entry (or an "opened by mistake" escape) before
-                // the switch takes effect. Clearing the route also clears
-                // the customer, so the same gate applies.
-                tryLeaveCurrentCustomer(() => {
-                  setSelectedRoute(next);
-                  if (!next) setSelectedCustomer(null);
-                });
-              }}
-              placeholder="Search route..."
-              isDisabled={isLoadingRoutes}
-              isLoading={isLoadingRoutes}
-              styles={selectStyles}
-              isSearchable
-              isClearable
-            />
-          </div>
-
-          <div className="bg-white rounded border p-2 shadow-sm">
-            <div className="flex items-center justify-between mb-1">
-              <label className="flex items-center font-semibold text-gray-800 text-sm">
-                <Users className="w-3 h-3 mr-1 text-green-600" />
-                Customer
-              </label>
-              {routeProgress.total > 0 && (
-                <div className="flex items-center gap-3 text-xs text-gray-600">
-                  <span className="inline-flex items-center gap-1">
-                    <span className="w-2 h-2 rounded-full bg-emerald-500" />
-                    {routeProgress.placed} placed
-                  </span>
-                  <span className="inline-flex items-center gap-1">
-                    <span className="w-2 h-2 rounded-full bg-amber-500" />
-                    {routeProgress.contacted} contacted
-                  </span>
-                  <span className="inline-flex items-center gap-1">
-                    <span className="w-2 h-2 rounded-full bg-red-500" />
-                    {routeProgress.remaining} to call
-                  </span>
+        {/* Top row: Route + Customer pickers inlined into the Performance
+            strip (today / week / month cards). The pickers are the compact
+            versions — single row each, no header labels, tight padding —
+            so everything fits on one row at normal screen widths. */}
+        <div className="flex-shrink-0">
+          <PerformanceStrip
+            leading={
+              <>
+                {/* flex-1 + min-w so these two pickers absorb whatever
+                    horizontal space is left after the cards + pinned
+                    targets lay out — the strip auto-wraps on narrow
+                    viewports via `flex-wrap`. basis-0 keeps the two
+                    pickers equal-width when they're on the same row. */}
+                <div className="bg-white rounded border p-1.5 shadow-sm flex-1 basis-0 min-w-[200px] flex flex-col justify-center">
+                  <div className="text-[9px] uppercase tracking-wide text-gray-500 font-semibold flex items-center gap-1 mb-1">
+                    <Truck className="w-3 h-3 text-blue-600" />
+                    Route
+                  </div>
+                  <Select
+                    options={routes}
+                    value={selectedRoute}
+                    onChange={(opt) => {
+                      const next = opt as Option | null;
+                      // Switching away from a route with an opened
+                      // customer → force an outcome entry (or an "opened
+                      // by mistake" escape) before the switch takes
+                      // effect. Clearing the route also clears the
+                      // customer, so the same gate applies.
+                      tryLeaveCurrentCustomer(() => {
+                        setSelectedRoute(next);
+                        if (!next) setSelectedCustomer(null);
+                      });
+                    }}
+                    placeholder="Search..."
+                    isDisabled={isLoadingRoutes}
+                    isLoading={isLoadingRoutes}
+                    styles={selectStyles}
+                    isSearchable
+                    isClearable
+                  />
                 </div>
-              )}
-            </div>
-            <AsyncSelect
-              key={selectedRoute?.value ?? "all"}
-              cacheOptions={!!selectedRoute}
-              defaultOptions
-              loadOptions={loadCustomerOptions}
-              value={selectedCustomer}
-              styles={{
-                ...selectStyles,
-                option: (base: any, state: any) => {
-                  const account = (state.data as Option).value;
-                  const outcome = contactOutcomes.get(account);
-                  const hasOrderToday = (ordersTodayMap.get(account) ?? 0) > 0;
-                  const tint = tintForOutcome(outcome, hasOrderToday, state.isFocused);
-                  return {
-                    ...selectStyles.option(base, state),
-                    backgroundColor: tint,
-                  };
-                },
-              }}
+
+                <div className="bg-white rounded border p-1.5 shadow-sm flex-1 basis-0 min-w-[200px] flex flex-col justify-center">
+                  <div className="text-[9px] uppercase tracking-wide text-gray-500 font-semibold flex items-center gap-1 mb-1">
+                    <Users className="w-3 h-3 text-green-600" />
+                    Customer
+                  </div>
+                  <AsyncSelect
+                    key={selectedRoute?.value ?? "all"}
+                    cacheOptions={!!selectedRoute}
+                    defaultOptions
+                    loadOptions={loadCustomerOptions}
+                    value={selectedCustomer}
+                    styles={{
+                      ...selectStyles,
+                      option: (base: any, state: any) => {
+                        const account = (state.data as Option).value;
+                        const outcome = contactOutcomes.get(account);
+                        const hasOrderToday = (ordersTodayMap.get(account) ?? 0) > 0;
+                        const tint = tintForOutcome(outcome, hasOrderToday, state.isFocused);
+                        return {
+                          ...selectStyles.option(base, state),
+                          backgroundColor: tint,
+                        };
+                      },
+                    }}
               onChange={(opt) => {
                 const next = opt as Option | null;
                 if (next && next.value === selectedCustomer?.value) return;
@@ -1168,13 +1178,38 @@ export function OrderAssistantScreen({ onOpenOrder }: OrderAssistantProps = {}) 
                   </div>
                 );
               }}
-              placeholder={
-                selectedRoute ? "Search customer in route..." : "Search any customer..."
-              }
-              isClearable
-            />
-          </div>
+                    placeholder={
+                      selectedRoute ? "Search customer in route..." : "Search any customer..."
+                    }
+                    isClearable
+                  />
+                </div>
+              </>
+            }
+          />
         </div>
+
+        {/* Route progress chips moved out of the Customer header — now
+            their own compact strip, only shown when a route is selected. */}
+        {routeProgress.total > 0 && (
+          <div className="bg-white rounded border shadow-sm px-2 py-1 flex items-center gap-3 text-xs text-gray-700 flex-shrink-0 w-fit">
+            <span className="text-[10px] uppercase tracking-wide text-gray-500 font-semibold">
+              Route progress
+            </span>
+            <span className="inline-flex items-center gap-1">
+              <span className="w-2 h-2 rounded-full bg-emerald-500" />
+              {routeProgress.placed} placed
+            </span>
+            <span className="inline-flex items-center gap-1">
+              <span className="w-2 h-2 rounded-full bg-amber-500" />
+              {routeProgress.contacted} contacted
+            </span>
+            <span className="inline-flex items-center gap-1">
+              <span className="w-2 h-2 rounded-full bg-red-500" />
+              {routeProgress.remaining} to call
+            </span>
+          </div>
+        )}
 
         {customerDetail && (
           <CustomerContactStrip

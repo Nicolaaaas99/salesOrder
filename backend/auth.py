@@ -17,6 +17,10 @@ import threading
 from typing import Optional
 
 from fastapi import Depends, Header, HTTPException, status
+from sqlalchemy import text
+from sqlalchemy.orm import Session
+
+from database import get_db
 
 
 _sessions: dict[str, str] = {}       # token -> username
@@ -75,6 +79,67 @@ def get_current_token(authorization: Optional[str] = Header(None)) -> str:
     if token is None:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Missing token")
     return token
+
+
+_ROLE_RANK = {"AGENT": 0, "SUPERVISOR": 1, "ADMIN": 2}
+
+
+def resolve_role(db: Session, username: str) -> Optional[str]:
+    """Look up the active role for a login username. None when no
+    matching `_tb_SOAppUsers` row exists (or the row is inactive) —
+    callers treat None as "not authorised"."""
+    row = db.execute(
+        text(
+            """
+            SELECT u.cRole
+            FROM [SOAssistant].dbo._tb_SOAppUsers u
+            JOIN [BA_00_LPD_CON].dbo._rtblAgents g
+                   ON g.idAgents = u.iAgentID
+            WHERE LOWER(g.cAgentName) = LOWER(:username)
+              AND u.bActive = 1
+            """
+        ),
+        {"username": (username or "").strip()},
+    ).mappings().first()
+    if not row:
+        return None
+    return (row["cRole"] or "").strip().upper() or None
+
+
+def get_current_user_role(
+    username: str = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> str:
+    """FastAPI dependency — resolves the current session's role on
+    every request. A deactivated user's next request 401s immediately
+    (no need to invalidate their token manually)."""
+    role = resolve_role(db, username)
+    if role is None:
+        raise HTTPException(
+            status.HTTP_401_UNAUTHORIZED,
+            "Not authorised — ask your admin to add you to the Sales Order Assistant.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return role
+
+
+def require_min_role(min_role: str):
+    """Factory producing a FastAPI dep that 403s when the caller's
+    role is below `min_role`. Call like:
+        router = APIRouter(dependencies=[Depends(require_min_role('SUPERVISOR'))])
+    …or inline on individual endpoints that need to escalate above
+    the router's default."""
+    min_rank = _ROLE_RANK[min_role.upper()]
+
+    def _dep(role: str = Depends(get_current_user_role)) -> str:
+        if _ROLE_RANK.get(role, -1) < min_rank:
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                f"Requires {min_role} or higher.",
+            )
+        return role
+
+    return _dep
 
 
 # ---------------- Evolution SDK integration ----------------------------------

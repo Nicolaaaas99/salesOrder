@@ -11,16 +11,19 @@
  The USE + GO batches are required because CREATE/ALTER VIEW must be the
  first statement in its batch.
 
- Object list (15 views + 1 function + 2 tables):
+ Object list (19 views + 1 function + 4 tables):
    Views     — _vw_SOActiveDeals, _vw_SOAgentDefaultWhse, _vw_SOCustomerDetail,
                _vw_SOCustomerInvoiceHistory, _vw_SOCustomerOrdersPerDay,
                _vw_SOCustomers, _vw_SOInventory,
                _vw_SOPriceListPrices, _vw_SOProjects, _vw_SORoute,
+               _vw_SORouteOptions, _vw_SOTelesaleOptions, _vw_SOSalesRep,
+               _vw_SOCategoryOptions,
                _vw_SOSalesOrderConfig, _vw_SOSeasonalFactors,
                _vw_SOSettlementTerms, _vw_SOTaxTypes, _vw_SOWarehouses
    Functions — _fn_SOCustomerPriceAsOf(@asOf date) — resolves deal/list price
                for a given session date; replaces the old _vw_SOCustomerPrice.
-   Tables    — _tb_SOOrderAssistantAudit (existing), _tb_SOCustomerContactLog (new)
+   Tables    — _tb_SOOrderAssistantAudit, _tb_SOCustomerContactLog,
+               _tb_SOCustomerAssignmentAudit, _tb_SOTargets, _tb_SOAppUsers
 ******************************************************************************/
 
 USE [SOAssistant];
@@ -243,6 +246,19 @@ SELECT
     CL.DCLink                        CustomerAccLink,
     CL.Account                       CustomerAccount,
     CL.Account+'-'+CL.Name           CustomerAccName,
+    ISNULL(CL.ulARTelesalesRep, 'None') TelesalesRep,
+    -- SalesRepId: ISNULL to 0 so the column is never NULL. 0 is a safe
+    -- sentinel because real SalesRep ids start at 1 — if a 0-id rep
+    -- ever gets created, this column becomes ambiguous.
+    ISNULL(CL.RepID, 0)              SalesRepId,
+    -- SalesRep.Code (short handle like "Vincent", "M M") instead of
+    -- SalesRep.Name — matches how the business refers to reps + the
+    -- Analytics screen's label (both use Code). Must stay consistent
+    -- across both halves of the UNION or the open-orders rows would
+    -- carry a different rep display than the invoice-side rows.
+    -- Falls back to 'None' when the LEFT JOIN finds nothing (NULL RepID
+    -- or an orphan RepID that points at a missing SalesRep row).
+    ISNULL(REP.Code, 'None')         SalesRep,
     STK.ulIIMainCategory             Category,
     STK.StockLink,
     STK.Code                         StockCode,
@@ -258,6 +274,7 @@ SELECT
     0                                                                                                      AS OnOrder
 FROM [BA_00_LPD_CON].dbo.PostST ST
 JOIN [BA_00_LPD_CON].dbo.Client CL ON CL.DCLink = ST.DrCrAccount
+LEFT JOIN [BA_00_LPD_CON].dbo.SalesRep REP ON REP.idSalesRep = CL.RepID
 JOIN [BA_00_LPD_CON].dbo.StkItem STK ON STK.StockLink = ST.AccountLink
 WHERE ST.Id IN ('Crn', 'OInv', 'Inv')
   AND ST.TxDate >= DATEADD(WEEK, -12, GETDATE())
@@ -270,6 +287,9 @@ SELECT
     CL.DCLink                                 CustomerAccLink,
     CL.Account                                CustomerAccount,
     CL.Account+'-'+CL.Name                    CustomerAccName,
+    ISNULL(CL.ulARTelesalesRep, 'None')       TelesalesRep,
+    ISNULL(CL.RepID, 0)                       SalesRepId,
+    ISNULL(REP.Code, 'None')                  SalesRep,
     STK.ulIIMainCategory                      Category,
     STK.StockLink,
     STK.Code                                  StockCode,
@@ -286,6 +306,7 @@ SELECT
 FROM [BA_00_LPD_CON].dbo._btblInvoiceLines LIN
 JOIN [BA_00_LPD_CON].dbo.InvNum   NUM ON NUM.AutoIndex = LIN.iInvoiceID
 JOIN [BA_00_LPD_CON].dbo.Client   CL  ON CL.DCLink     = NUM.AccountID
+LEFT JOIN [BA_00_LPD_CON].dbo.SalesRep REP ON REP.idSalesRep = CL.RepID
 JOIN [BA_00_LPD_CON].dbo.StkItem  STK ON STK.StockLink = LIN.iStockCodeID
 WHERE NUM.DocType  = 4
   AND NUM.DocState IN (1);
@@ -384,6 +405,7 @@ SELECT
     STK.WhseItem        AS IsWhseItem,
     CASE WHEN STK.bUOMItem = 1 THEN ISNULL(UOM.cUnitCode, '') ELSE '' END AS Uom,
     TAX.idTaxRate       AS DefaultTaxTypeId,
+    STK.ulIIMainCategory AS Category,
     WH.WhseLink         AS WhseId,
     WH.Code             AS WhseCode,
     ISNULL(QTY.QtyOnHand, 0) AS QtyOnHand
@@ -439,12 +461,77 @@ GO
 
 -- =============================================================================
 -- 11. _vw_SORoute  (routes come from Client master data, not transactions)
+--     Deliveries screen's route picker uses this — "routes actually in
+--     use" is the right semantic there. For the Customer Sales History
+--     maintenance modal, use _vw_SORouteOptions below instead, which
+--     includes defined-but-unused options (e.g. a brand-new INACTIVE
+--     route before any customers have been assigned to it).
 -- =============================================================================
 CREATE OR ALTER VIEW dbo._vw_SORoute AS
 SELECT DISTINCT ulARRoute AS Route
 FROM [BA_00_LPD_CON].dbo.Client
 WHERE ulARRoute IS NOT NULL
   AND LTRIM(RTRIM(ulARRoute)) <> '';
+GO
+
+-- =============================================================================
+-- 11b. _vw_SORouteOptions  (every route option defined in Evolution's user-
+--      dict, including unassigned ones). Powers the dropdown in the
+--      Customer Sales History maintenance modal. Evolution stores the
+--      option list as a single semi-colon-separated string in
+--      _rtblUserDict.cLookupOptions — STRING_SPLIT turns it into one row
+--      per option so the frontend consumes the same shape as every other
+--      lookup view. Empty trimmed values are filtered out.
+--      Requires SQL Server 2016+ (STRING_SPLIT).
+-- =============================================================================
+CREATE OR ALTER VIEW dbo._vw_SORouteOptions AS
+SELECT LTRIM(RTRIM(value)) AS Route
+FROM [BA_00_LPD_CON].dbo._rtblUserDict
+CROSS APPLY STRING_SPLIT(cLookupOptions, ';')
+WHERE cTableName = 'CLIENT'
+  AND cFieldName = 'ulARRoute'
+  AND LTRIM(RTRIM(value)) <> '';
+GO
+
+-- =============================================================================
+-- 11c. _vw_SOTelesaleOptions  (every telesales-rep option defined in the
+--      Evolution user-dict). Same pattern as _vw_SORouteOptions.
+-- =============================================================================
+CREATE OR ALTER VIEW dbo._vw_SOTelesaleOptions AS
+SELECT LTRIM(RTRIM(value)) AS Telesale
+FROM [BA_00_LPD_CON].dbo._rtblUserDict
+CROSS APPLY STRING_SPLIT(cLookupOptions, ';')
+WHERE cTableName = 'CLIENT'
+  AND cFieldName = 'ulARTelesalesRep'
+  AND LTRIM(RTRIM(value)) <> '';
+GO
+
+-- =============================================================================
+-- 11d. _vw_SOSalesRep  (full SalesRep master — needed for the maintenance
+--      modal so the user can assign a customer to any defined rep,
+--      including a new INACTIVE one). The Analytics screen separately
+--      uses MAX(REP.Code) for its labels — this view is purely for the
+--      dropdown data source.
+-- =============================================================================
+CREATE OR ALTER VIEW dbo._vw_SOSalesRep AS
+SELECT idSalesRep AS Id, Code AS SalesRep, Name AS RepName
+FROM [BA_00_LPD_CON].dbo.SalesRep;
+GO
+
+-- =============================================================================
+-- 11e. _vw_SOCategoryOptions  (every category option defined in the
+--      Evolution user-dict for StkItem.ulIIMainCategory). Powers the
+--      category dropdown in the target form. Same STRING_SPLIT pattern
+--      as _vw_SORouteOptions / _vw_SOTelesaleOptions — one row per
+--      option, trimmed, blank values filtered out.
+-- =============================================================================
+CREATE OR ALTER VIEW dbo._vw_SOCategoryOptions AS
+SELECT LTRIM(RTRIM(value)) AS Category
+FROM [BA_00_LPD_CON].dbo._rtblUserDict
+CROSS APPLY STRING_SPLIT(cLookupOptions, ';')
+WHERE cTableName = 'STKITEM'
+  AND cFieldName = 'ulIIMainCategory'
+  AND LTRIM(RTRIM(value)) <> '';
 GO
 
 -- =============================================================================
@@ -588,6 +675,14 @@ BEGIN
     CREATE TABLE [SOAssistant].dbo._tb_SOCustomerContactLog (
         idContactLog       BIGINT IDENTITY(1,1) NOT NULL,
         dCallDate          DATE           NOT NULL,
+        -- The delivery date the rep was prepping for in the session when
+        -- this row was written. Can lag dCallDate by a day or two when the
+        -- rep is planning tomorrow's deliveries today. The Deliveries
+        -- report filters by this column so a NO_ORDER logged on 27 Oct for
+        -- a 28 Oct delivery lists under "28 Oct" where it belongs. NULL
+        -- for pre-feature rows (October 2026); dropdown-dot queries still
+        -- key off dCallDate so they stay about "today's work".
+        dDeliveryDate      DATE           NULL,
         cRouteCode         VARCHAR(32)    NULL,
         iCustomerDCLink    INT            NOT NULL,
         cCustomerAccount   VARCHAR(20)    NOT NULL,
@@ -609,6 +704,21 @@ BEGIN
 END;
 GO
 
+-- Idempotent migration: adds dDeliveryDate to pre-existing deployments.
+-- SQL Server ALTER TABLE ADD always appends to the physical row, so on
+-- existing installs this lands at the end rather than next to dCallDate
+-- as in the fresh CREATE above — cosmetic only, every query is named.
+IF NOT EXISTS (
+    SELECT 1 FROM sys.columns
+    WHERE name = 'dDeliveryDate'
+      AND object_id = OBJECT_ID('[SOAssistant].dbo._tb_SOCustomerContactLog')
+)
+BEGIN
+    ALTER TABLE [SOAssistant].dbo._tb_SOCustomerContactLog
+        ADD dDeliveryDate DATE NULL;
+END;
+GO
+
 -- Supporting index: the dropdown dot query asks for all of today's outcomes
 -- for a single route. Date-first ordering keeps that lookup cheap.
 IF NOT EXISTS (
@@ -620,6 +730,305 @@ BEGIN
     CREATE INDEX IX_SOCustomerContactLog_RouteDate
         ON [SOAssistant].dbo._tb_SOCustomerContactLog (dCallDate, cRouteCode)
         INCLUDE (iCustomerDCLink, cOutcome, dtCreatedAt);
+END;
+GO
+
+-- -----------------------------------------------------------------------------
+-- _tb_SOCustomerAssignmentAudit  (one row per maintenance edit of a
+-- customer's route / telesales / sales rep via the Customer Sales
+-- History screen's Edit modal). Append-only; before/after columns per
+-- field so you can see exactly what changed and who did it. Nulls on the
+-- prev-* columns mean the previous value was blank/NULL in Client.
+-- -----------------------------------------------------------------------------
+IF OBJECT_ID('[SOAssistant].dbo._tb_SOCustomerAssignmentAudit', 'U') IS NULL
+BEGIN
+    CREATE TABLE [SOAssistant].dbo._tb_SOCustomerAssignmentAudit (
+        idAssignmentAudit  BIGINT IDENTITY(1,1) NOT NULL,
+        iCustomerDCLink    INT            NOT NULL,
+        cCustomerAccount   VARCHAR(20)    NOT NULL,
+        cPrevRoute         VARCHAR(64)    NULL,
+        cNewRoute          VARCHAR(64)    NULL,
+        cPrevTelesale      VARCHAR(64)    NULL,
+        cNewTelesale       VARCHAR(64)    NULL,
+        iPrevSalesRepId    INT            NULL,
+        iNewSalesRepId     INT            NULL,
+        cPrevSalesRepCode  VARCHAR(64)    NULL,
+        cNewSalesRepCode   VARCHAR(64)    NULL,
+        -- On-hold flag before/after the edit (Client.On_Hold). NULL on
+        -- pre-feature rows written before this column was added.
+        bPrevOnHold        BIT            NULL,
+        bNewOnHold         BIT            NULL,
+        cUsername          VARCHAR(64)    NOT NULL,
+        cAppVersion        VARCHAR(32)    NULL,
+        cNote              NVARCHAR(200)  NULL,
+        dtActionAt         DATETIME2(7)   NOT NULL
+            CONSTRAINT DF_SOCustomerAssignmentAudit_dt DEFAULT (sysdatetime()),
+        CONSTRAINT PK_SOCustomerAssignmentAudit PRIMARY KEY CLUSTERED (idAssignmentAudit)
+    );
+END;
+GO
+
+-- Idempotent migration: adds bPrevOnHold + bNewOnHold to pre-existing
+-- deployments. ALTER TABLE ADD appends to the physical row — logically
+-- they belong between cNewSalesRepCode and cUsername as in the fresh
+-- CREATE above, but every query is named so this is cosmetic.
+IF NOT EXISTS (
+    SELECT 1 FROM sys.columns
+    WHERE name = 'bPrevOnHold'
+      AND object_id = OBJECT_ID('[SOAssistant].dbo._tb_SOCustomerAssignmentAudit')
+)
+BEGIN
+    ALTER TABLE [SOAssistant].dbo._tb_SOCustomerAssignmentAudit
+        ADD bPrevOnHold BIT NULL, bNewOnHold BIT NULL;
+END;
+GO
+
+IF NOT EXISTS (
+    SELECT 1 FROM sys.indexes
+    WHERE name = 'IX_SOCustomerAssignmentAudit_Customer'
+      AND object_id = OBJECT_ID('[SOAssistant].dbo._tb_SOCustomerAssignmentAudit')
+)
+BEGIN
+    CREATE INDEX IX_SOCustomerAssignmentAudit_Customer
+        ON [SOAssistant].dbo._tb_SOCustomerAssignmentAudit (cCustomerAccount, dtActionAt DESC);
+END;
+GO
+
+-- -----------------------------------------------------------------------------
+-- _tb_SOTargets  (litre-based performance targets — Phase 4 of Analytics).
+-- Any combination of the five scope columns is valid: a target "about"
+-- the agent (cUsername) alone, a route alone, or any compound ("Yoghurt
+-- litres for CustomerX on RouteY by AgentZ" = four columns set). The
+-- CHECK constraint only enforces "at least one scope dim set".
+--
+-- Column sizes match the Evolution tables they mirror so matching joins
+-- never truncate: cUsername↔_rtblAgents.cAgentName (50),
+-- cRoute↔Client.ulARRoute (100), cCustomerAccount↔Client.Account (20),
+-- cCategory↔StkItem.ulIIMainCategory (100), cStockCode↔StkItem.cSimpleCode (20).
+--
+-- cPeriod values:
+--   DAILY   → measure today's litres
+--   WEEKLY  → Sunday-aligned current week (matches PerformanceStrip)
+--   MONTHLY → calendar month to date
+--   CUSTOM  → fixed window: dEffectiveFrom..dEffectiveTo are the
+--             measurement bounds (one-shot, non-rolling). Think promos.
+--
+-- For DAILY/WEEKLY/MONTHLY, dEffectiveFrom/dEffectiveTo are on/off
+-- validity dates (dEffectiveTo NULL = still active).
+-- -----------------------------------------------------------------------------
+IF OBJECT_ID('[SOAssistant].dbo._tb_SOTargets', 'U') IS NULL
+BEGIN
+    CREATE TABLE [SOAssistant].dbo._tb_SOTargets (
+        idTarget          INT IDENTITY(1,1) NOT NULL,
+        -- Agent id (_rtblAgents.idAgents). Preferred over cUsername
+        -- for the "Placed by" dim — the id is stable while the text
+        -- name can drift (case, trailing letter, re-spellings). Both
+        -- are populated on save: iAgentID drives measurement, cUsername
+        -- is the human-readable display.
+        iAgentID          INT            NULL,
+        cUsername         VARCHAR(50)    NULL,
+        -- Telesales rep (Client.ulARTelesalesRep). A telesales target
+        -- measures litres on orders delivered to customers assigned to
+        -- that telesales rep — different from an agent target, which
+        -- measures orders this login placed via the app.
+        cTelesales        VARCHAR(100)   NULL,
+        -- Sales rep (Client.RepID → SalesRep.Code). Same shape as
+        -- cTelesales: filters by the salesrep assigned to the customer
+        -- on the order, not by who logged in.
+        cSalesRep         VARCHAR(50)    NULL,
+        cRoute            VARCHAR(100)   NULL,
+        cCustomerAccount  VARCHAR(20)    NULL,
+        cCategory         VARCHAR(100)   NULL,
+        cStockCode        VARCHAR(20)    NULL,
+        cPeriod           VARCHAR(16)    NOT NULL,
+        fTargetLitres     DECIMAL(18, 2) NOT NULL,
+        dEffectiveFrom    DATE           NOT NULL,
+        dEffectiveTo      DATE           NULL,
+        cCreatedBy        VARCHAR(50)    NOT NULL,
+        dtCreatedAt       DATETIME2(7)   NOT NULL
+            CONSTRAINT DF_SOTargets_dt DEFAULT (sysdatetime()),
+        CONSTRAINT PK_SOTargets PRIMARY KEY CLUSTERED (idTarget),
+        CONSTRAINT CK_SOTargets_Period CHECK
+            (cPeriod IN ('DAILY', 'WEEKLY', 'MONTHLY', 'CUSTOM')),
+        CONSTRAINT CK_SOTargets_HasScope CHECK (
+            iAgentID IS NOT NULL
+            OR cUsername IS NOT NULL
+            OR cTelesales IS NOT NULL
+            OR cSalesRep IS NOT NULL
+            OR cRoute IS NOT NULL
+            OR cCustomerAccount IS NOT NULL
+            OR cCategory IS NOT NULL
+            OR cStockCode IS NOT NULL
+        ),
+        CONSTRAINT CK_SOTargets_CustomRange CHECK (
+            cPeriod <> 'CUSTOM' OR dEffectiveTo IS NOT NULL
+        ),
+        CONSTRAINT CK_SOTargets_TargetPositive CHECK (fTargetLitres > 0)
+    );
+END;
+GO
+
+-- Idempotent migration: adds cTelesales to pre-existing deployments.
+-- ALTER TABLE ADD appends to the physical row — logically it belongs
+-- next to cUsername as in the fresh CREATE above, but every query is
+-- named so this is cosmetic.
+IF NOT EXISTS (
+    SELECT 1 FROM sys.columns
+    WHERE name = 'cTelesales'
+      AND object_id = OBJECT_ID('[SOAssistant].dbo._tb_SOTargets')
+)
+BEGIN
+    ALTER TABLE [SOAssistant].dbo._tb_SOTargets
+        ADD cTelesales VARCHAR(100) NULL;
+END;
+GO
+
+-- Idempotent migration: adds cSalesRep to pre-existing deployments.
+-- Same shape as the cTelesales migration above.
+IF NOT EXISTS (
+    SELECT 1 FROM sys.columns
+    WHERE name = 'cSalesRep'
+      AND object_id = OBJECT_ID('[SOAssistant].dbo._tb_SOTargets')
+)
+BEGIN
+    ALTER TABLE [SOAssistant].dbo._tb_SOTargets
+        ADD cSalesRep VARCHAR(50) NULL;
+END;
+GO
+
+-- Idempotent migration: adds iAgentID to pre-existing deployments.
+-- Preferred over cUsername for "Placed by" measurement — a stable int
+-- key doesn't drift when the Evolution agent record is renamed and
+-- doesn't false-mismatch on case ("BrendaS" vs "Brendas"). On save
+-- both columns are populated; measurement prefers iAgentID.
+IF NOT EXISTS (
+    SELECT 1 FROM sys.columns
+    WHERE name = 'iAgentID'
+      AND object_id = OBJECT_ID('[SOAssistant].dbo._tb_SOTargets')
+)
+BEGIN
+    ALTER TABLE [SOAssistant].dbo._tb_SOTargets
+        ADD iAgentID INT NULL;
+END;
+GO
+
+-- Rebuild CK_SOTargets_HasScope so it includes cTelesales, cSalesRep
+-- and iAgentID. The original constraint was defined before those
+-- columns existed, so on pre-existing deployments it rejects targets
+-- scoped only to those dims (every known-to-it scope column is NULL).
+-- Drop + recreate behind an idempotent guard: act only if the current
+-- constraint definition is missing ANY of the three, so re-running is
+-- a no-op once rebuilt. OBJECT_DEFINITION returns the SQL text of the
+-- constraint, which we grep for the column names.
+IF EXISTS (
+    SELECT 1 FROM sys.check_constraints
+    WHERE name = 'CK_SOTargets_HasScope'
+      AND parent_object_id = OBJECT_ID('[SOAssistant].dbo._tb_SOTargets')
+      AND (OBJECT_DEFINITION(object_id) NOT LIKE '%cTelesales%'
+           OR OBJECT_DEFINITION(object_id) NOT LIKE '%cSalesRep%'
+           OR OBJECT_DEFINITION(object_id) NOT LIKE '%iAgentID%')
+)
+BEGIN
+    ALTER TABLE [SOAssistant].dbo._tb_SOTargets
+        DROP CONSTRAINT CK_SOTargets_HasScope;
+    ALTER TABLE [SOAssistant].dbo._tb_SOTargets
+        ADD CONSTRAINT CK_SOTargets_HasScope CHECK (
+            iAgentID IS NOT NULL
+            OR cUsername IS NOT NULL
+            OR cTelesales IS NOT NULL
+            OR cSalesRep IS NOT NULL
+            OR cRoute IS NOT NULL
+            OR cCustomerAccount IS NOT NULL
+            OR cCategory IS NOT NULL
+            OR cStockCode IS NOT NULL
+        );
+END;
+GO
+
+-- Supporting index for the Order Assistant's per-agent lookup (most
+-- recently created active target for this user). Drop + recreate if an
+-- older version of this index exists that doesn't INCLUDE cSalesRep —
+-- the key lookups add up on this hot path.
+IF EXISTS (
+    SELECT 1 FROM sys.indexes ix
+    WHERE ix.name = 'IX_SOTargets_Username'
+      AND ix.object_id = OBJECT_ID('[SOAssistant].dbo._tb_SOTargets')
+      AND NOT EXISTS (
+          SELECT 1
+          FROM sys.index_columns ixc
+          JOIN sys.columns col
+            ON col.object_id = ixc.object_id
+           AND col.column_id = ixc.column_id
+          WHERE ixc.object_id = ix.object_id
+            AND ixc.index_id  = ix.index_id
+            AND ixc.is_included_column = 1
+            AND col.name = 'cSalesRep'
+      )
+)
+BEGIN
+    DROP INDEX IX_SOTargets_Username ON [SOAssistant].dbo._tb_SOTargets;
+END;
+GO
+
+IF NOT EXISTS (
+    SELECT 1 FROM sys.indexes
+    WHERE name = 'IX_SOTargets_Username'
+      AND object_id = OBJECT_ID('[SOAssistant].dbo._tb_SOTargets')
+)
+BEGIN
+    CREATE INDEX IX_SOTargets_Username
+        ON [SOAssistant].dbo._tb_SOTargets (cUsername, dtCreatedAt DESC)
+        INCLUDE (cTelesales, cSalesRep, cRoute, cCustomerAccount, cCategory, cStockCode,
+                 cPeriod, fTargetLitres, dEffectiveFrom, dEffectiveTo);
+END;
+GO
+
+-- Supporting index for the Deliveries report Reason column, which asks
+-- for the latest outcome per customer across a delivery-date range.
+IF NOT EXISTS (
+    SELECT 1 FROM sys.indexes
+    WHERE name = 'IX_SOCustomerContactLog_DeliveryDate'
+      AND object_id = OBJECT_ID('[SOAssistant].dbo._tb_SOCustomerContactLog')
+)
+BEGIN
+    CREATE INDEX IX_SOCustomerContactLog_DeliveryDate
+        ON [SOAssistant].dbo._tb_SOCustomerContactLog (dDeliveryDate, cCustomerAccount)
+        INCLUDE (cOutcome, dtCreatedAt);
+END;
+GO
+
+-- -----------------------------------------------------------------------------
+-- _tb_SOAppUsers  (user-rights whitelist). An Evolution agent can only
+-- log into the Sales Order Assistant if a matching active row exists
+-- here. Role governs what they can do:
+--   AGENT       read-only — can view targets they own + non-identity
+--               targets (route / customer / category / stock), use
+--               Customer Sales History filters but not its maintenance
+--               actions. Cannot CRUD targets.
+--   SUPERVISOR  full access to everything the app currently offers
+--               (CRUD targets, CSH maintenance, bulk edits).
+--   ADMIN       SUPERVISOR + the Users & Roles management screen.
+--
+-- iAgentID is the foreign key into [BA_00_LPD_CON].dbo._rtblAgents.
+-- UNIQUE so there's at most one role per Evolution agent. bActive=0
+-- shadow-deletes (keeps the row for audit but blocks login).
+-- -----------------------------------------------------------------------------
+IF OBJECT_ID('[SOAssistant].dbo._tb_SOAppUsers', 'U') IS NULL
+BEGIN
+    CREATE TABLE [SOAssistant].dbo._tb_SOAppUsers (
+        idAppUser    INT IDENTITY(1,1) NOT NULL,
+        iAgentID     INT          NOT NULL,
+        cRole        VARCHAR(16)  NOT NULL,
+        bActive      BIT          NOT NULL
+            CONSTRAINT DF_SOAppUsers_bActive DEFAULT (1),
+        cCreatedBy   VARCHAR(50)  NOT NULL,
+        dtCreatedAt  DATETIME2(7) NOT NULL
+            CONSTRAINT DF_SOAppUsers_dt DEFAULT (sysdatetime()),
+        CONSTRAINT PK_SOAppUsers PRIMARY KEY CLUSTERED (idAppUser),
+        CONSTRAINT UX_SOAppUsers_Agent UNIQUE (iAgentID),
+        CONSTRAINT CK_SOAppUsers_Role CHECK
+            (cRole IN ('AGENT', 'SUPERVISOR', 'ADMIN'))
+    );
 END;
 GO
 
@@ -705,8 +1114,144 @@ SET @sql = N'GRANT INSERT ON OBJECT :: dbo._tb_SOOrderAssistantAudit TO ' + QUOT
 EXEC sp_executesql @sql;
 SET @sql = N'GRANT INSERT ON OBJECT :: dbo._tb_SOCustomerContactLog TO ' + QUOTENAME(@login) + N';';
 EXEC sp_executesql @sql;
+SET @sql = N'GRANT INSERT ON OBJECT :: dbo._tb_SOCustomerAssignmentAudit TO ' + QUOTENAME(@login) + N';';
+EXEC sp_executesql @sql;
+-- Targets table needs full CRUD since the Analytics Performance screen
+-- lets users create / edit / delete targets. Not append-only like the
+-- audit tables.
+SET @sql = N'GRANT INSERT, UPDATE, DELETE ON OBJECT :: dbo._tb_SOTargets TO ' + QUOTENAME(@login) + N';';
+EXEC sp_executesql @sql;
+-- AppUsers table — the admin Users & Roles screen does full CRUD
+-- (add, change role, deactivate) under the ADMIN role gate.
+SET @sql = N'GRANT INSERT, UPDATE, DELETE ON OBJECT :: dbo._tb_SOAppUsers TO ' + QUOTENAME(@login) + N';';
+EXEC sp_executesql @sql;
 
-PRINT 'Granted SELECT + INSERT to login ' + @login + ' on [SOAssistant].';
+PRINT 'Granted SELECT + INSERT on [SOAssistant] to login ' + @login + '.';
+
+-- The Customer Sales History maintenance modal writes directly to the
+-- Evolution Client table (3 scalar columns — ulARRoute, ulARTelesalesRep,
+-- RepID). On a fresh deploy the backend login almost always already has
+-- UPDATE on dbo.Client (because Evolution itself uses this login), but
+-- grant it explicitly here just in case:
+USE [BA_00_LPD_CON];
+SET @sql = N'GRANT UPDATE ON OBJECT :: dbo.Client TO ' + QUOTENAME(@login) + N';';
+EXEC sp_executesql @sql;
+USE [SOAssistant];
+PRINT 'Granted UPDATE on Client in [BA_00_LPD_CON] to login ' + @login + '.';
+*/
+
+
+-- =============================================================================
+-- One-time backfill of dDeliveryDate for pre-existing PLACED rows.
+--
+-- Rows written before the dDeliveryDate column existed get NULL on migration
+-- and are therefore invisible to the Deliveries report's Reason column
+-- (which filters strictly by dDeliveryDate — a NULL doesn't match any date
+-- range). For PLACED rows we can recover the delivery date from the order
+-- itself (InvNum.DeliveryDate on the row sharing cOrderNum). Non-PLACED
+-- rows stay NULL because we have no reliable record of what delivery date
+-- the rep was prepping for at the time.
+--
+-- CROSS APPLY TOP 1 picks one row per OrderNum (Evolution splits
+-- partially-processed orders across multiple InvNum rows, but they all
+-- share the same DeliveryDate).
+--
+-- Review the row count returned by the SELECT first; run the UPDATE once.
+/*
+SELECT COUNT(*) AS placed_rows_to_backfill
+FROM [SOAssistant].dbo._tb_SOCustomerContactLog
+WHERE cOutcome = 'PLACED'
+  AND dDeliveryDate IS NULL
+  AND cOrderNum IS NOT NULL;
+
+UPDATE log
+SET log.dDeliveryDate = x.delivery_date
+FROM [SOAssistant].dbo._tb_SOCustomerContactLog log
+CROSS APPLY (
+    SELECT TOP 1 CAST(inv.DeliveryDate AS DATE) AS delivery_date
+    FROM dbo.InvNum inv
+    WHERE inv.OrderNum = log.cOrderNum
+      AND inv.DocType = 4
+) x
+WHERE log.cOutcome = 'PLACED'
+  AND log.dDeliveryDate IS NULL;
+*/
+
+
+-- =============================================================================
+-- One-time backfill: canonicalise historical cUsername casing + fill
+-- iAgentID on existing target rows.
+--
+-- Why: audit rows carried whatever casing the user typed at login
+-- ("Brendas"), while the Evolution master has it canonically
+-- ("BrendaS"). Measurement by cUsername string-matched inconsistently.
+-- Going forward we match by iAgentID + canonicalise at login time, but
+-- historical data still carries the mismatched values. Running these
+-- UPDATEs once fixes the drift.
+--
+-- Preview-count SELECTs are above each UPDATE; uncomment the block,
+-- review the counts, then run the UPDATE.
+/*
+-- Audit rows with cUsername that doesn't exactly match the Evolution master.
+SELECT COUNT(*) AS audit_rows_to_canonicalise
+FROM [SOAssistant].dbo._tb_SOOrderAssistantAudit a
+JOIN [BA_00_LPD_CON].dbo._rtblAgents g
+       ON LOWER(g.cAgentName) = LOWER(a.cUsername)
+WHERE a.cUsername <> g.cAgentName COLLATE Latin1_General_CS_AS;
+
+UPDATE a
+SET a.cUsername = g.cAgentName
+FROM [SOAssistant].dbo._tb_SOOrderAssistantAudit a
+JOIN [BA_00_LPD_CON].dbo._rtblAgents g
+       ON LOWER(g.cAgentName) = LOWER(a.cUsername)
+WHERE a.cUsername <> g.cAgentName COLLATE Latin1_General_CS_AS;
+
+-- Target rows: fill iAgentID from cUsername match + canonicalise text.
+SELECT COUNT(*) AS targets_to_fill_agent_id
+FROM [SOAssistant].dbo._tb_SOTargets t
+JOIN [BA_00_LPD_CON].dbo._rtblAgents g
+       ON LOWER(g.cAgentName) = LOWER(t.cUsername)
+WHERE t.iAgentID IS NULL
+  AND t.cUsername IS NOT NULL;
+
+UPDATE t
+SET t.iAgentID = g.idAgents,
+    t.cUsername = g.cAgentName
+FROM [SOAssistant].dbo._tb_SOTargets t
+JOIN [BA_00_LPD_CON].dbo._rtblAgents g
+       ON LOWER(g.cAgentName) = LOWER(t.cUsername)
+WHERE t.cUsername IS NOT NULL;
+
+-- cCreatedBy audit-trail column — purely for display, canonicalise too.
+UPDATE t
+SET t.cCreatedBy = g.cAgentName
+FROM [SOAssistant].dbo._tb_SOTargets t
+JOIN [BA_00_LPD_CON].dbo._rtblAgents g
+       ON LOWER(g.cAgentName) = LOWER(t.cCreatedBy)
+WHERE t.cCreatedBy <> g.cAgentName COLLATE Latin1_General_CS_AS;
+*/
+
+
+-- =============================================================================
+-- Bootstrap first ADMIN — MUST BE RUN ONCE BY HAND on a fresh deploy.
+--
+-- Login is gated on `_tb_SOAppUsers` membership — if the table is
+-- empty, nobody can log in, including whoever would normally promote
+-- others. Run this once with the Evolution agent id of your first
+-- admin. From then on they can add + role-change everyone else via
+-- the Users & Roles screen in the app.
+--
+-- Find the agent id first:
+--   SELECT idAgents, cAgentName
+--   FROM [BA_00_LPD_CON].dbo._rtblAgents
+--   WHERE cAgentName = '<your-login>';
+--
+-- Then uncomment + edit the INSERT below:
+/*
+INSERT INTO [SOAssistant].dbo._tb_SOAppUsers
+    (iAgentID, cRole, bActive, cCreatedBy)
+VALUES
+    (445, 'ADMIN', 1, 'bootstrap');   -- <-- edit the id
 */
 
 
@@ -714,13 +1259,13 @@ PRINT 'Granted SELECT + INSERT to login ' + @login + ' on [SOAssistant].';
 -- Verification
 -- =============================================================================
 SELECT name FROM [SOAssistant].sys.views  WHERE name LIKE '_vw_SO%' ORDER BY name;
--- Expected 15 rows.
+-- Expected 19 rows.
 
 SELECT name FROM [SOAssistant].sys.objects WHERE name LIKE '_fn_SO%' AND type IN ('IF','TF','FN') ORDER BY name;
 -- Expected 1 row: _fn_SOCustomerPriceAsOf.
 
 SELECT name FROM [SOAssistant].sys.tables WHERE name LIKE '_tb_SO%' ORDER BY name;
--- Expected 2 rows: _tb_SOCustomerContactLog, _tb_SOOrderAssistantAudit.
+-- Expected 5 rows: _tb_SOAppUsers, _tb_SOCustomerAssignmentAudit, _tb_SOCustomerContactLog, _tb_SOOrderAssistantAudit, _tb_SOTargets.
 
 -- Row-count sanity check — should match the Evolution-side table.
 SELECT 'SOAssistant audit rows' AS label, COUNT(*) AS n

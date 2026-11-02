@@ -191,6 +191,20 @@ def place_order(
         text("SELECT ulARRoute FROM dbo.Client WHERE Account = :account"),
         {"account": payload.customer_account},
     ).mappings().first()
+    # Look up the InvNum.AutoIndex for the row we just created so we can
+    # stamp it onto the contact-log row. Gives downstream reports a direct
+    # FK into the order rather than having to re-join on OrderNum (which
+    # Evolution splits across multiple rows after partial processing).
+    # TOP 1 DESC is a safety net — immediately after save there's exactly
+    # one DocType=4 row with this OrderNum.
+    inv_row = db.execute(
+        text(
+            "SELECT TOP 1 AutoIndex FROM dbo.InvNum "
+            "WHERE OrderNum = :order_no AND DocType = 4 "
+            "ORDER BY AutoIndex DESC"
+        ),
+        {"order_no": result.order_no},
+    ).mappings().first()
     write_contact_log(
         db,
         customer_account=payload.customer_account,
@@ -200,6 +214,11 @@ def place_order(
         source_app="SO_ASSISTANT",
         app_version=app_version,
         order_no=result.order_no,
+        inv_num_auto_index=(inv_row and int(inv_row["AutoIndex"])) or None,
+        # The order's own delivery date — gives the Deliveries report a
+        # correct dDeliveryDate for the PLACED row without having to
+        # backfill from InvNum later.
+        delivery_date=payload.delivery_date,
         swallow_db_errors=True,
     )
     return result
@@ -300,15 +319,53 @@ def _by_date_column(by: str) -> str:
 @router.get("/by-order-date", response_model=List[schemas.SalesOrderSearchResult])
 def list_orders_by_order_date(
     account: str = Query(...),
-    on_date: date = Query(..., alias="date"),
+    on_date: Optional[date] = Query(None, alias="date"),
+    from_date: Optional[date] = Query(None, alias="from"),
+    to_date: Optional[date] = Query(None, alias="to"),
     by: str = Query("order", pattern="^(order|delivery)$"),
     db: Session = Depends(get_db),
 ):
-    """Return the sales orders for one customer where the chosen date column
-    matches the given calendar day. `by=order` (default) uses OrderDate; the
-    Route Overview passes `by=delivery` to use DeliveryDate."""
+    """Sales orders for one customer where the chosen date column falls in
+    the given range (inclusive). Pass `from=&to=` for a range or `date=`
+    for a single day; one of the two forms is required.
+    `by=order` (default) uses OrderDate; the Deliveries report passes
+    `by=delivery` to use DeliveryDate."""
+    if from_date is not None and to_date is not None:
+        frm, to = (from_date, to_date) if from_date <= to_date else (to_date, from_date)
+    elif on_date is not None:
+        frm, to = on_date, on_date
+    else:
+        raise HTTPException(400, "must provide either `date` or `from`+`to`")
+
     date_col = _by_date_column(by)
+    # Dedupe to one row per OrderNum: Evolution splits a partially-processed
+    # order into multiple InvNum rows (one per fulfilment slice) sharing the
+    # same OrderNum. We rank DocState so the "most open" slice wins —
+    # Unprocessed (1) over Partial (3) over Archived (4) — tiebreak by
+    # AutoIndex DESC so the newest split takes precedence. OrdTotIncl is
+    # the full-order total and is identical across the slices, so the
+    # picked row's total matches what the user placed.
     sql = f"""
+        WITH ranked AS (
+            SELECT
+                inv.*,
+                ROW_NUMBER() OVER (
+                    PARTITION BY inv.OrderNum
+                    ORDER BY
+                        CASE inv.DocState
+                            WHEN 1 THEN 1
+                            WHEN 3 THEN 2
+                            WHEN 4 THEN 3
+                            ELSE 4
+                        END,
+                        inv.AutoIndex DESC
+                ) AS rn
+            FROM InvNum inv
+            WHERE inv.DocType = 4
+              AND inv.DocState IN (1, 3, 4)
+              AND ISNULL(inv.OrderNum, '') <> ''
+              AND CAST(inv.{date_col} AS DATE) BETWEEN :from_date AND :to_date
+        )
         SELECT
             inv.OrderNum      AS order_no,
             inv.ExtOrderNum   AS external_order,
@@ -320,18 +377,15 @@ def list_orders_by_order_date(
             inv.OrdTotIncl    AS total_incl,
             c.Account         AS customer_account,
             c.Name            AS customer_name
-        FROM InvNum inv
+        FROM ranked inv
         LEFT JOIN Client c ON c.DCLink = inv.AccountID
-        WHERE inv.DocType = 4
-          AND inv.DocState IN (1, 3, 4)
-          AND ISNULL(inv.OrderNum, '') <> ''
+        WHERE inv.rn = 1
           AND c.Account = :account
-          AND CAST(inv.{date_col} AS DATE) = :on_date
         ORDER BY inv.OrderNum DESC
     """
     rows = db.execute(
         text(sql),
-        {"account": account.strip(), "on_date": on_date},
+        {"account": account.strip(), "from_date": frm, "to_date": to},
     ).mappings().all()
 
     return [

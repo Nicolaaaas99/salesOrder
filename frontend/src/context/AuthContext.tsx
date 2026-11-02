@@ -6,10 +6,19 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import { auth as authApi } from "../api/client";
+import { auth as authApi, type AppUserRole } from "../api/client";
 
 type AuthState = {
   username: string | null;
+  /** `_rtblAgents.idAgents` for the logged-in user. Used by Performance
+   *  strip to match targets by stable id instead of drift-prone
+   *  cUsername text. Null until login completes (and null for logins
+   *  that aren't in _rtblAgents, though that's unusual). */
+  agentId: number | null;
+  /** Resolved from `_tb_SOAppUsers`. Null until login. All UI gating
+   *  (Add target button, CSH maintenance pencil, admin screen, …)
+   *  branches off this value. */
+  role: AppUserRole | null;
   token: string | null;
   /** `YYYY-MM-DD` in LOCAL calendar. Null until the rep picks one at the
    *  start of a session. All sales-order date defaults use this. */
@@ -46,18 +55,30 @@ const AuthContext = createContext<AuthContextValue | null>(null);
  * pick a date at session start) but preserved across reloads.
  */
 export function AuthProvider({ children }: { children: ReactNode }) {
-  const [state, setState] = useState<AuthState>(() => ({
-    token: sessionStorage.getItem("auth_token"),
-    username: sessionStorage.getItem("auth_username"),
-    sessionDate: sessionStorage.getItem("auth_session_date"),
-    defaultWarehouseCode: sessionStorage.getItem("auth_default_warehouse"),
-    forceExtOrderNum: sessionStorage.getItem("auth_force_ext_order_num") === "1",
-  }));
+  const [state, setState] = useState<AuthState>(() => {
+    const storedAgentId = sessionStorage.getItem("auth_agent_id");
+    const storedRole = sessionStorage.getItem("auth_role") as AppUserRole | null;
+    return {
+      token: sessionStorage.getItem("auth_token"),
+      username: sessionStorage.getItem("auth_username"),
+      agentId: storedAgentId ? Number(storedAgentId) : null,
+      role: storedRole,
+      sessionDate: sessionStorage.getItem("auth_session_date"),
+      defaultWarehouseCode: sessionStorage.getItem("auth_default_warehouse"),
+      forceExtOrderNum: sessionStorage.getItem("auth_force_ext_order_num") === "1",
+    };
+  });
 
   const login = useCallback(async (username: string, password: string) => {
     const res = await authApi.login(username.trim(), password);
     sessionStorage.setItem("auth_token", res.token);
     sessionStorage.setItem("auth_username", res.username);
+    if (res.agent_id != null) {
+      sessionStorage.setItem("auth_agent_id", String(res.agent_id));
+    } else {
+      sessionStorage.removeItem("auth_agent_id");
+    }
+    sessionStorage.setItem("auth_role", res.role);
     // Fresh login = re-prompt for session date.
     sessionStorage.removeItem("auth_session_date");
     if (res.default_warehouse_code) {
@@ -73,6 +94,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setState({
       token: res.token,
       username: res.username,
+      agentId: res.agent_id ?? null,
+      role: res.role,
       sessionDate: null,
       defaultWarehouseCode: res.default_warehouse_code ?? null,
       forceExtOrderNum: !!res.force_ext_order_num,
@@ -85,12 +108,16 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     authApi.logout().catch(() => {});
     sessionStorage.removeItem("auth_token");
     sessionStorage.removeItem("auth_username");
+    sessionStorage.removeItem("auth_agent_id");
+    sessionStorage.removeItem("auth_role");
     sessionStorage.removeItem("auth_session_date");
     sessionStorage.removeItem("auth_default_warehouse");
     sessionStorage.removeItem("auth_force_ext_order_num");
     setState({
       token: null,
       username: null,
+      agentId: null,
+      role: null,
       sessionDate: null,
       defaultWarehouseCode: null,
       forceExtOrderNum: false,
@@ -130,8 +157,16 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         } else {
           sessionStorage.removeItem("auth_force_ext_order_num");
         }
+        if (me.agent_id != null) {
+          sessionStorage.setItem("auth_agent_id", String(me.agent_id));
+        } else {
+          sessionStorage.removeItem("auth_agent_id");
+        }
+        sessionStorage.setItem("auth_role", me.role);
         setState((prev) => ({
           ...prev,
+          agentId: me.agent_id ?? null,
+          role: me.role,
           defaultWarehouseCode: me.default_warehouse_code ?? null,
           forceExtOrderNum: !!me.force_ext_order_num,
         }));
@@ -149,6 +184,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       setState({
         token: null,
         username: null,
+        agentId: null,
+        role: null,
         sessionDate: null,
         defaultWarehouseCode: null,
         forceExtOrderNum: false,

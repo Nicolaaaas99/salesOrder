@@ -129,58 +129,44 @@ export function SalesOrderTab({
   }
 
   return (
-    <div className="so-landing">
-      <div className="so-landing-inner">
-        <header className="so-landing-header">
-          <h1>Sales Orders</h1>
-          <p>Choose how you'd like to get started.</p>
+    <div className="h-full bg-gray-50 overflow-y-auto">
+      <div className="max-w-5xl mx-auto w-full p-6">
+        <header className="mb-5">
+          <h1 className="text-xl font-semibold text-gray-900">Sales Orders</h1>
+          <p className="text-sm text-gray-600">Choose how you'd like to get started.</p>
         </header>
 
-        <div className="so-landing-cards">
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
           {CREATE_NEW_ORDER_ENABLED && (
-            <button
-              className="so-landing-card"
+            <HubCard
+              icon={<FilePlus className="w-6 h-6" />}
+              iconClass="bg-blue-100 text-blue-700"
+              title="Create a new order"
+              description="Start from a blank sales order."
               onClick={() => {
                 setFormSessionKey((k) => k + 1);
                 setMode({ kind: "new" });
               }}
-            >
-              <div className="so-landing-card-icon so-landing-card-icon--new">
-                <FilePlus className="w-6 h-6" />
-              </div>
-              <div className="so-landing-card-body">
-                <h2>Create a new order</h2>
-                <p>
-                  Start from a blank sales order. Pick a customer, add lines and
-                  fill in the header details.
-                </p>
-              </div>
-            </button>
+            />
           )}
 
-          <button
-            className="so-landing-card"
+          <HubCard
+            icon={<FolderOpen className="w-6 h-6" />}
+            iconClass="bg-emerald-100 text-emerald-700"
+            title="Open an existing order"
+            description="Load a previous order to edit or re-use."
             onClick={() => setMode({ kind: "searching" })}
             disabled={loading}
-          >
-            <div className="so-landing-card-icon so-landing-card-icon--open">
-              <FolderOpen className="w-6 h-6" />
-            </div>
-            <div className="so-landing-card-body">
-              <h2>Open an existing order</h2>
-              <p>
-                Load a previous sales order to edit, or use an archived one as
-                a template for a new order.
-              </p>
-            </div>
-          </button>
+          />
         </div>
 
         {loading && (
-          <div className="so-landing-status">Loading sales order…</div>
+          <div className="mt-4 text-center text-xs text-gray-600">
+            Loading sales order…
+          </div>
         )}
         {errorMsg && (
-          <div className="so-landing-status so-landing-status--err">
+          <div className="mt-4 text-center text-xs text-red-600">
             {errorMsg}
           </div>
         )}
@@ -193,5 +179,39 @@ export function SalesOrderTab({
         />
       )}
     </div>
+  );
+}
+
+/** Same visual language as AnalyticsScreen.HubCard — kept inline here
+ *  rather than extracted so each tab stays self-contained. */
+function HubCard({
+  icon,
+  iconClass,
+  title,
+  description,
+  onClick,
+  disabled,
+}: {
+  icon: React.ReactNode;
+  iconClass: string;
+  title: string;
+  description: string;
+  onClick: () => void;
+  disabled?: boolean;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      disabled={disabled}
+      className="group bg-white rounded border shadow-sm hover:shadow-md transition-shadow p-4 text-left flex gap-3 items-start disabled:opacity-60 disabled:cursor-not-allowed"
+    >
+      <div className={`flex-shrink-0 w-10 h-10 rounded-md flex items-center justify-center ${iconClass}`}>
+        {icon}
+      </div>
+      <div className="flex-1 min-w-0">
+        <h2 className="text-sm font-semibold text-gray-900">{title}</h2>
+        <p className="text-xs text-gray-600 mt-1 leading-snug">{description}</p>
+      </div>
+    </button>
   );
 }

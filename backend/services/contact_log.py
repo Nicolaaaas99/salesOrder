@@ -77,6 +77,7 @@ def write_contact_log(
     order_no: Optional[str] = None,
     inv_num_auto_index: Optional[int] = None,
     call_date: Optional[date] = None,
+    delivery_date: Optional[date] = None,
     swallow_db_errors: bool = False,
 ) -> Optional[int]:
     """Insert one contact-log row. Returns the new idContactLog on success,
@@ -85,7 +86,15 @@ def write_contact_log(
     DB-level failures (permissions, constraint violations) raise
     ContactLogError so the user-facing path can surface the real reason.
     Internal callers that must stay best-effort (e.g. the PLACED write
-    inside the order-save path) can pass `swallow_db_errors=True`."""
+    inside the order-save path) can pass `swallow_db_errors=True`.
+
+    `call_date` defaults to today (actual day the row was written).
+    `delivery_date` is the session's planned delivery date — may differ
+    from call_date when the rep is prepping tomorrow in today's session.
+    The Deliveries report filters strictly by delivery_date so a NO_ORDER
+    logged on the 27th for a 28th-delivery call list shows up when the
+    report is filtered to the 28th. Pass None to leave it blank for
+    callers that genuinely don't have a target delivery date."""
     outcome = (outcome or "").upper().strip()
     if outcome not in ALLOWED_OUTCOMES:
         logger.warning("contact-log: rejecting unknown outcome %r", outcome)
@@ -103,19 +112,22 @@ def write_contact_log(
         row = db.execute(
             text(f"""
                 INSERT INTO {CONTACT_LOG_TABLE}
-                    (dCallDate, cRouteCode, iCustomerDCLink, cCustomerAccount,
+                    (dCallDate, dDeliveryDate, cRouteCode,
+                     iCustomerDCLink, cCustomerAccount,
                      cOutcome, cNote, dFollowUpDate,
                      cOrderNum, iInvNumAutoIndex,
                      iAgentID, cUsername, cSourceApp, cAppVersion)
                 OUTPUT INSERTED.idContactLog
                 VALUES
-                    (:call_date, :route, :dclink, :account,
+                    (:call_date, :delivery_date, :route,
+                     :dclink, :account,
                      :outcome, :note, :follow_up,
                      :order_no, :auto_index,
                      :agent_id, :username, :source_app, :app_version)
             """),
             {
                 "call_date": call_date,
+                "delivery_date": delivery_date,
                 "route": (route_code or "").strip() or None,
                 "dclink": int(customer["DCLink"]),
                 "account": customer["Account"],
@@ -132,8 +144,10 @@ def write_contact_log(
         ).scalar()
         db.commit()
         logger.info(
-            "contact-log: %s %s/%s by %s (route=%s)",
-            outcome, customer_account, call_date.isoformat(), username, route_code,
+            "contact-log: %s %s/call=%s/delivery=%s by %s (route=%s)",
+            outcome, customer_account, call_date.isoformat(),
+            delivery_date.isoformat() if delivery_date else "-",
+            username, route_code,
         )
         return int(row) if row is not None else None
     except Exception as e:
@@ -147,6 +161,46 @@ def write_contact_log(
         if swallow_db_errors:
             return None
         raise ContactLogError(str(e)) from e
+
+
+def fetch_latest_in_delivery_range(
+    db: Session,
+    *,
+    from_date: date,
+    to_date: date,
+) -> list[dict]:
+    """Latest outcome row per customer whose dDeliveryDate falls inside
+    [from_date, to_date] inclusive. Used by the Deliveries report Reason
+    column — the whole point of filtering on dDeliveryDate (not dCallDate)
+    is so a NO_ORDER logged on the 27th for a 28th call list shows up when
+    the report is scoped to the 28th. Rows with NULL dDeliveryDate (pre-
+    migration data) are intentionally excluded; the user can backfill via
+    the template in create_views.sql."""
+    rows = db.execute(
+        text(f"""
+            SELECT cCustomerAccount AS account,
+                   iCustomerDCLink  AS dclink,
+                   cOutcome         AS outcome,
+                   cNote            AS note,
+                   dFollowUpDate    AS follow_up_date,
+                   cOrderNum        AS order_no,
+                   iAgentID         AS agent_id,
+                   cUsername        AS username,
+                   dtCreatedAt      AS created_at
+            FROM (
+                SELECT *,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY cCustomerAccount
+                           ORDER BY dtCreatedAt DESC, idContactLog DESC
+                       ) AS rn
+                FROM {CONTACT_LOG_TABLE}
+                WHERE dDeliveryDate BETWEEN :from_date AND :to_date
+            ) t
+            WHERE t.rn = 1
+        """),
+        {"from_date": from_date, "to_date": to_date},
+    ).mappings().all()
+    return [dict(r) for r in rows]
 
 
 def fetch_latest_for_date(

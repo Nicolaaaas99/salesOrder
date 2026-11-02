@@ -38,6 +38,9 @@ export type InventoryItem = {
   available: number;
   warehouse_codes: string[];
   pack_size: number;
+  /** StkItem.ulIIMainCategory — populated so the Target form can
+   *  auto-fill a Category chip when the user picks a stock. */
+  category: string;
 };
 
 export type CustomerPrice = {
@@ -201,7 +204,15 @@ export type CustomerDealItem = {
 
 // ---------- Analytics — Customer History (lazy-loaded pivot) ----------
 
-export type PivotLevel = "routes" | "customers" | "categories" | "stocks";
+/** Dimension codes available in the pivot hierarchy. Must stay in sync
+ *  with the backend's _DIMENSIONS list in analytics.py. */
+export type PivotDim =
+  | "route"
+  | "salesrep"
+  | "telesales"
+  | "customer"
+  | "category"
+  | "stock";
 
 export type PivotWeekCell = {
   amount: number;
@@ -218,17 +229,39 @@ export type PivotRow = {
   total_amount: number;
   total_litres: number;
   last_sale_date: string | null;
+  /** Customer-coverage stats for this bucket. stale = count of customers
+   *  with no sales in the last 14 days (null safe: 0 when total_count is 0). */
+  stale_count: number;
+  total_count: number;
 };
 
 export type PivotLevelResponse = {
-  level: PivotLevel;
+  /** The dim code of this level (echoes path[depth]). */
+  level: PivotDim;
   rows: PivotRow[];
 };
 
-export type PivotLevelFilters = {
-  route?: string;
-  account?: string;
-  category?: string;
+/** One invoice / credit-note line within a bucket's scope. Returned by
+ *  `/analytics/transactions`. Open sales orders are excluded so the
+ *  totals match the pivot grid. */
+export type HistoryTransaction = {
+  tx_date: string;        // ISO yyyy-mm-dd
+  order_no: string;
+  id: string;             // 'OInv' | 'Inv' | 'Crn'
+  customer_account: string;
+  customer_name: string;
+  category: string | null;
+  stock_code: string;
+  stock_desc: string;
+  quantity: number;
+  litre: number;
+  excl_amount: number;
+  vat: number;
+  incl_amount: number;
+};
+
+export type TransactionListResponse = {
+  transactions: HistoryTransaction[];
 };
 
 
@@ -261,6 +294,10 @@ export type ContactLogCreate = {
   outcome: ContactOutcomeModal;
   note?: string | null;
   follow_up_date?: string | null;
+  /** Session's planned delivery date — stored as `dDeliveryDate` so the
+   *  Deliveries report can filter outcomes by the day the rep was
+   *  prepping for (not necessarily today). */
+  delivery_date?: string | null;
   source_app?: string;
 };
 
@@ -286,4 +323,147 @@ export type OrderSuggestion = {
   warehouse_codes: string[];
   pack_size: number;
   price_source: string;   // 'Customer Deal' | 'Group Deal' | 'Price List' | 'None'
+};
+
+
+// ---------- Customer-assignment maintenance ----------
+
+export type RouteOption = { route: string };
+export type TelesaleOption = { telesale: string };
+export type SalesRepOption = { id: number; code: string; name: string };
+export type CategoryOption = { category: string };
+/** Merged list of anyone the app has ever seen as an agent — audit
+ *  users ∪ SalesRep.Code ∪ _rtblAgents.cAgentName. Used by the target
+ *  form so non-rep logins (admins, team leads) can be targets too. */
+export type AllAgentOption = {
+  username: string;
+  label: string;
+  source: "audit" | "salesrep" | "agent";
+};
+
+/** Single picker option for the Target form's "Placed by" dropdown.
+ *  `id` is `_rtblAgents.idAgents` — the stable key sent on save and
+ *  used for measurement; `name` is `cAgentName` for display. */
+export type AgentOption = {
+  id: number;
+  name: string;
+};
+
+export type CustomerAssignment = {
+  account: string;
+  name: string;
+  route: string | null;
+  telesale: string | null;
+  salesrep_id: number | null;
+  salesrep_code: string | null;
+  on_hold: boolean;
+};
+
+export type CustomerAssignmentUpdate = {
+  route?: string | null;
+  telesale?: string | null;
+  salesrep_id?: number | null;
+  on_hold: boolean;
+  note?: string | null;
+};
+
+/** Bulk-edit payload. Per-field `update_*` flags are required so an
+ *  untouched field leaves each customer's existing value alone. */
+export type CustomerBulkAssignmentUpdate = {
+  accounts: string[];
+  route?: string | null;
+  update_route: boolean;
+  telesale?: string | null;
+  update_telesale: boolean;
+  salesrep_id?: number | null;
+  update_salesrep: boolean;
+  on_hold: boolean;
+  update_on_hold: boolean;
+  note?: string | null;
+};
+
+export type CustomerBulkAssignmentResult = {
+  updated_count: number;
+};
+
+
+// ---------- Agent performance strip (Order Assistant top bar) ----------
+
+export type PerformanceWindow = {
+  today: number;
+  week: number;   // Sunday-to-Saturday, anchored on the current week's Sunday
+  month: number;  // Calendar month to date
+};
+
+export type AgentPerformance = {
+  litres: PerformanceWindow;
+  customers_called: PerformanceWindow;
+};
+
+
+// ---------- Litre targets (Analytics → Performance + Order Assistant bar) ----------
+
+export type TargetPeriod = "DAILY" | "WEEKLY" | "MONTHLY" | "CUSTOM";
+
+/** Server-side scope-kind classification. Returned so the Performance
+ *  screen can group / filter without recomputing the dim combination
+ *  logic in the client. */
+export type TargetScopeKind =
+  | "agent"
+  | "telesales"
+  | "sales_rep"
+  | "route"
+  | "customer"
+  | "category"
+  | "stock"
+  | "compound";
+
+export type Target = {
+  id: number;
+  /** _rtblAgents.idAgents — preferred over `username` for the
+   *  "Placed by" axis. Stable across casing drift. Null for legacy
+   *  rows written before this column existed. */
+  agent_id: number | null;
+  username: string | null;
+  telesale: string | null;
+  sales_rep: string | null;
+  route: string | null;
+  customer_account: string | null;
+  category: string | null;
+  stock_code: string | null;
+  period: TargetPeriod;
+  target_litres: number;
+  effective_from: string;        // yyyy-mm-dd
+  effective_to: string | null;   // yyyy-mm-dd or null
+  created_by: string;
+  created_at: string;            // ISO datetime
+};
+
+export type TargetWithActual = Target & {
+  actual_litres: number;
+  progress_pct: number;          // 0..∞ (frontend caps the bar at 100 %)
+  window_from: string;           // yyyy-mm-dd — the measurement window used
+  window_to: string;
+};
+
+export type TargetListResponse = {
+  targets: TargetWithActual[];
+};
+
+/** POST / PATCH body. Shape intentionally mirrors the Pydantic
+ *  `TargetBase` — any combination of scope dims is allowed, server
+ *  enforces "at least one". */
+export type TargetUpsert = {
+  agent_id?: number | null;
+  username?: string | null;
+  telesale?: string | null;
+  sales_rep?: string | null;
+  route?: string | null;
+  customer_account?: string | null;
+  category?: string | null;
+  stock_code?: string | null;
+  period: TargetPeriod;
+  target_litres: number;
+  effective_from: string;
+  effective_to?: string | null;
 };

@@ -64,67 +64,168 @@ def _date_column(by: str) -> str:
     return {"order": "OrderDate", "delivery": "DeliveryDate"}[by]
 
 
+def _resolve_range(
+    on_date: Optional[date],
+    from_date: Optional[date],
+    to_date: Optional[date],
+) -> tuple[date, date]:
+    """Collapse the three date query params into a (from, to) tuple.
+
+    Precedence: explicit range (from+to) wins; else single-day (on_date);
+    else default both to today. Swaps if the caller gave them in reverse."""
+    if from_date is not None and to_date is not None:
+        return (from_date, to_date) if from_date <= to_date else (to_date, from_date)
+    single = on_date or date.today()
+    return single, single
+
+
+# Contact-log table went live on this date; rows for earlier dates must
+# render blank in the Reason column (not "Not contacted"), since the
+# feature simply didn't exist. Keep in sync with the frontend constant in
+# DeliveriesScreen.tsx.
+_CONTACT_LOG_START_DATE = date(2026, 10, 26)
+
+
 @router.get("/export-orders-per-day")
 def export_orders_per_day(
-    on_date: date = Query(default_factory=date.today, alias="date"),
+    on_date: Optional[date] = Query(None, alias="date"),
+    from_date: Optional[date] = Query(None, alias="from"),
+    to_date: Optional[date] = Query(None, alias="to"),
     by: str = Query("order", pattern="^(order|delivery)$"),
     db: Session = Depends(get_db),
 ):
-    """Download an .xlsx workbook of every active, routed customer with their
-    order count for the given day — zero-count customers included."""
+    """Download an .xlsx of every active, routed customer × date in the
+    range. One row per customer per date (so a 3-day range × 500 customers
+    = 1500 rows). Columns: Date · Route · Account · Customer · NoOfOrders
+    · Reason. Zero-order rows kept so the Reason column tells the full
+    coverage story. Pass `from=&to=` or just `date=`."""
     # Deferred import so the module still loads if openpyxl isn't installed
     # (e.g. a stale venv) — only this endpoint would 500 until pip install.
     from openpyxl import Workbook
     from openpyxl.styles import Font
 
+    frm, to = _resolve_range(on_date, from_date, to_date)
     date_col = _date_column(by)
-    sql = f"""
-        -- All active, routed customers on the LEFT so zero-order customers
-        -- still appear. Order counts come from InvNum directly so we can
-        -- swap OrderDate for DeliveryDate based on the `by` argument.
-        SELECT
-            cl.ulARRoute          AS route,
-            cl.Account            AS account,
-            cl.Name               AS customer_name,
-            ISNULL(opd.order_count, 0) AS order_count
-        FROM dbo.Client cl
-        LEFT JOIN (
-            SELECT NUM.AccountID AS DCLink,
-                   COUNT(NUM.OrderNum) AS order_count
+
+    # 1. Customer master — one row per active, routed customer.
+    customers = db.execute(
+        text("""
+            SELECT ulARRoute AS route, Account AS account, Name AS customer_name
+            FROM dbo.Client
+            WHERE ISNULL(On_Hold, 0) = 0
+              AND ulARRoute IS NOT NULL
+              AND LTRIM(RTRIM(ulARRoute)) <> ''
+        """)
+    ).mappings().all()
+
+    # 2. Per-(account, date) order counts across the range. COUNT DISTINCT
+    # OrderNum so a split order (Evolution creates multiple InvNum rows
+    # sharing the same OrderNum when partially processed) only counts once.
+    order_rows = db.execute(
+        text(f"""
+            SELECT CL.Account                        AS account,
+                   CAST(NUM.{date_col} AS DATE)       AS tx_date,
+                   COUNT(DISTINCT NUM.OrderNum)      AS order_count
             FROM dbo.InvNum NUM
+            JOIN dbo.Client CL ON CL.DCLink = NUM.AccountID
             WHERE NUM.DocType = 4
               AND NUM.DocState IN (1, 3, 4)
-              AND CAST(NUM.{date_col} AS DATE) = :on_date
-            GROUP BY NUM.AccountID
-        ) opd ON opd.DCLink = cl.DCLink
-        WHERE ISNULL(cl.On_Hold, 0) = 0
-          AND cl.ulARRoute IS NOT NULL
-          AND LTRIM(RTRIM(cl.ulARRoute)) <> ''
-        ORDER BY cl.ulARRoute, cl.Name
-    """
-    rows = db.execute(text(sql), {"on_date": on_date}).mappings().all()
+              AND CAST(NUM.{date_col} AS DATE) BETWEEN :from_date AND :to_date
+            GROUP BY CL.Account, CAST(NUM.{date_col} AS DATE)
+        """),
+        {"from_date": frm, "to_date": to},
+    ).mappings().all()
+    counts_by_key: dict[tuple[str, date], int] = {
+        ((r["account"] or "").strip(), r["tx_date"]): int(r["order_count"] or 0)
+        for r in order_rows
+    }
+
+    # 3. Latest contact-log outcome per (customer, delivery-date) in the
+    # range. Keyed on dDeliveryDate (not dCallDate) so a NO_ORDER logged
+    # on the 27th for a 28th-delivery call list lands in the 28 Oct row
+    # of the export where the user expects to see it. Partitioning by
+    # (customer, delivery-date) — not just customer — so each daily row
+    # carries that day's reason, not a bleed-through from a later day.
+    # Rows with NULL dDeliveryDate (pre-migration data) are excluded.
+    outcome_rows = db.execute(
+        text("""
+            SELECT cCustomerAccount AS account,
+                   dDeliveryDate    AS delivery_date,
+                   cOutcome         AS outcome
+            FROM (
+                SELECT *,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY cCustomerAccount, dDeliveryDate
+                           ORDER BY dtCreatedAt DESC, idContactLog DESC
+                       ) AS rn
+                FROM [SOAssistant].dbo._tb_SOCustomerContactLog
+                WHERE dDeliveryDate BETWEEN :from_date AND :to_date
+            ) t
+            WHERE t.rn = 1
+        """),
+        {"from_date": frm, "to_date": to},
+    ).mappings().all()
+    outcomes_by_key: dict[tuple[str, date], str] = {
+        ((r["account"] or "").strip(), r["delivery_date"]): (r["outcome"] or "").strip()
+        for r in outcome_rows
+    }
+
+    # 4. Build the dense (customer × date) grid. Reason values are
+    # uppercase to match the native DB outcome strings (NO_ORDER / CALLBACK
+    # / NO_ANSWER / REFUSED) — makes the column grep/filter-friendly in
+    # Excel. The on-screen chip uses title-case for readability; the
+    # export favours consistency.
+    def _reason(count: int, outcome: Optional[str], d: date) -> str:
+        if count > 0 or outcome == "PLACED":
+            return "PLACED"
+        if outcome:
+            return outcome
+        if d >= _CONTACT_LOG_START_DATE:
+            return "NOT_CONTACTED"
+        return ""  # pre-feature — don't label
+
+    all_dates: list[date] = []
+    cursor = frm
+    while cursor <= to:
+        all_dates.append(cursor)
+        cursor += timedelta(days=1)
 
     wb = Workbook()
     ws = wb.active
     date_label = "DeliveryDate" if by == "delivery" else "OrderDate"
-    ws.title = f"Orders {on_date.isoformat()}"
+    range_label = frm.isoformat() if frm == to else f"{frm.isoformat()} to {to.isoformat()}"
+    ws.title = f"Orders {range_label}"[:31]  # Excel caps sheet names at 31 chars
 
-    headers = [date_label, "Route", "CustomerAccount", "CustomerName", "NoOfOrders"]
+    headers = [date_label, "Route", "CustomerAccount", "CustomerName", "NoOfOrders", "Reason"]
     ws.append(headers)
     for cell in ws[1]:
         cell.font = Font(bold=True)
 
-    for r in rows:
-        ws.append([
-            on_date.isoformat(),
-            (r["route"] or "").strip(),
-            (r["account"] or "").strip(),
-            (r["customer_name"] or "").strip(),
-            int(r["order_count"] or 0),
-        ])
+    # Sort customers once; emit day-by-day so the sheet reads as date
+    # blocks top-to-bottom. Within each date, Route then Customer name.
+    customers_sorted = sorted(
+        customers,
+        key=lambda r: ((r["route"] or "").strip(), (r["customer_name"] or "").strip()),
+    )
+
+    for d in all_dates:
+        for c in customers_sorted:
+            route = (c["route"] or "").strip()
+            account = (c["account"] or "").strip()
+            name = (c["customer_name"] or "").strip()
+            count = counts_by_key.get((account, d), 0)
+            outcome = outcomes_by_key.get((account, d))
+            ws.append([
+                d.isoformat(),
+                route,
+                account,
+                name,
+                count,
+                _reason(count, outcome, d),
+            ])
 
     # Reasonable default column widths (approximate — openpyxl uses char units).
-    for col_letter, width in zip(("A", "B", "C", "D", "E"), (12, 20, 18, 48, 12)):
+    for col_letter, width in zip(("A", "B", "C", "D", "E", "F"), (12, 20, 18, 48, 12, 16)):
         ws.column_dimensions[col_letter].width = width
     ws.freeze_panes = "A2"
 
@@ -132,7 +233,11 @@ def export_orders_per_day(
     wb.save(buf)
     buf.seek(0)
 
-    filename = f"orders-per-day-{on_date.isoformat()}.xlsx"
+    filename = (
+        f"orders-per-day-{frm.isoformat()}.xlsx"
+        if frm == to
+        else f"orders-per-day-{frm.isoformat()}_to_{to.isoformat()}.xlsx"
+    )
     return StreamingResponse(
         buf,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -143,29 +248,37 @@ def export_orders_per_day(
 @router.get("/orders-today", response_model=List[schemas.CustomerOrderCount])
 def list_orders_today(
     route: Optional[str] = Query(None),
-    on_date: date = Query(default_factory=date.today, alias="date"),
+    on_date: Optional[date] = Query(None, alias="date"),
+    from_date: Optional[date] = Query(None, alias="from"),
+    to_date: Optional[date] = Query(None, alias="to"),
     by: str = Query("order", pattern="^(order|delivery)$"),
     db: Session = Depends(get_db),
 ):
-    """Order counts per customer for a single calendar day. Defaults to today.
-    `by=order` (default) counts by OrderDate — used by the Order Assistant pill.
-    `by=delivery` counts by DeliveryDate — used by the Route Overview summary.
-    `route` optional: when omitted, counts are returned across all customers
-    so the Order Assistant can show the "placed today" check mark even before
-    the rep has picked a route."""
+    """Order counts per customer across a date range (inclusive). Pass
+    `from=&to=` for a range or `date=` for a single day; if neither is
+    passed, defaults to today.
+    `by=order` counts by OrderDate — Order Assistant pill (always single-day).
+    `by=delivery` counts by DeliveryDate — Deliveries report (range-capable).
+    `route` optional: omit to count across all customers (used by the
+    Order Assistant's "placed today" check-mark before a route is picked)."""
+    frm, to = _resolve_range(on_date, from_date, to_date)
     date_col = _date_column(by)
     where = [
         "NUM.DocType = 4",
         "NUM.DocState IN (1, 3, 4)",
-        f"CAST(NUM.{date_col} AS DATE) = :on_date",
+        f"CAST(NUM.{date_col} AS DATE) BETWEEN :from_date AND :to_date",
     ]
-    params: dict = {"on_date": on_date}
+    params: dict = {"from_date": frm, "to_date": to}
     if route and route.strip():
         where.append("LTRIM(RTRIM(CL.ulARRoute)) = :route")
         params["route"] = route.strip()
 
+    # COUNT DISTINCT OrderNum (not COUNT rows): Evolution splits a
+    # partially-processed order into multiple InvNum rows sharing the same
+    # OrderNum, so plain COUNT would double-count a split order. The user
+    # sees one logical order, not the fulfilment slices.
     sql = f"""
-        SELECT CL.Account AS account, COUNT(NUM.OrderNum) AS order_count
+        SELECT CL.Account AS account, COUNT(DISTINCT NUM.OrderNum) AS order_count
         FROM dbo.InvNum NUM
         JOIN dbo.Client CL ON CL.DCLink = NUM.AccountID
         WHERE {' AND '.join(where)}

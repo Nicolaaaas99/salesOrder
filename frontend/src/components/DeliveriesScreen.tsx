@@ -3,6 +3,7 @@ import Select from "react-select";
 import { Truck, Calendar, XCircle, FileText, ArrowLeft, Search, ListOrdered, Download } from "lucide-react";
 import { api } from "../api/client";
 import type {
+  ContactOutcome,
   CustomerDetail,
   HistoricalOrder,
   OrderSuggestion,
@@ -19,8 +20,28 @@ import { fmtCurrency } from "../utils/format";
 import { useAuth } from "../context/AuthContext";
 
 type Option = { value: string; label: string };
-type CustomerRow = { id: string; display: string; ordersOnDate: number };
+type CustomerRow = {
+  id: string;
+  display: string;
+  ordersInRange: number;
+  /** Latest contact-log outcome for this customer across the chosen range,
+   *  or null if there's no row. The column renderer decides between
+   *  "Placed" / outcome chip / "Not contacted" / "—". */
+  outcome: ContactOutcome | null;
+};
 type OrderFilter = "all" | "with" | "without";
+
+/** The contact-log table went live on this date. Before this, no row ≠
+ *  "not contacted" — the system simply wasn't recording. The Reason
+ *  column shows a muted dash with a tooltip for ranges that end before
+ *  this date, so historical data isn't mislabelled. */
+const CONTACT_LOG_START_DATE = "2026-10-26";
+
+/** Format a (from, to) pair for display. Collapses to a single date when
+ *  the two bounds match. */
+function fmtRange(from: string, to: string): string {
+  return from === to ? from : `${from} to ${to}`;
+}
 
 
 const selectStyles = {
@@ -52,19 +73,23 @@ const selectStyles = {
   }),
 };
 
-type RouteDeliveriesProps = {
+type DeliveriesProps = {
   /** Called when the user clicks "Go to source" on an order in the orders
    *  modal — opens the order in the Sales Order Entry tab for editing. */
   onOpenOrder?: (orderNo: string) => void;
-  /** Return to the Route Overview hub (closes this screen). */
+  /** Return to the Analytics hub (closes this screen). */
   onBack?: () => void;
 };
 
-export function RouteDeliveriesScreen({ onOpenOrder, onBack }: RouteDeliveriesProps = {}) {
+export function DeliveriesScreen({ onOpenOrder, onBack }: DeliveriesProps = {}) {
   const { sessionDate } = useAuth();
   const [routes, setRoutes] = useState<Option[]>([]);
   const [selectedRoute, setSelectedRoute] = useState<Option | null>(null);
-  const [selectedDate, setSelectedDate] = useState<string>(today());
+  // Date range. Default both to today so the screen opens looking the
+  // same as the old single-day view. The pickers enforce from ≤ to so
+  // the user can't invert the range by hand.
+  const [fromDate, setFromDate] = useState<string>(today());
+  const [toDate, setToDate] = useState<string>(today());
   const [customers, setCustomers] = useState<CustomerRow[]>([]);
   // Bumped after any order mutation so all route/date-scoped fetches re-run
   // and drop the stale row from counts, lists, and the drill-in panel.
@@ -128,7 +153,9 @@ export function RouteDeliveriesScreen({ onOpenOrder, onBack }: RouteDeliveriesPr
     })();
   }, []);
 
-  // Fetch customers + order counts whenever route or date changes.
+  // Fetch customers + order counts + latest contact-log outcome whenever
+  // route or date-range changes. Three parallel calls; the contact log
+  // one is new and powers the Reason column.
   useEffect(() => {
     if (!selectedRoute) {
       setCustomers([]);
@@ -138,15 +165,18 @@ export function RouteDeliveriesScreen({ onOpenOrder, onBack }: RouteDeliveriesPr
       setIsLoadingCustomers(true);
       setError(null);
       try {
-        const [custs, counts] = await Promise.all([
+        const [custs, counts, outcomes] = await Promise.all([
           api.listHistoryCustomers(selectedRoute.value),
-          api.listCustomerOrdersToday(selectedRoute.value, selectedDate, "delivery"),
+          api.listCustomerOrdersInRange(selectedRoute.value, fromDate, toDate, "delivery"),
+          api.listOutcomesInRange(fromDate, toDate),
         ]);
         const countMap = new Map(counts.map((c) => [c.account, c.order_count]));
+        const outcomeMap = new Map(outcomes.map((o) => [o.account, o.outcome]));
         const merged: CustomerRow[] = custs.map((c) => ({
           id: c.id,
           display: c.display,
-          ordersOnDate: countMap.get(c.id) ?? 0,
+          ordersInRange: countMap.get(c.id) ?? 0,
+          outcome: outcomeMap.get(c.id) ?? null,
         }));
         setCustomers(merged);
       } catch {
@@ -155,7 +185,7 @@ export function RouteDeliveriesScreen({ onOpenOrder, onBack }: RouteDeliveriesPr
         setIsLoadingCustomers(false);
       }
     })();
-  }, [selectedRoute, selectedDate, refreshKey]);
+  }, [selectedRoute, fromDate, toDate, refreshKey]);
 
   // Fetch history/suggestions/detail when drilling into a customer. Also fetch
   // the orders for the selected date so the right-side panel can list them
@@ -177,7 +207,7 @@ export function RouteDeliveriesScreen({ onOpenOrder, onBack }: RouteDeliveriesPr
           api.listOrderSuggestions(drillCustomer.id, sessionDate!),
           api.getCustomer(drillCustomer.id).catch(() => null),
           api
-            .listOrdersByOrderDate(drillCustomer.id, selectedDate, "delivery")
+            .listOrdersByDateRange(drillCustomer.id, fromDate, toDate, "delivery")
             .catch(() => [] as SalesOrderSearchResult[]),
         ]);
         setOrders(ordersData);
@@ -190,9 +220,9 @@ export function RouteDeliveriesScreen({ onOpenOrder, onBack }: RouteDeliveriesPr
         setIsLoadingOrders(false);
       }
     })();
-  }, [drillCustomer, selectedDate, refreshKey, sessionDate]);
+  }, [drillCustomer, fromDate, toDate, refreshKey, sessionDate]);
 
-  // Fetch orders for the chosen customer+date when the modal opens.
+  // Fetch orders for the chosen customer+range when the modal opens.
   useEffect(() => {
     if (!viewingOrdersFor) {
       setOrderList([]);
@@ -201,7 +231,7 @@ export function RouteDeliveriesScreen({ onOpenOrder, onBack }: RouteDeliveriesPr
     (async () => {
       setIsLoadingOrderList(true);
       try {
-        const data = await api.listOrdersByOrderDate(viewingOrdersFor.id, selectedDate, "delivery");
+        const data = await api.listOrdersByDateRange(viewingOrdersFor.id, fromDate, toDate, "delivery");
         setOrderList(data);
       } catch {
         setOrderList([]);
@@ -209,7 +239,7 @@ export function RouteDeliveriesScreen({ onOpenOrder, onBack }: RouteDeliveriesPr
         setIsLoadingOrderList(false);
       }
     })();
-  }, [viewingOrdersFor, selectedDate, refreshKey]);
+  }, [viewingOrdersFor, fromDate, toDate, refreshKey]);
 
   const suggestionsMap = useMemo(() => {
     const m = new Map<string, OrderSuggestion>();
@@ -223,8 +253,8 @@ export function RouteDeliveriesScreen({ onOpenOrder, onBack }: RouteDeliveriesPr
     const term = search.trim().toLowerCase();
     return customers
       .filter((c) => {
-        if (orderFilter === "with") return c.ordersOnDate > 0;
-        if (orderFilter === "without") return c.ordersOnDate === 0;
+        if (orderFilter === "with") return c.ordersInRange > 0;
+        if (orderFilter === "without") return c.ordersInRange === 0;
         return true;
       })
       .filter((c) =>
@@ -235,8 +265,8 @@ export function RouteDeliveriesScreen({ onOpenOrder, onBack }: RouteDeliveriesPr
       )
       .sort((a, b) => {
         // Customers with orders first, then alphabetical
-        if ((a.ordersOnDate > 0) !== (b.ordersOnDate > 0)) {
-          return a.ordersOnDate > 0 ? -1 : 1;
+        if ((a.ordersInRange > 0) !== (b.ordersInRange > 0)) {
+          return a.ordersInRange > 0 ? -1 : 1;
         }
         return a.display.localeCompare(b.display);
       });
@@ -245,7 +275,7 @@ export function RouteDeliveriesScreen({ onOpenOrder, onBack }: RouteDeliveriesPr
   async function handleExport() {
     setIsExporting(true);
     try {
-      await api.exportOrdersPerDayXlsx(selectedDate, "delivery");
+      await api.exportOrdersPerDayXlsx(fromDate, toDate, "delivery");
     } catch (e: any) {
       setError(`Export failed: ${e?.message ?? e}`);
     } finally {
@@ -254,13 +284,16 @@ export function RouteDeliveriesScreen({ onOpenOrder, onBack }: RouteDeliveriesPr
   }
 
   const totalOrders = useMemo(
-    () => customers.reduce((sum, c) => sum + c.ordersOnDate, 0),
+    () => customers.reduce((sum, c) => sum + c.ordersInRange, 0),
     [customers]
   );
   const customersWithOrders = useMemo(
-    () => customers.filter((c) => c.ordersOnDate > 0).length,
+    () => customers.filter((c) => c.ordersInRange > 0).length,
     [customers]
   );
+
+  const rangeLabel = fmtRange(fromDate, toDate);
+  const showNotContactedChip = toDate >= CONTACT_LOG_START_DATE;
 
   return (
     <div className="h-full bg-gray-50 p-2 flex flex-col">
@@ -302,15 +335,37 @@ export function RouteDeliveriesScreen({ onOpenOrder, onBack }: RouteDeliveriesPr
           <div className="bg-white rounded border p-2 shadow-sm w-44">
             <label className="flex items-center font-semibold text-gray-800 mb-1 text-xs">
               <Calendar className="w-3 h-3 mr-1 text-blue-600" />
-              Delivery Date
+              Delivery From
             </label>
-            <DateInput value={selectedDate} onChange={setSelectedDate} />
+            <DateInput
+              value={fromDate}
+              onChange={(v) => {
+                setFromDate(v);
+                // Keep from ≤ to; if the user pushed From past To, drag To along.
+                if (v > toDate) setToDate(v);
+              }}
+            />
+          </div>
+
+          <div className="bg-white rounded border p-2 shadow-sm w-44">
+            <label className="flex items-center font-semibold text-gray-800 mb-1 text-xs">
+              <Calendar className="w-3 h-3 mr-1 text-blue-600" />
+              Delivery To
+            </label>
+            <DateInput
+              value={toDate}
+              onChange={(v) => {
+                setToDate(v);
+                // Mirror: if To slips before From, pull From back.
+                if (v < fromDate) setFromDate(v);
+              }}
+            />
           </div>
 
           <button
             onClick={handleExport}
             disabled={isExporting}
-            title="Download an .xlsx workbook of order counts for every route on this date"
+            title="Download an .xlsx workbook of order counts for every route in this date range"
             className="inline-flex items-center gap-1.5 px-4 py-1.5 text-xs font-semibold bg-emerald-600 text-white rounded-md shadow-sm hover:bg-emerald-700 disabled:opacity-60 disabled:cursor-not-allowed self-center"
           >
             <Download className="w-3.5 h-3.5" />
@@ -338,6 +393,7 @@ export function RouteDeliveriesScreen({ onOpenOrder, onBack }: RouteDeliveriesPr
             totalOrders={totalOrders}
             customersWithOrders={customersWithOrders}
             totalCustomers={customers.length}
+            showNotContactedChip={showNotContactedChip}
             onDrillIn={(c) => setDrillCustomer(c)}
             onViewOrders={(c) => setViewingOrdersFor(c)}
           />
@@ -369,7 +425,7 @@ export function RouteDeliveriesScreen({ onOpenOrder, onBack }: RouteDeliveriesPr
                   <CustomerInfoPanel customer={customerDetail} />
                 </div>
                 <OrdersOnDatePanel
-                  date={selectedDate}
+                  date={rangeLabel}
                   orders={drillOrders}
                   onViewOrder={(no) => setViewingSummaryOf(no)}
                 />
@@ -382,7 +438,7 @@ export function RouteDeliveriesScreen({ onOpenOrder, onBack }: RouteDeliveriesPr
       {viewingOrdersFor && (
         <OrdersModal
           customer={viewingOrdersFor}
-          date={selectedDate}
+          date={rangeLabel}
           orders={orderList}
           isLoading={isLoadingOrderList}
           onClose={() => setViewingOrdersFor(null)}
@@ -422,6 +478,54 @@ export function RouteDeliveriesScreen({ onOpenOrder, onBack }: RouteDeliveriesPr
   );
 }
 
+/** One Reason-column cell. Mirrors the Order Assistant dropdown-dot
+ *  colours exactly (see outcomeDot in OrderAssistantScreen.tsx):
+ *    • green  → placed (any orders in range OR PLACED log row)
+ *    • yellow → contacted but no order (NO_ORDER / CALLBACK / NO_ANSWER / REFUSED)
+ *    • red    → no log row and no orders → "Not contacted"
+ *  For ranges that end before the contact-log table went live, we render
+ *  a muted dash instead of the red chip so historical data isn't
+ *  mislabelled. */
+function ReasonChip({
+  outcome,
+  hasOrders,
+  showNotContacted,
+}: {
+  outcome: ContactOutcome | null;
+  hasOrders: boolean;
+  showNotContacted: boolean;
+}) {
+  if (hasOrders || outcome === "PLACED") {
+    return (
+      <span className="inline-flex text-[10px] font-semibold bg-emerald-100 text-emerald-800 border border-emerald-300 px-2 py-0.5 rounded-full">
+        Placed
+      </span>
+    );
+  }
+  if (outcome) {
+    return (
+      <span className="inline-flex text-[10px] font-semibold bg-amber-100 text-amber-800 border border-amber-300 px-2 py-0.5 rounded-full">
+        {outcome}
+      </span>
+    );
+  }
+  if (!showNotContacted) {
+    return (
+      <span
+        className="text-gray-300"
+        title={`Contact log started on ${CONTACT_LOG_START_DATE} — no data for earlier dates`}
+      >
+        —
+      </span>
+    );
+  }
+  return (
+    <span className="inline-flex text-[10px] font-semibold bg-red-100 text-red-800 border border-red-300 px-2 py-0.5 rounded-full">
+      Not contacted
+    </span>
+  );
+}
+
 type RouteSummaryProps = {
   selectedRoute: Option | null;
   customers: CustomerRow[];
@@ -433,6 +537,10 @@ type RouteSummaryProps = {
   totalOrders: number;
   customersWithOrders: number;
   totalCustomers: number;
+  /** False when the chosen range ends before the contact-log feature went
+   *  live. In that case the Reason column renders a muted dash for
+   *  customers with no log row, instead of a misleading "Not contacted". */
+  showNotContactedChip: boolean;
   onDrillIn: (c: { id: string; display: string }) => void;
   onViewOrders: (c: { id: string; display: string }) => void;
 };
@@ -448,6 +556,7 @@ function RouteSummary({
   totalOrders,
   customersWithOrders,
   totalCustomers,
+  showNotContactedChip,
   onDrillIn,
   onViewOrders,
 }: RouteSummaryProps) {
@@ -523,6 +632,9 @@ function RouteSummary({
                 <th className="text-center px-3 py-1.5 font-semibold w-32">
                   Orders
                 </th>
+                <th className="text-center px-3 py-1.5 font-semibold w-40">
+                  Reason
+                </th>
                 <th className="w-28"></th>
               </tr>
             </thead>
@@ -535,7 +647,7 @@ function RouteSummary({
                   <td className="px-3 py-1.5 font-mono text-gray-800">{c.id}</td>
                   <td className="px-3 py-1.5 text-gray-900">{c.display}</td>
                   <td className="px-3 py-1.5 text-center">
-                    {c.ordersOnDate > 0 ? (
+                    {c.ordersInRange > 0 ? (
                       <button
                         onClick={(e) => {
                           e.stopPropagation();
@@ -545,11 +657,18 @@ function RouteSummary({
                         className="inline-flex items-center gap-1 text-[10px] font-semibold bg-amber-100 text-amber-800 border border-amber-300 px-2 py-0.5 rounded-full hover:bg-amber-200"
                       >
                         <ListOrdered className="w-3 h-3" />
-                        {c.ordersOnDate}
+                        {c.ordersInRange}
                       </button>
                     ) : (
                       <span className="text-gray-300">—</span>
                     )}
+                  </td>
+                  <td className="px-3 py-1.5 text-center">
+                    <ReasonChip
+                      outcome={c.outcome}
+                      hasOrders={c.ordersInRange > 0}
+                      showNotContacted={showNotContactedChip}
+                    />
                   </td>
                   <td className="px-3 py-1.5 text-right">
                     <button

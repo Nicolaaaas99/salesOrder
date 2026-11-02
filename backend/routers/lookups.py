@@ -1,12 +1,20 @@
 from typing import Dict, List, Optional
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from sqlalchemy import bindparam, text
 from sqlalchemy.orm import Session
 
-from auth import get_current_user
+from auth import get_current_user, require_min_role
 from database import get_db
 import schemas
 from services.pricing import resolve_customer_prices
+
+
+def _app_version(
+    x_app_version: Optional[str] = Header(None, alias="X-App-Version"),
+) -> Optional[str]:
+    """SPA build version header — stamped onto audit rows so we can tell
+    which client build made a change."""
+    return (x_app_version or "").strip()[:32] or None
 
 router = APIRouter(
     prefix="/lookups",
@@ -23,22 +31,61 @@ def _join_address(*parts) -> str:
 def list_customers(
     q: Optional[str] = Query(None),
     limit: int = Query(50, le=2000),
+    route: Optional[str] = Query(
+        None,
+        description="Restrict to customers on this route (Client.ulARRoute).",
+    ),
+    telesale: Optional[str] = Query(
+        None,
+        description="Restrict to customers with this telesales rep (Client.ulARTelesalesRep).",
+    ),
+    sales_rep: Optional[str] = Query(
+        None,
+        description=(
+            "Restrict to customers whose assigned SalesRep.Code matches "
+            "this value (joins Client.RepID → SalesRep.Code)."
+        ),
+    ),
     db: Session = Depends(get_db),
 ):
+    """Customer search for pickers. Optional dim filters narrow the list
+    so the Target form can offer only customers that match the other
+    scope dims the user has already set — no "always-zero" compound
+    targets."""
+    # The customer-side filters hit the underlying Client table (not the
+    # _vw_SOCustomers view, which already filters out On_Hold). We re-apply
+    # the On_Hold = 0 guard here to keep behaviour identical when none of
+    # the filters are set.
     sql = """
-        SELECT TOP (:limit) AccountCode AS account, CustomerName AS name
-        FROM [SOAssistant].dbo._vw_SOCustomers
-        WHERE AccountCode IS NOT NULL
-          AND CustomerName IS NOT NULL
-          AND (:like IS NULL OR AccountCode LIKE :like OR CustomerName LIKE :like)
-        ORDER BY CustomerName
+        SELECT TOP (:limit)
+            LTRIM(RTRIM(CL.Account)) AS account,
+            CL.Name                  AS name
+        FROM [BA_00_LPD_CON].dbo.Client CL
+        LEFT JOIN [BA_00_LPD_CON].dbo.SalesRep REP ON REP.idSalesRep = CL.RepID
+        WHERE ISNULL(CL.On_Hold, 0) = 0
+          AND CL.Account IS NOT NULL
+          AND CL.Name IS NOT NULL
+          AND (:like IS NULL OR CL.Account LIKE :like OR CL.Name LIKE :like)
+          AND (:route IS NULL
+               OR LTRIM(RTRIM(CL.ulARRoute)) = :route)
+          AND (:telesale IS NULL
+               OR LTRIM(RTRIM(ISNULL(CL.ulARTelesalesRep, ''))) = :telesale)
+          AND (:sales_rep IS NULL
+               OR LTRIM(RTRIM(ISNULL(REP.Code, ''))) = :sales_rep)
+        ORDER BY CL.Name
     """
     q_stripped = (q or "").strip()
     like = f"%{q_stripped}%" if q_stripped else None
-    rows = db.execute(text(sql), {"like": like, "limit": limit}).mappings().all()
-    # Null-guard: a customer row with a null name/account would otherwise fail
-    # the Pydantic `str` validation and surface as a 500 — more likely with the
-    # higher no-route limit (500) than the default (50).
+    rows = db.execute(
+        text(sql),
+        {
+            "like": like,
+            "limit": limit,
+            "route": (route or "").strip() or None,
+            "telesale": (telesale or "").strip() or None,
+            "sales_rep": (sales_rep or "").strip() or None,
+        },
+    ).mappings().all()
     return [
         schemas.CustomerSummary(
             account=(r["account"] or "").strip(),
@@ -167,6 +214,14 @@ def update_customer_contact(
 def list_inventory(
     q: Optional[str] = Query(None),
     limit: int = Query(50, le=200),
+    category: Optional[str] = Query(
+        None,
+        description=(
+            "Restrict to stock items in this category "
+            "(StkItem.ulIIMainCategory). Lets the Target form filter the "
+            "Stock dropdown once a Category chip is set."
+        ),
+    ),
     db: Session = Depends(get_db),
 ):
     sql = """
@@ -178,16 +233,26 @@ def list_inventory(
             MAX(Uom)                                             AS uom,
             MAX(DefaultTaxTypeId)                                AS default_tax_type_id,
             MAX(PackSize)                                        AS pack_size,
+            MAX(Category)                                        AS category,
             SUM(QtyOnHand)                                       AS available,
             STRING_AGG(WhseCode, ',') WITHIN GROUP (ORDER BY WhseCode) AS warehouse_codes
         FROM [SOAssistant].dbo._vw_SOInventory
         WHERE (:like IS NULL OR StockCode LIKE :like OR StockDesc LIKE :like)
+          AND (:category IS NULL
+               OR ISNULL(Category, '') = :category)
         GROUP BY StockCode
         ORDER BY StockCode
     """
     q_stripped = (q or "").strip()
     like = f"%{q_stripped}%" if q_stripped else None
-    rows = db.execute(text(sql), {"like": like, "limit": limit}).mappings().all()
+    rows = db.execute(
+        text(sql),
+        {
+            "like": like,
+            "limit": limit,
+            "category": (category or "").strip() or None,
+        },
+    ).mappings().all()
     return [
         schemas.InventoryItem(
             code=r["code"],
@@ -199,6 +264,7 @@ def list_inventory(
             available=float(r["available"] or 0),
             warehouse_codes=[c for c in (r["warehouse_codes"] or "").split(",") if c],
             pack_size=max(1, int(r["pack_size"] or 1)),
+            category=(r["category"] or "").strip(),
         )
         for r in rows
     ]
@@ -332,3 +398,543 @@ def list_settlement_terms(db: Session = Depends(get_db)):
     """
     rows = db.execute(text(sql)).mappings().all()
     return [schemas.SettlementTerm(**r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# Customer-assignment maintenance (Analytics → Customer Sales History → Edit)
+# ---------------------------------------------------------------------------
+
+@router.get("/route-options", response_model=List[schemas.RouteOption])
+def list_route_options(db: Session = Depends(get_db)):
+    """Every route the user-dict offers for Client.ulARRoute. Distinct from
+    `/history/routes` (which lists routes with at least one customer) —
+    this one includes a freshly-created INACTIVE option before anyone's
+    been reassigned."""
+    rows = db.execute(
+        text(
+            "SELECT DISTINCT Route FROM [SOAssistant].dbo._vw_SORouteOptions "
+            "ORDER BY Route"
+        )
+    ).mappings().all()
+    return [schemas.RouteOption(route=(r["Route"] or "").strip()) for r in rows]
+
+
+@router.get("/telesale-options", response_model=List[schemas.TelesaleOption])
+def list_telesale_options(db: Session = Depends(get_db)):
+    rows = db.execute(
+        text(
+            "SELECT DISTINCT Telesale FROM [SOAssistant].dbo._vw_SOTelesaleOptions "
+            "ORDER BY Telesale"
+        )
+    ).mappings().all()
+    return [schemas.TelesaleOption(telesale=(r["Telesale"] or "").strip()) for r in rows]
+
+
+@router.get("/category-options", response_model=List[schemas.CategoryOption])
+def list_category_options(db: Session = Depends(get_db)):
+    rows = db.execute(
+        text(
+            "SELECT DISTINCT Category FROM [SOAssistant].dbo._vw_SOCategoryOptions "
+            "ORDER BY Category"
+        )
+    ).mappings().all()
+    return [schemas.CategoryOption(category=(r["Category"] or "").strip()) for r in rows]
+
+
+@router.get("/agent-options", response_model=List[schemas.AgentOption])
+def list_agent_options(db: Session = Depends(get_db)):
+    """Agents who can own a "Placed by" target. Queries Evolution's
+    canonical `_rtblAgents` table directly — the login handle a user
+    types to sign into the app IS `cAgentName`, and `cAgentName` is
+    what gets stamped onto `_tb_SOOrderAssistantAudit.cUsername` on
+    every placed order. One row per logical person, no pseudo-
+    duplicates ("Brenda" / "Brendas", "Fridah" / "FridahR") because
+    the agent master doesn't carry the typos that the telesales
+    user-dict + historical audit rows do.
+
+    Filtered to active agents only (`bAgentActive = 1`). If someone
+    needs to appear here, add them as an agent in Evolution.
+
+    Returns `cAgentName` as `name`. The Target form's "Placed by" chip
+    always persists to `_tb_SOTargets.cUsername`; the measurement path
+    then matches audit rows by that exact string."""
+    rows = db.execute(
+        text(
+            """
+            SELECT idAgents AS id, LTRIM(RTRIM(cAgentName)) AS name
+            FROM [BA_00_LPD_CON].dbo._rtblAgents
+            WHERE bAgentActive = 1
+              AND cAgentName IS NOT NULL
+              AND LTRIM(RTRIM(cAgentName)) <> ''
+            ORDER BY name
+            """
+        )
+    ).mappings().all()
+    return [
+        schemas.AgentOption(id=int(r["id"]), name=(r["name"] or "").strip())
+        for r in rows
+        if r["id"] is not None and (r["name"] or "").strip()
+    ]
+
+
+@router.get("/all-agents", response_model=List[schemas.AllAgentOption])
+def list_all_agents(db: Session = Depends(get_db)):
+    """Every known agent username, merged from three sources:
+      • `_tb_SOOrderAssistantAudit.cUsername` — anyone who has ever
+        placed an order via the app (catches non-rep logins like admins).
+      • `SalesRep.Code` — Evolution's rep master.
+      • `_rtblAgents.cAgentName` — Evolution's agent master.
+
+    Dedupe on lowercase username; the SalesRep name (if available) wins
+    the display label. Used by the target form's Agent dropdown so a
+    user that isn't a SalesRep (e.g. you, NJ) can still have targets
+    set against them."""
+    rows = db.execute(
+        text(
+            """
+            WITH all_sources AS (
+                SELECT DISTINCT
+                       LTRIM(RTRIM(cUsername)) AS username,
+                       CAST(NULL AS varchar(100)) AS label,
+                       'audit' AS source
+                FROM [SOAssistant].dbo._tb_SOOrderAssistantAudit
+                WHERE cUsername IS NOT NULL
+                  AND LTRIM(RTRIM(cUsername)) <> ''
+
+                UNION ALL
+                SELECT DISTINCT
+                       LTRIM(RTRIM(Code)) AS username,
+                       NULLIF(LTRIM(RTRIM(Name)), '') AS label,
+                       'salesrep' AS source
+                FROM [BA_00_LPD_CON].dbo.SalesRep
+                WHERE Code IS NOT NULL
+                  AND LTRIM(RTRIM(Code)) <> ''
+
+                UNION ALL
+                SELECT DISTINCT
+                       LTRIM(RTRIM(cAgentName)) AS username,
+                       NULLIF(LTRIM(RTRIM(cDescription)), '') AS label,
+                       'agent' AS source
+                FROM [BA_00_LPD_CON].dbo._rtblAgents
+                WHERE cAgentName IS NOT NULL
+                  AND LTRIM(RTRIM(cAgentName)) <> ''
+            ),
+            picked AS (
+                SELECT username, label, source,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY LOWER(username)
+                           ORDER BY
+                               -- Prefer rows that carry a label; then
+                               -- prefer SalesRep > agent > audit as the
+                               -- "most canonical" source.
+                               CASE WHEN label IS NOT NULL THEN 0 ELSE 1 END,
+                               CASE source
+                                   WHEN 'salesrep' THEN 0
+                                   WHEN 'agent'    THEN 1
+                                   ELSE 2
+                               END
+                       ) AS rn
+                FROM all_sources
+            )
+            SELECT username, label, source
+            FROM picked
+            WHERE rn = 1
+            ORDER BY username
+            """
+        )
+    ).mappings().all()
+    return [
+        schemas.AllAgentOption(
+            username=(r["username"] or "").strip(),
+            label=((r["label"] or r["username"]) or "").strip(),
+            source=(r["source"] or "").strip(),
+        )
+        for r in rows
+    ]
+
+
+@router.get("/sales-reps", response_model=List[schemas.SalesRepOption])
+def list_sales_reps(db: Session = Depends(get_db)):
+    # Filter out reps with no Code — a rep without a readable short-name
+    # has nothing meaningful to display, and showing "#<id>" as a
+    # fallback made the dropdown look like it contained system
+    # placeholders. Hidden reps simply aren't pickable from the modal.
+    rows = db.execute(
+        text(
+            """
+            SELECT Id, SalesRep, RepName
+            FROM [SOAssistant].dbo._vw_SOSalesRep
+            WHERE SalesRep IS NOT NULL AND LTRIM(RTRIM(SalesRep)) <> ''
+            ORDER BY SalesRep
+            """
+        )
+    ).mappings().all()
+    return [
+        schemas.SalesRepOption(
+            id=int(r["Id"]),
+            code=(r["SalesRep"] or "").strip(),
+            name=(r["RepName"] or "").strip(),
+        )
+        for r in rows
+    ]
+
+
+@router.get("/customers/{account}/assignment", response_model=schemas.CustomerAssignment)
+def get_customer_assignment(account: str, db: Session = Depends(get_db)):
+    """Current route / telesales / sales-rep assignment for the given
+    customer. Powers the Edit modal's prefill."""
+    row = db.execute(
+        text(
+            """
+            SELECT CL.Account         AS account,
+                   CL.Name            AS name,
+                   CL.ulARRoute       AS route,
+                   CL.ulARTelesalesRep AS telesale,
+                   CL.RepID           AS salesrep_id,
+                   REP.Code           AS salesrep_code,
+                   ISNULL(CL.On_Hold, 0) AS on_hold
+            FROM dbo.Client CL
+            LEFT JOIN dbo.SalesRep REP ON REP.idSalesRep = CL.RepID
+            WHERE CL.Account = :account
+            """
+        ),
+        {"account": account},
+    ).mappings().first()
+    if not row:
+        raise HTTPException(404, f"Customer '{account}' not found")
+
+    def _clean(v):
+        if v is None:
+            return None
+        s = str(v).strip()
+        return s or None
+
+    return schemas.CustomerAssignment(
+        account=(row["account"] or "").strip(),
+        name=(row["name"] or "").strip(),
+        route=_clean(row["route"]),
+        telesale=_clean(row["telesale"]),
+        salesrep_id=int(row["salesrep_id"]) if row["salesrep_id"] is not None else None,
+        salesrep_code=_clean(row["salesrep_code"]),
+        on_hold=bool(row["on_hold"]),
+    )
+
+
+@router.patch(
+    "/customers/{account}/assignment",
+    response_model=schemas.CustomerAssignment,
+    dependencies=[Depends(require_min_role("SUPERVISOR"))],
+)
+def update_customer_assignment(
+    account: str,
+    payload: schemas.CustomerAssignmentUpdate,
+    db: Session = Depends(get_db),
+    username: str = Depends(get_current_user),
+    app_version: Optional[str] = Depends(_app_version),
+):
+    """Reassign a customer's route / telesales / sales-rep. Writes
+    directly to Client (bypasses the SDK — these are plain scalar columns
+    with no SDK-side invariants). An audit row is written with the
+    before/after values before the UPDATE commits, so the two always
+    land together or neither does."""
+    # Validate salesrep_id if provided
+    if payload.salesrep_id is not None:
+        rep = db.execute(
+            text("SELECT idSalesRep, Code FROM dbo.SalesRep WHERE idSalesRep = :id"),
+            {"id": payload.salesrep_id},
+        ).mappings().first()
+        if not rep:
+            raise HTTPException(400, f"Sales rep id {payload.salesrep_id} does not exist")
+        new_rep_code = (rep["Code"] or "").strip() or None
+    else:
+        new_rep_code = None
+
+    # Snapshot the current values before the UPDATE so the audit row can
+    # record the exact before/after. Load DCLink too so the audit row is
+    # keyed by both account + dclink (survives account renames).
+    current = db.execute(
+        text(
+            """
+            SELECT CL.DCLink      AS dclink,
+                   CL.ulARRoute       AS prev_route,
+                   CL.ulARTelesalesRep AS prev_telesale,
+                   CL.RepID           AS prev_salesrep_id,
+                   REP.Code           AS prev_salesrep_code,
+                   ISNULL(CL.On_Hold, 0) AS prev_on_hold
+            FROM dbo.Client CL
+            LEFT JOIN dbo.SalesRep REP ON REP.idSalesRep = CL.RepID
+            WHERE CL.Account = :account
+            """
+        ),
+        {"account": account},
+    ).mappings().first()
+    if not current:
+        raise HTTPException(404, f"Customer '{account}' not found")
+
+    def _norm(v):
+        if v is None:
+            return None
+        s = str(v).strip()
+        return s or None
+
+    new_route = _norm(payload.route)
+    new_telesale = _norm(payload.telesale)
+    new_rep_id = payload.salesrep_id
+    new_on_hold = 1 if payload.on_hold else 0
+    prev_on_hold = 1 if int(current["prev_on_hold"] or 0) else 0
+
+    try:
+        # Audit first — if the Client UPDATE later fails for some reason
+        # (permission revoked, deadlock) the audit insert rolls back with
+        # it because both run in the same transaction. Both commit together.
+        db.execute(
+            text(
+                """
+                INSERT INTO [SOAssistant].dbo._tb_SOCustomerAssignmentAudit
+                    (iCustomerDCLink, cCustomerAccount,
+                     cPrevRoute, cNewRoute,
+                     cPrevTelesale, cNewTelesale,
+                     iPrevSalesRepId, iNewSalesRepId,
+                     cPrevSalesRepCode, cNewSalesRepCode,
+                     bPrevOnHold, bNewOnHold,
+                     cUsername, cAppVersion, cNote)
+                VALUES
+                    (:dclink, :account,
+                     :prev_route, :new_route,
+                     :prev_telesale, :new_telesale,
+                     :prev_rep_id, :new_rep_id,
+                     :prev_rep_code, :new_rep_code,
+                     :prev_on_hold, :new_on_hold,
+                     :username, :app_version, :note)
+                """
+            ),
+            {
+                "dclink": int(current["dclink"]),
+                "account": account,
+                "prev_route": _norm(current["prev_route"]),
+                "new_route": new_route,
+                "prev_telesale": _norm(current["prev_telesale"]),
+                "new_telesale": new_telesale,
+                "prev_rep_id": int(current["prev_salesrep_id"]) if current["prev_salesrep_id"] is not None else None,
+                "new_rep_id": new_rep_id,
+                "prev_rep_code": _norm(current["prev_salesrep_code"]),
+                "new_rep_code": new_rep_code,
+                "prev_on_hold": prev_on_hold,
+                "new_on_hold": new_on_hold,
+                "username": username,
+                "app_version": app_version,
+                "note": (payload.note or "").strip()[:200] or None,
+            },
+        )
+
+        db.execute(
+            text(
+                """
+                UPDATE dbo.Client
+                SET ulARRoute        = :route,
+                    ulARTelesalesRep = :telesale,
+                    RepID            = :salesrep_id,
+                    On_Hold          = :on_hold
+                WHERE Account = :account
+                """
+            ),
+            {
+                "account": account,
+                "route": new_route,
+                "telesale": new_telesale,
+                "salesrep_id": new_rep_id,
+                "on_hold": new_on_hold,
+            },
+        )
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(500, f"Could not update customer assignment: {e}")
+
+    # Return the freshly-read state so the frontend can confirm what's
+    # persisted (and populate the pivot row's new label).
+    return get_customer_assignment(account, db)
+
+
+@router.patch(
+    "/customers/bulk-assignment",
+    response_model=schemas.CustomerBulkAssignmentResult,
+    dependencies=[Depends(require_min_role("SUPERVISOR"))],
+)
+def bulk_update_customer_assignment(
+    payload: schemas.CustomerBulkAssignmentUpdate,
+    db: Session = Depends(get_db),
+    username: str = Depends(get_current_user),
+    app_version: Optional[str] = Depends(_app_version),
+):
+    """Reassign the same route / telesales / sales-rep across N customers
+    in one atomic transaction. Per-field `update_*` flags are required so
+    an unchanged field doesn't accidentally overwrite each customer's
+    existing value. One audit row per customer is written in the same
+    transaction — all N commit together or none do."""
+    if not payload.accounts:
+        raise HTTPException(400, "accounts cannot be empty")
+    if not (
+        payload.update_route
+        or payload.update_telesale
+        or payload.update_salesrep
+        or payload.update_on_hold
+    ):
+        raise HTTPException(
+            400,
+            "at least one of update_route, update_telesale, update_salesrep, "
+            "update_on_hold must be true",
+        )
+
+    # Deduplicate and trim account values — the frontend occasionally
+    # submits whitespace-padded ids, and dupes just waste cycles.
+    accounts = sorted({a.strip() for a in payload.accounts if a and a.strip()})
+    if not accounts:
+        raise HTTPException(400, "accounts cannot be empty")
+
+    # Validate salesrep_id up front so we don't start writing before
+    # discovering it's bogus.
+    new_rep_code: Optional[str] = None
+    if payload.update_salesrep and payload.salesrep_id is not None:
+        rep = db.execute(
+            text("SELECT idSalesRep, Code FROM dbo.SalesRep WHERE idSalesRep = :id"),
+            {"id": payload.salesrep_id},
+        ).mappings().first()
+        if not rep:
+            raise HTTPException(400, f"Sales rep id {payload.salesrep_id} does not exist")
+        new_rep_code = (rep["Code"] or "").strip() or None
+
+    # Snapshot every customer's current state in one round-trip; also
+    # confirms every submitted account exists. If any is missing, fail
+    # the whole thing before writing a single row.
+    rows = db.execute(
+        text(
+            """
+            SELECT CL.Account         AS account,
+                   CL.DCLink          AS dclink,
+                   CL.ulARRoute       AS prev_route,
+                   CL.ulARTelesalesRep AS prev_telesale,
+                   CL.RepID           AS prev_salesrep_id,
+                   REP.Code           AS prev_salesrep_code,
+                   ISNULL(CL.On_Hold, 0) AS prev_on_hold
+            FROM dbo.Client CL
+            LEFT JOIN dbo.SalesRep REP ON REP.idSalesRep = CL.RepID
+            WHERE CL.Account IN :accounts
+            """
+        ).bindparams(bindparam("accounts", expanding=True)),
+        {"accounts": accounts},
+    ).mappings().all()
+    found = {(r["account"] or "").strip() for r in rows}
+    missing = [a for a in accounts if a not in found]
+    if missing:
+        raise HTTPException(
+            400,
+            f"Accounts not found: {', '.join(missing[:10])}"
+            + (f" (+{len(missing) - 10} more)" if len(missing) > 10 else ""),
+        )
+
+    def _norm(v):
+        if v is None:
+            return None
+        s = str(v).strip()
+        return s or None
+
+    # Precompute the "new" values per customer. Flags off → carry prev.
+    new_route_val = _norm(payload.route) if payload.update_route else None
+    new_telesale_val = _norm(payload.telesale) if payload.update_telesale else None
+    new_rep_id_val = payload.salesrep_id if payload.update_salesrep else None
+    new_on_hold_val = (1 if payload.on_hold else 0) if payload.update_on_hold else None
+    note = (payload.note or "").strip()[:200] or None
+
+    # Build the UPDATE SET dynamically — only set the columns the user
+    # actually asked to change. Avoids writing a column back to itself
+    # (which would spuriously tick off any trigger watching for changes).
+    set_parts = []
+    if payload.update_route:
+        set_parts.append("ulARRoute = :route")
+    if payload.update_telesale:
+        set_parts.append("ulARTelesalesRep = :telesale")
+    if payload.update_salesrep:
+        set_parts.append("RepID = :salesrep_id")
+    if payload.update_on_hold:
+        set_parts.append("On_Hold = :on_hold")
+    update_sql = text(
+        f"UPDATE dbo.Client SET {', '.join(set_parts)} WHERE Account = :account"
+    )
+
+    audit_sql = text(
+        """
+        INSERT INTO [SOAssistant].dbo._tb_SOCustomerAssignmentAudit
+            (iCustomerDCLink, cCustomerAccount,
+             cPrevRoute, cNewRoute,
+             cPrevTelesale, cNewTelesale,
+             iPrevSalesRepId, iNewSalesRepId,
+             cPrevSalesRepCode, cNewSalesRepCode,
+             bPrevOnHold, bNewOnHold,
+             cUsername, cAppVersion, cNote)
+        VALUES
+            (:dclink, :account,
+             :prev_route, :new_route,
+             :prev_telesale, :new_telesale,
+             :prev_rep_id, :new_rep_id,
+             :prev_rep_code, :new_rep_code,
+             :prev_on_hold, :new_on_hold,
+             :username, :app_version, :note)
+        """
+    )
+
+    try:
+        for curr in rows:
+            account = (curr["account"] or "").strip()
+            prev_route = _norm(curr["prev_route"])
+            prev_telesale = _norm(curr["prev_telesale"])
+            prev_rep_id = (
+                int(curr["prev_salesrep_id"])
+                if curr["prev_salesrep_id"] is not None
+                else None
+            )
+            prev_rep_code = _norm(curr["prev_salesrep_code"])
+            prev_on_hold = 1 if int(curr["prev_on_hold"] or 0) else 0
+
+            # Audit: always capture all four before/after. When a flag is
+            # false the "new" is the "prev" so the row makes sense in
+            # isolation (anyone reading the audit sees the state after).
+            db.execute(
+                audit_sql,
+                {
+                    "dclink": int(curr["dclink"]),
+                    "account": account,
+                    "prev_route": prev_route,
+                    "new_route": new_route_val if payload.update_route else prev_route,
+                    "prev_telesale": prev_telesale,
+                    "new_telesale": new_telesale_val if payload.update_telesale else prev_telesale,
+                    "prev_rep_id": prev_rep_id,
+                    "new_rep_id": new_rep_id_val if payload.update_salesrep else prev_rep_id,
+                    "prev_rep_code": prev_rep_code,
+                    "new_rep_code": new_rep_code if payload.update_salesrep else prev_rep_code,
+                    "prev_on_hold": prev_on_hold,
+                    "new_on_hold": new_on_hold_val if payload.update_on_hold else prev_on_hold,
+                    "username": username,
+                    "app_version": app_version,
+                    "note": note,
+                },
+            )
+
+            # Only touch the columns the user actually asked to change.
+            params: dict = {"account": account}
+            if payload.update_route:
+                params["route"] = new_route_val
+            if payload.update_telesale:
+                params["telesale"] = new_telesale_val
+            if payload.update_salesrep:
+                params["salesrep_id"] = new_rep_id_val
+            if payload.update_on_hold:
+                params["on_hold"] = new_on_hold_val
+            db.execute(update_sql, params)
+
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(500, f"Bulk update failed, no changes applied: {e}")
+
+    return schemas.CustomerBulkAssignmentResult(updated_count=len(rows))

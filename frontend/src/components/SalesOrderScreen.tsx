@@ -406,9 +406,10 @@ export function SalesOrderScreen({
       const res = isUpdate
         ? await api.updateOrder(editing!.order_no, payload)
         : await api.placeOrder(payload);
-      // Global signal so any list / badge the order touches in other screens
-      // (Order Assistant, Route Overview) refreshes immediately.
-      window.dispatchEvent(new CustomEvent("orders:mutated"));
+      // orders:mutated dispatch moved to dismissModal so the strip
+      // numbers only start animating once the success modal is gone
+      // — otherwise the modal covers the strip and the user misses
+      // the animation entirely.
       setSuccessMsg({
         title: isUpdate ? "Sales Order Updated" : "Sales Order Created",
         body: isUpdate
@@ -424,6 +425,13 @@ export function SalesOrderScreen({
 
   function dismissModal() {
     setSuccessMsg(null);
+    // Fire orders:mutated here (not inside the save handler) so the
+    // Performance strip only refetches + animates after the success
+    // modal has closed and the Order Assistant underneath is visible
+    // again. Downstream screens (DeliveriesScreen) also listen, but
+    // they just bump a refresh key — the small delay doesn't matter
+    // to them.
+    window.dispatchEvent(new CustomEvent("orders:mutated"));
     if (onPlaced) {
       onPlaced();
     } else {

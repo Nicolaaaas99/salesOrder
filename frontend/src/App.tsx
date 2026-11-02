@@ -2,7 +2,7 @@ import { useCallback, useState } from "react";
 import { LogOut, UserCircle } from "lucide-react";
 import { SalesOrderTab } from "./components/SalesOrderTab";
 import { OrderAssistantScreen } from "./components/OrderAssistantScreen";
-import { RouteOverviewScreen } from "./components/RouteOverviewScreen";
+import { AnalyticsScreen } from "./components/AnalyticsScreen";
 import { LoginScreen } from "./components/LoginScreen";
 import { SessionDateModal } from "./components/SessionDateModal";
 import { DefaultWarehouseModal } from "./components/DefaultWarehouseModal";
@@ -38,7 +38,7 @@ function AppShell() {
 }
 
 function AuthenticatedApp() {
-  const { username, logout } = useAuth();
+  const { username, role, logout } = useAuth();
   const [view, setView] = useState<View>("assistant");
   // When another tab (e.g. Route Overview) wants to open an existing order
   // for editing, it drops the order number here and switches us to the
@@ -98,6 +98,20 @@ function AuthenticatedApp() {
           <span className="flex items-center gap-1 text-xs text-gray-600">
             <UserCircle className="w-4 h-4 text-gray-500" />
             {username}
+            {role && (
+              <span
+                className={`ml-1 inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide ${
+                  role === "ADMIN"
+                    ? "bg-purple-100 text-purple-700 border border-purple-200"
+                    : role === "SUPERVISOR"
+                      ? "bg-blue-100 text-blue-700 border border-blue-200"
+                      : "bg-gray-100 text-gray-600 border border-gray-200"
+                }`}
+                title={`Signed in as ${role.toLowerCase()}`}
+              >
+                {role}
+              </span>
+            )}
           </span>
           <button
             onClick={logout}
@@ -133,7 +147,7 @@ function AuthenticatedApp() {
           className="h-full"
           style={{ display: view === "overview" ? "block" : "none" }}
         >
-          <RouteOverviewScreen onOpenOrder={openOrderInEntryTab} />
+          <AnalyticsScreen onOpenOrder={openOrderInEntryTab} />
         </div>
       </main>
     </div>

@@ -21,6 +21,7 @@ from services.contact_log import (
     ALLOWED_OUTCOMES,
     ContactLogError,
     fetch_latest_for_date,
+    fetch_latest_in_delivery_range,
     write_contact_log,
 )
 
@@ -67,6 +68,7 @@ def log_contact_outcome(
             outcome=outcome,
             note=payload.note,
             follow_up_date=payload.follow_up_date,
+            delivery_date=payload.delivery_date,
             username=username,
             source_app=payload.source_app,
             app_version=app_version,
@@ -86,13 +88,24 @@ def log_contact_outcome(
 @router.get("/by-date", response_model=List[schemas.ContactLogEntry])
 def list_latest_for_date(
     on_date: Optional[date] = Query(None, alias="date"),
+    from_date: Optional[date] = Query(None, alias="from"),
+    to_date: Optional[date] = Query(None, alias="to"),
     db: Session = Depends(get_db),
 ):
-    """Return the latest outcome row for each customer on the given date,
-    across all routes (default: today). Used by the customer dropdown to
-    colour its dots. The counter at the top of the picker further filters
-    this on the client against the current route's customer list."""
-    rows = fetch_latest_for_date(db, call_date=on_date)
+    """Latest outcome row per customer. The two forms key off DIFFERENT
+    columns on purpose:
+
+      • `date=X` (single day) → filters by dCallDate — what the Order
+        Assistant dropdown dots use ("did I handle this customer today?").
+      • `from=&to=` (range)   → filters by dDeliveryDate — what the
+        Deliveries report Reason column uses ("what's the latest known
+        state for this customer's call list on these delivery days?").
+
+    If both forms are given, the range wins. Default: today's dCallDate."""
+    if from_date is not None and to_date is not None:
+        rows = fetch_latest_in_delivery_range(db, from_date=from_date, to_date=to_date)
+    else:
+        rows = fetch_latest_for_date(db, call_date=on_date)
     return [
         schemas.ContactLogEntry(
             account=(r["account"] or "").strip(),

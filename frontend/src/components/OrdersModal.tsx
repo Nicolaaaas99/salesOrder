@@ -75,7 +75,15 @@ export function OrdersModal({ customer, date, orders, isLoading, onClose, onView
               </thead>
               <tbody>
                 {sorted.map((o) => {
-                  const { tier, label } = classifyDeliveryAge(o.delivery_date, todayIso);
+                  // Only Unprocessed (DocState=1) orders can be "overdue" —
+                  // Partial Processed / Archived have already been actioned
+                  // and the Status column communicates their state. Suppress
+                  // the age chip for closed rows so we don't tell the user a
+                  // shipped order is overdue.
+                  const isOpen = o.doc_state === 1;
+                  const { tier, label } = isOpen
+                    ? classifyDeliveryAge(o.delivery_date, todayIso)
+                    : { tier: null, label: null };
                   return (
                     <tr key={o.order_no} className="border-b border-gray-100 hover:bg-blue-50">
                       <td className="px-3 py-1.5 font-mono text-gray-800">{o.order_no}</td>
@@ -87,14 +95,16 @@ export function OrdersModal({ customer, date, orders, isLoading, onClose, onView
                       </td>
                       <td className="px-3 py-1.5 text-gray-700 whitespace-nowrap">
                         <span className="font-mono">{fmtDate(o.delivery_date)}</span>
-                        <span
-                          className={
-                            "ml-1.5 inline-block px-1.5 py-[1px] rounded-full text-[9px] font-semibold uppercase tracking-wide border " +
-                            TIER_CLASSES[tier]
-                          }
-                        >
-                          {label}
-                        </span>
+                        {tier && label && (
+                          <span
+                            className={
+                              "ml-1.5 inline-block px-1.5 py-[1px] rounded-full text-[9px] font-semibold uppercase tracking-wide border " +
+                              TIER_CLASSES[tier]
+                            }
+                          >
+                            {label}
+                          </span>
+                        )}
                       </td>
                       <td className="px-3 py-1.5 text-gray-700">{o.doc_state_label}</td>
                       <td className="px-3 py-1.5 text-right font-mono text-gray-900">
