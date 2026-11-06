@@ -227,7 +227,28 @@ def my_performance(
     # DocState IN (1, 3, 4) matches the rest of the codebase and
     # excludes cancelled orders (DocState=0) so cancelling an order
     # subtracts its litres from the agent's totals.
-    litres_row = db.execute(
+    # Lower bound for the partial-process branch. A remainder row is
+    # always created AFTER its original, and InvNum.AutoIndex is an
+    # identity, so every row we could match has AutoIndex >= the
+    # agent's earliest order this month. Passing it as a literal param
+    # turns the OrigDocID branch into a PK range seek over this month's
+    # rows instead of a full InvNum scan (no extra index needed).
+    min_row = db.execute(
+        text(
+            """
+            SELECT MIN(iInvNumAutoIndex) AS min_id
+            FROM [SOAssistant].dbo._tb_SOOrderAssistantAudit
+            WHERE cUsername = :username
+              AND cAction = 'CREATE'
+              AND dtActionAt >= :month_start
+              AND iInvNumAutoIndex IS NOT NULL
+            """
+        ),
+        bind,
+    ).mappings().first()
+    min_id = min_row["min_id"] if min_row else None
+
+    litres_row = None if min_id is None else db.execute(
         text(
             """
             WITH my_creates AS (
@@ -239,18 +260,33 @@ def my_performance(
                   AND dtActionAt >= :month_start
                   AND iInvNumAutoIndex IS NOT NULL
             ),
-            per_date AS (
-                SELECT c.action_date,
-                       SUM(ISNULL(LIN.fQuantity, 0) * ISNULL(STK.ulIISize, 0)) AS litres
+            -- Two separate branches instead of one `AutoIndex = x OR
+            -- OrigDocID = x` join. The OR form defeated the InvNum PK
+            -- index and made SQL Server re-scan InvNum per audit row
+            -- (observed 2026-11-06: 70-145 s CPU / 17-36M reads per
+            -- call, pinning the server). UNION ALL keeps the exact same
+            -- row semantics: branch 1 is a PK seek, branch 2 is a PK
+            -- range seek from :min_id (see min_row above).
+            matched AS (
+                SELECT c.action_date, NUM.AutoIndex
                 FROM my_creates c
-                JOIN dbo.InvNum NUM
-                       ON (NUM.AutoIndex = c.iInvNumAutoIndex
-                           OR NUM.OrigDocID = c.iInvNumAutoIndex)
-                      AND NUM.DocType = 4
-                      AND NUM.DocState IN (1, 3, 4)
-                JOIN dbo._btblInvoiceLines LIN ON LIN.iInvoiceID = NUM.AutoIndex
+                JOIN dbo.InvNum NUM ON NUM.AutoIndex = c.iInvNumAutoIndex
+                WHERE NUM.DocType = 4 AND NUM.DocState IN (1, 3, 4)
+                UNION ALL
+                SELECT c.action_date, NUM.AutoIndex
+                FROM my_creates c
+                JOIN dbo.InvNum NUM ON NUM.OrigDocID = c.iInvNumAutoIndex
+                WHERE NUM.DocType = 4 AND NUM.DocState IN (1, 3, 4)
+                  AND NUM.AutoIndex > :min_id
+                  AND NUM.OrigDocID <> NUM.AutoIndex
+            ),
+            per_date AS (
+                SELECT m.action_date,
+                       SUM(ISNULL(LIN.fQuantity, 0) * ISNULL(STK.ulIISize, 0)) AS litres
+                FROM matched m
+                JOIN dbo._btblInvoiceLines LIN ON LIN.iInvoiceID = m.AutoIndex
                 JOIN dbo.StkItem STK           ON STK.StockLink  = LIN.iStockCodeID
-                GROUP BY c.action_date
+                GROUP BY m.action_date
             )
             SELECT
                 SUM(CASE WHEN action_date >= :today_start THEN litres ELSE 0 END) AS today,
@@ -259,7 +295,7 @@ def my_performance(
             FROM per_date
             """
         ),
-        bind,
+        {**bind, "min_id": min_id},
     ).mappings().first()
 
     calls_row = db.execute(

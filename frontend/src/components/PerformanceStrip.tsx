@@ -25,9 +25,11 @@ export function notifyTargetsMutated() {
 }
 
 /** Fallback poll — picks up the "effective_to passed" case where no
- *  mutation event fires but a target quietly expires. 60s feels like
- *  the right trade between freshness and chatter; the strip is light. */
-const TARGETS_POLL_MS = 60_000;
+ *  mutation event fires but a target quietly expires. Was 60s; that
+ *  multiplied a heavy InvNum query by every open session and pinned
+ *  SQL Server (2026-11-06). Order save / contact-log events already
+ *  refresh the strip, so the poll is only a slow safety net now. */
+const TARGETS_POLL_MS = 10 * 60_000;
 
 /** Hard cap on how many target cards the strip shows at once. Keeps
  *  the top bar readable + leaves room for the Route / Customer pickers
@@ -209,24 +211,32 @@ export function PerformanceStrip({ leading }: Props = {}) {
   const [myTargets, setMyTargets] = useState<TargetWithActual[] | null>(null);
   const [showAll, setShowAll] = useState(false);
 
-  const refetch = useCallback(() => {
-    setLoading(true);
-    Promise.allSettled([auth.getMyPerformance(), api.getMyTargets()])
-      .then(([perfRes, targetsRes]) => {
-        if (perfRes.status === "fulfilled") setData(perfRes.value);
-        if (targetsRes.status === "fulfilled") setMyTargets(targetsRes.value.targets);
-      })
-      .finally(() => setLoading(false));
+  // At most one fetch in flight. Without this, a slow backend let
+  // events + the poll stack overlapping requests onto SQL Server.
+  const inflightRef = useRef(false);
+
+  const fetchAll = useCallback(async (showSpinner: boolean) => {
+    if (inflightRef.current) return;
+    inflightRef.current = true;
+    if (showSpinner) setLoading(true);
+    try {
+      const [perfRes, targetsRes] = await Promise.allSettled([
+        auth.getMyPerformance(),
+        // Don't hit /targets/mine at all while the module is hidden.
+        TARGETS_FEATURE_ENABLED
+          ? api.getMyTargets()
+          : Promise.resolve({ targets: [] as TargetWithActual[] }),
+      ]);
+      if (perfRes.status === "fulfilled") setData(perfRes.value);
+      if (targetsRes.status === "fulfilled") setMyTargets(targetsRes.value.targets);
+    } finally {
+      inflightRef.current = false;
+      if (showSpinner) setLoading(false);
+    }
   }, []);
 
-  const silentRefetch = useCallback(() => {
-    Promise.allSettled([auth.getMyPerformance(), api.getMyTargets()]).then(
-      ([perfRes, targetsRes]) => {
-        if (perfRes.status === "fulfilled") setData(perfRes.value);
-        if (targetsRes.status === "fulfilled") setMyTargets(targetsRes.value.targets);
-      },
-    );
-  }, []);
+  const refetch = useCallback(() => void fetchAll(true), [fetchAll]);
+  const silentRefetch = useCallback(() => void fetchAll(false), [fetchAll]);
 
   useEffect(() => {
     refetch();
