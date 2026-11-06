@@ -16,6 +16,7 @@ import { OrdersModal } from "./OrdersModal";
 import { OrderSummaryModal } from "./OrderSummaryModal";
 import { productKey } from "../utils/history";
 import { today } from "../utils/date";
+import { useFocusRefresh } from "../utils/useFocusRefresh";
 import { fmtCurrency } from "../utils/format";
 import { useAuth } from "../context/AuthContext";
 
@@ -97,16 +98,14 @@ export function DeliveriesScreen({ onOpenOrder, onBack }: DeliveriesProps = {}) 
 
   // Catch mutations from elsewhere in the app and other users' changes.
   // `orders:mutated` is dispatched after cancel / delivery-date / save;
-  // `focus` catches cross-user changes when the window regains focus.
+  // `focus` catches cross-user changes when the window regains focus
+  // (throttled to once per 30 s — see useFocusRefresh).
   useEffect(() => {
     const bump = () => setRefreshKey((k) => k + 1);
     window.addEventListener("orders:mutated", bump);
-    window.addEventListener("focus", bump);
-    return () => {
-      window.removeEventListener("orders:mutated", bump);
-      window.removeEventListener("focus", bump);
-    };
+    return () => window.removeEventListener("orders:mutated", bump);
   }, []);
+  useFocusRefresh(() => setRefreshKey((k) => k + 1));
   const [search, setSearch] = useState("");
   const [orderFilter, setOrderFilter] = useState<OrderFilter>("all");
 

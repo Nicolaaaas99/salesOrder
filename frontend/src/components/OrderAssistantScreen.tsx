@@ -36,6 +36,7 @@ import { useAuth } from "../context/AuthContext";
 import { today } from "../utils/date";
 import { worstDeliveryTier } from "../utils/deliveryAge";
 import { useCustomerAutoRefresh } from "../utils/useCustomerAutoRefresh";
+import { useFocusRefresh } from "../utils/useFocusRefresh";
 
 type Option = { value: string; label: string };
 
@@ -891,19 +892,17 @@ export function OrderAssistantScreen({ onOpenOrder }: OrderAssistantProps = {}) 
   //   • `orders:mutated` fires from this app whenever an order is created,
   //     updated, cancelled, or has its delivery date changed.
   //   • `focus` catches the "another rep cancelled while I was elsewhere"
-  //     case — tabbing back to the window re-fetches everything.
-  useEffect(() => {
-    const refreshAll = () => {
-      refreshOrdersToday();
-      refreshUnprocessedOrders();
-    };
-    window.addEventListener("orders:mutated", refreshAll);
-    window.addEventListener("focus", refreshAll);
-    return () => {
-      window.removeEventListener("orders:mutated", refreshAll);
-      window.removeEventListener("focus", refreshAll);
-    };
+  //     case — tabbing back to the window re-fetches everything, at most
+  //     once per 30 s (reps alt-tab to Evolution constantly).
+  const refreshAll = useCallback(() => {
+    refreshOrdersToday();
+    refreshUnprocessedOrders();
   }, [refreshOrdersToday, refreshUnprocessedOrders]);
+  useEffect(() => {
+    window.addEventListener("orders:mutated", refreshAll);
+    return () => window.removeEventListener("orders:mutated", refreshAll);
+  }, [refreshAll]);
+  useFocusRefresh(refreshAll);
 
   const handleFinalizePlaced = useCallback(() => {
     // Hard reset after a successful placement — close the finalize sheet and

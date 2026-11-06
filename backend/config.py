@@ -16,6 +16,14 @@ COMMON_USERNAME  = os.getenv("COMMON_USERNAME", DB_USERNAME)
 COMMON_PASSWORD  = os.getenv("COMMON_PASSWORD", DB_PASSWORD)
 COMMON_DATABASE  = os.getenv("COMMON_DATABASE", "SageCommon")
 
+# Performance guards (see PERFORMANCE.md).
+# Any single SQL statement running longer than this is cancelled by the driver.
+DB_QUERY_TIMEOUT_SECONDS = int(os.getenv("DB_QUERY_TIMEOUT_SECONDS", "30"))
+# Statements slower than this are logged as "SLOW SQL" with the API path.
+DB_SLOW_QUERY_SECONDS    = float(os.getenv("DB_SLOW_QUERY_SECONDS", "1.0"))
+# Whole API requests slower than this are logged as "SLOW REQUEST".
+SLOW_REQUEST_SECONDS     = float(os.getenv("SLOW_REQUEST_SECONDS", "2.0"))
+
 DLL_PATH     = os.getenv("DLL_PATH")
 LICENSE_KEY  = os.getenv("LICENSE_KEY")
 LICENSE_CODE = os.getenv("LICENSE_CODE")

@@ -11,6 +11,7 @@ from auth import get_current_user
 from database import get_db
 import schemas
 from services.pricing import resolve_customer_prices
+from services import short_cache
 
 router = APIRouter(
     prefix="/history",
@@ -130,10 +131,11 @@ def export_orders_per_day(
             JOIN dbo.Client CL ON CL.DCLink = NUM.AccountID
             WHERE NUM.DocType = 4
               AND NUM.DocState IN (1, 3, 4)
-              AND CAST(NUM.{date_col} AS DATE) BETWEEN :from_date AND :to_date
+              AND NUM.{date_col} >= :from_date
+              AND NUM.{date_col} <  :to_exclusive
             GROUP BY CL.Account, CAST(NUM.{date_col} AS DATE)
         """),
-        {"from_date": frm, "to_date": to},
+        {"from_date": frm, "to_exclusive": to + timedelta(days=1)},
     ).mappings().all()
     counts_by_key: dict[tuple[str, date], int] = {
         ((r["account"] or "").strip(), r["tx_date"]): int(r["order_count"] or 0)
@@ -263,15 +265,34 @@ def list_orders_today(
     Order Assistant's "placed today" check-mark before a route is picked)."""
     frm, to = _resolve_range(on_date, from_date, to_date)
     date_col = _date_column(by)
+    route_key = (route or "").strip()
+    # Shared 20 s cache: every rep asks this same question on every window
+    # focus. Order create/update/cancel/reschedule invalidate it (see
+    # sales_orders.py) so a just-placed order still shows immediately.
+    return short_cache.get_or_compute(
+        ORDERS_TODAY_CACHE,
+        (frm, to, date_col, route_key),
+        20,
+        lambda: _query_orders_today(db, frm, to, date_col, route_key),
+    )
+
+
+ORDERS_TODAY_CACHE = "orders_today"
+
+
+def _query_orders_today(db: Session, frm: date, to: date, date_col: str, route: str):
+    # Plain range on the raw column (no CAST) so an index on the date
+    # column can be used; `< to + 1 day` keeps the inclusive-end semantics.
     where = [
         "NUM.DocType = 4",
         "NUM.DocState IN (1, 3, 4)",
-        f"CAST(NUM.{date_col} AS DATE) BETWEEN :from_date AND :to_date",
+        f"NUM.{date_col} >= :from_date",
+        f"NUM.{date_col} < :to_exclusive",
     ]
-    params: dict = {"from_date": frm, "to_date": to}
-    if route and route.strip():
+    params: dict = {"from_date": frm, "to_exclusive": to + timedelta(days=1)}
+    if route:
         where.append("LTRIM(RTRIM(CL.ulARRoute)) = :route")
-        params["route"] = route.strip()
+        params["route"] = route
 
     # COUNT DISTINCT OrderNum (not COUNT rows): Evolution splits a
     # partially-processed order into multiple InvNum rows sharing the same

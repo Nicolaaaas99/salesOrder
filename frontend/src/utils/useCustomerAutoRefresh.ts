@@ -62,6 +62,13 @@ export function useCustomerAutoRefresh(
       if (cancelled) return;
       void refresh();
     };
+    // The 5 s poll only runs while the tab is visible — a minimised or
+    // background tab doesn't need live credit status, and the visibility
+    // listener below refreshes the moment the rep comes back.
+    const pollRefresh = () => {
+      if (document.visibilityState !== "visible") return;
+      safeRefresh();
+    };
 
     const onFocus = () => safeRefresh();
     const onVisibility = () => {
@@ -70,7 +77,7 @@ export function useCustomerAutoRefresh(
 
     window.addEventListener("focus", onFocus);
     document.addEventListener("visibilitychange", onVisibility);
-    const interval = window.setInterval(safeRefresh, POLL_INTERVAL_MS);
+    const interval = window.setInterval(pollRefresh, POLL_INTERVAL_MS);
 
     return () => {
       cancelled = true;

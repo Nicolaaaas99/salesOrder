@@ -1,10 +1,41 @@
-from fastapi import FastAPI, APIRouter
+import logging
+import sys
+import time
+
+from fastapi import FastAPI, APIRouter, Request
 from fastapi.middleware.cors import CORSMiddleware
 
+import config
+from request_context import current_request_path
 from routers import auth, lookups, sales_orders, debug, history, contact_log, analytics, targets, admin
 from connection import connect
 
+# Log to stdout so IIS httpPlatformHandler writes it to backend\logs\stdout_*.log
+logging.basicConfig(
+    level=logging.INFO,
+    stream=sys.stdout,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+perf_logger = logging.getLogger("perf")
+
 app = FastAPI(title="Sales Order API")
+
+
+@app.middleware("http")
+async def _timing_middleware(request: Request, call_next):
+    """Tag every SQL statement with the API path (for the SLOW SQL log) and
+    log any request slower than SLOW_REQUEST_SECONDS."""
+    token = current_request_path.set(f"{request.method} {request.url.path}")
+    started = time.perf_counter()
+    try:
+        return await call_next(request)
+    finally:
+        elapsed = time.perf_counter() - started
+        if elapsed >= config.SLOW_REQUEST_SECONDS:
+            perf_logger.warning(
+                "SLOW REQUEST %.2fs %s %s", elapsed, request.method, request.url.path
+            )
+        current_request_path.reset(token)
 
 app.add_middleware(
     CORSMiddleware,

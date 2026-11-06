@@ -1,5 +1,5 @@
 import logging
-from datetime import date
+from datetime import date, timedelta
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
@@ -13,6 +13,7 @@ from routers.lookups import CUSTOMER_CREDIT_SQL, _build_customer_detail
 from services.audit import write_order_audit
 from services.contact_log import write_contact_log
 from services.sales_order_service import create_sales_order, update_sales_order
+from services import short_cache
 
 
 def _app_version(
@@ -221,6 +222,7 @@ def place_order(
         delivery_date=payload.delivery_date,
         swallow_db_errors=True,
     )
+    short_cache.invalidate("orders_today")
     return result
 
 
@@ -245,8 +247,8 @@ SEARCH_SQL = """
       AND (:order_no IS NULL OR inv.OrderNum LIKE :order_no)
       AND (:ext_order IS NULL OR inv.ExtOrderNum LIKE :ext_order)
       AND (:description IS NULL OR inv.Description LIKE :description)
-      AND (:date_from IS NULL OR CAST(inv.OrderDate AS DATE) >= :date_from)
-      AND (:date_to   IS NULL OR CAST(inv.OrderDate AS DATE) <= :date_to)
+      AND (:date_from IS NULL OR inv.OrderDate >= :date_from)
+      AND (:date_to_excl IS NULL OR inv.OrderDate < :date_to_excl)
     GROUP BY inv.OrderNum, inv.DocState
     ORDER BY inv.OrderNum DESC
 """
@@ -285,7 +287,7 @@ def search_sales_orders(
             "ext_order": like(ext_order),
             "description": like(description),
             "date_from": date_from,
-            "date_to": date_to,
+            "date_to_excl": date_to + timedelta(days=1) if date_to else None,
             "states": chosen_states,
             "limit": limit,
         },
@@ -364,7 +366,8 @@ def list_orders_by_order_date(
             WHERE inv.DocType = 4
               AND inv.DocState IN (1, 3, 4)
               AND ISNULL(inv.OrderNum, '') <> ''
-              AND CAST(inv.{date_col} AS DATE) BETWEEN :from_date AND :to_date
+              AND inv.{date_col} >= :from_date
+              AND inv.{date_col} <  :to_exclusive
         )
         SELECT
             inv.OrderNum      AS order_no,
@@ -385,7 +388,7 @@ def list_orders_by_order_date(
     """
     rows = db.execute(
         text(sql),
-        {"account": account.strip(), "from_date": frm, "to_date": to},
+        {"account": account.strip(), "from_date": frm, "to_exclusive": to + timedelta(days=1)},
     ).mappings().all()
 
     return [
@@ -601,6 +604,7 @@ def update_order(
         db, result.order_no, "UPDATE", username, app_version,
         customer_account=payload.customer_account,
     )
+    short_cache.invalidate("orders_today")
     return result
 
 
@@ -665,6 +669,7 @@ def update_delivery_date(
         username,
     )
     write_order_audit(db, order_no, "RESCHEDULE", username, app_version)
+    short_cache.invalidate("orders_today")
     return _load_sales_order(order_no, db)
 
 
@@ -748,6 +753,7 @@ def cancel_order(
 
     logger.info("cancel_order: order_no=%s cancelled by %s", order_no, username)
     write_order_audit(db, order_no, "CANCEL", username, app_version)
+    short_cache.invalidate("orders_today")
     return schemas.CancelOrderResponse(
         order_no=order_no,
         doc_state=7,
