@@ -15,3 +15,7 @@ frontend/.vite/
 Thumbs.db
 .vscode/
 .idea/
+
+# TypeScript incremental build cache — rewritten by every `npm run build`.
+# Must NOT be tracked: a tracked copy made `git pull` refuse on the server.
+*.tsbuildinfo

@@ -30,8 +30,11 @@ backfill would label them ORDER_ASSISTANT.)
       - `IX_SOOrderAssistantAudit_InvNumAction` index + `_fn_SOOrderIntake`
         (dropped and re-created each run — it's a multi-statement function).
 - [ ] Verify: `SELECT CASE WHEN OBJECT_DEFINITION(OBJECT_ID('[SOAssistant].dbo._fn_SOOrderIntake')) LIKE '%X.AgentID%' THEN 'current' ELSE 'OLD' END;` returns `current`.
-- [ ] Deploy the app (Runbook below). No new Python packages for prod
-      (`pytest` / `httpx` in requirements.txt are test-only).
+- [ ] **One time only**, because the server's copy of
+      `frontend/tsconfig.tsbuildinfo` blocks `git pull`:
+      `cd C:\inetpub\salesOrder; git checkout -- frontend/tsconfig.tsbuildinfo; git pull`
+      — then deploy with `deploy.ps1` (Runbook step 6). No new Python
+      packages for prod (`pytest` / `httpx` in requirements.txt are test-only).
 - [ ] Smoke test:
       - Sales Order Entry -> Create a new order: only corporate customers
         (Spar / Checkers / Boxer / Pick n Pay / OK) in the dropdown. Place
@@ -212,9 +215,16 @@ backfill would label them ORDER_ASSISTANT.)
    - Has an `UPDATE … WHERE … IS NULL` body so re-running is a no-op.
 5. **Grant permissions** (fresh installs only — see Pending deploy for
    when this is required).
-6. **Pull backend code**, restart the FastAPI service.
-7. **Build + deploy frontend** (`npm run build`, publish `dist/`).
-8. **Smoke test** per the checklist above.
+6. **Deploy the code with the script — never by hand:**
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File C:\inetpub\salesOrder\deploy.ps1
+   ```
+   It pulls, builds and restarts the IIS site, stops at the first error,
+   rolls back to the previous version if the build fails, and ends with
+   `DEPLOYED <commit>`. Confirm in a browser: `https://<server>/version.json`
+   shows the same commit. (Typing the steps by hand is what kept "deploying"
+   old code: PowerShell carried on after a failed `git pull`.)
+7. **Smoke test** per the checklist above.
 
 ### Why `create_views.sql` is always safe to re-run
 - Views → `CREATE OR ALTER` (overwrites definition only).
