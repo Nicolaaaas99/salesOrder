@@ -24,6 +24,7 @@ from datetime import date, timedelta
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from services.forecasting import weeks as fc_weeks
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
@@ -44,13 +45,8 @@ router = APIRouter(
 # Shared SQL fragments
 # ---------------------------------------------------------------------------
 
-# Sunday-of-week expression. @@DATEFIRST-invariant: 1900-01-07 is a known
-# Sunday, so (DATEDIFF-days mod 7) gives days-since-the-current-Sunday.
-_WEEK_START = (
-    "DATEADD(day, "
-    "-((DATEDIFF(day, '19000107', ST.TxDate) % 7 + 7) % 7), "
-    "CAST(ST.TxDate AS date))"
-)
+# Week-start (Monday) expression, @@DATEFIRST-invariant. See weeks.py.
+_WEEK_START = fc_weeks.week_start_sql("ST.TxDate")
 
 # PostST signs returns as Debit > 0 / Credit = 0; sales as Credit > 0 /
 # Debit = 0. Mirror that onto the quantity so credit notes subtract.
@@ -165,19 +161,13 @@ def _master_applies(path: List[str], depth: int) -> bool:
     return all(path[i] in _DIM_CLIENT_SIDE for i in range(depth + 1))
 
 
-def _sunday_aligned_window_start(weeks: int) -> date:
-    """Start of the oldest Sunday-of-week displayed in the grid. The
-    frontend's week columns are Sunday-based, so the backend's `>=
-    window_start` filter needs to anchor on a Sunday too — otherwise mid-
-    week dates from the week BEFORE the oldest displayed Sunday leak
-    into Total / last_sale while having no visible column. Matches the
+def _week_aligned_window_start(weeks: int) -> date:
+    """Monday of the oldest week displayed in the grid. The `>=
+    window_start` filter must anchor on a week start, otherwise mid-week
+    dates from the week BEFORE the oldest displayed column leak into
+    Total / last_sale while having no visible column. Matches the
     frontend `buildWeekColumnsDesc` helper."""
-    today = date.today()
-    # Python isoweekday: Mon=1 .. Sun=7. Modulo 7 maps Sunday → 0 so a
-    # Sunday today subtracts 0, Monday subtracts 1, ..., Saturday 6.
-    days_since_sunday = today.isoweekday() % 7
-    current_sunday = today - timedelta(days=days_since_sunday)
-    return current_sunday - timedelta(weeks=weeks - 1)
+    return fc_weeks.week_start(date.today()) - timedelta(weeks=weeks - 1)
 
 
 # ---------------------------------------------------------------------------
@@ -517,7 +507,7 @@ def customer_history(
         raise HTTPException(400, f"must provide v0..v{depth - 1} for depth={depth}")
     parent_values = [v.strip() for v in raw_values]  # type: ignore[union-attr]
 
-    window_start = _sunday_aligned_window_start(weeks)
+    window_start = _week_aligned_window_start(weeks)
     rows = _fetch_level(db, window_start, dims, depth, parent_values)
     return schemas.PivotLevelResponse(level=dims[depth], rows=rows)
 
@@ -544,7 +534,7 @@ def transactions(
     v5: Optional[str] = Query(None),
     week_start: Optional[date] = Query(
         None,
-        description="Sunday of the week to show. Omit to span the full 12-week window.",
+        description="Monday of the week to show. Omit to span the full 12-week window.",
     ),
     weeks: int = Query(12, ge=1, le=26),
     db: Session = Depends(get_db),
@@ -567,7 +557,7 @@ def transactions(
         tx_from = week_start
         tx_to = week_start + timedelta(days=6)
     else:
-        tx_from = _sunday_aligned_window_start(weeks)
+        tx_from = _week_aligned_window_start(weeks)
         tx_to = date.today()
 
     # Open sales orders (Id='SO') are excluded so the modal totals match

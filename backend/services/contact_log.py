@@ -7,13 +7,18 @@ customer). Writes are best-effort — a failed insert never blocks the user.
 
 Outcomes:
     PLACED      — written by the order-save path, not the modal
-    NO_ORDER    — customer did not want / need to order today
-    CALLBACK    — asked to be called back (optional dFollowUpDate)
-    NO_ANSWER   — call went to voicemail / no answer
-    REFUSED     — refused, on stop, closed
+    NO_ORDER      — customer did not want / need to order today
+    WRITTEN_ORDER — customer sent a written order (email / paper); it gets
+                    keyed in manually rather than through the assistant
+    CALLBACK      — asked to be called back (optional dFollowUpDate)
+    NO_ANSWER     — call went to voicemail / no answer
+    REFUSED       — refused, on stop, closed
 
 "Opened by mistake" is not a stored outcome — the modal lets the agent
 escape without writing a row, so the dropdown dot stays red.
+
+cSourceApp records which screen wrote the row: ORDER_ASSISTANT or
+SALES_ORDER_ENTRY (legacy rows before 2026-11-06: 'SO_ASSISTANT').
 """
 import logging
 from datetime import date
@@ -26,7 +31,9 @@ logger = logging.getLogger(__name__)
 
 CONTACT_LOG_TABLE = "[SOAssistant].dbo._tb_SOCustomerContactLog"
 
-ALLOWED_OUTCOMES = {"PLACED", "NO_ORDER", "CALLBACK", "NO_ANSWER", "REFUSED"}
+ALLOWED_OUTCOMES = {
+    "PLACED", "NO_ORDER", "WRITTEN_ORDER", "CALLBACK", "NO_ANSWER", "REFUSED",
+}
 
 
 def _resolve_agent_id(db: Session, username: str) -> Optional[int]:
@@ -138,7 +145,7 @@ def write_contact_log(
                 "auto_index": inv_num_auto_index,
                 "agent_id": agent_id,
                 "username": username,
-                "source_app": (source_app or "SO_ASSISTANT")[:32],
+                "source_app": (source_app or "UNKNOWN")[:32],
                 "app_version": (app_version or "")[:32] or None,
             },
         ).scalar()

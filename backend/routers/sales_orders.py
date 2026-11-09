@@ -9,9 +9,15 @@ from sqlalchemy.orm import Session
 import schemas
 from auth import get_current_user
 from database import get_db
-from routers.lookups import CUSTOMER_CREDIT_SQL, _build_customer_detail
+from routers.lookups import (
+    CORPORATE_GROUPS,
+    CUSTOMER_CREDIT_SQL,
+    _build_customer_detail,
+    is_corporate_customer,
+)
 from services.audit import write_order_audit
 from services.contact_log import write_contact_log
+from services.forecasting.suggestions import record_order_decisions
 from services.sales_order_service import create_sales_order, update_sales_order
 from services import short_cache
 
@@ -138,6 +144,19 @@ def place_order(
 
     customer = _build_customer_detail(row)
 
+    # Sales Order Entry is limited to corporate customers (the picker only
+    # offers those); re-check here so a stale or hand-crafted request can't
+    # bypass it. Only on CREATE — editing an existing order is unaffected.
+    if payload.source == "SALES_ORDER_ENTRY" and not is_corporate_customer(
+        db, payload.customer_account
+    ):
+        raise HTTPException(
+            400,
+            f"{customer.name} is not a corporate customer "
+            f"({', '.join(CORPORATE_GROUPS)}). Use the Order Assistant "
+            f"to place orders for this customer.",
+        )
+
     # Only hard-block when the customer is flagged with CheckTerms = 1. For
     # CheckTerms = 0 customers the UI still shows the OVER LIMIT / OVER TERMS
     # badges so the rep sees the warning, but we let the order through.
@@ -180,9 +199,11 @@ def place_order(
     except Exception as e:
         raise HTTPException(500, f"Failed to create sales order: {e}")
 
+    source_app = payload.source or "UNKNOWN"
     write_order_audit(
         db, result.order_no, "CREATE", username, app_version,
         customer_account=payload.customer_account,
+        source_app=source_app,
     )
     # A placed order also counts as a PLACED outcome in the contact log so the
     # customer's dropdown dot turns green. Route comes from the customer master
@@ -212,7 +233,7 @@ def place_order(
         route_code=(route_row and route_row["ulARRoute"]) or None,
         outcome="PLACED",
         username=username,
-        source_app="SO_ASSISTANT",
+        source_app=source_app,
         app_version=app_version,
         order_no=result.order_no,
         inv_num_auto_index=(inv_row and int(inv_row["AutoIndex"])) or None,
@@ -223,6 +244,19 @@ def place_order(
         swallow_db_errors=True,
     )
     short_cache.invalidate("orders_today")
+    # Phase 4: stamp the rep's decision on every suggestion the Order
+    # Assistant showed (ACCEPTED / MODIFIED / REJECTED + MANUAL_ADD rows).
+    # Best-effort — logs and returns None on failure, never fails the order.
+    if payload.suggestion_ids is not None:
+        record_order_decisions(
+            db,
+            suggestion_ids=payload.suggestion_ids,
+            customer=payload.customer_account,
+            username=username,
+            order_no=result.order_no,
+            delivery_date=payload.delivery_date,
+            lines=[(l.stock_code, l.quantity) for l in payload.lines],
+        )
     return result
 
 
@@ -410,8 +444,13 @@ def list_orders_by_order_date(
     ]
 
 
+# TOP 1 + ORDER BY: a split order has several InvNum rows sharing the
+# OrderNum (original archived + remainder copy). Without an ORDER BY SQL
+# Server returns whichever it likes, so loading the same order could pick
+# a different slice each time. Prefer the most open slice (Unprocessed >
+# Partial > Archived), newest first — same rule as /by-order-date.
 DETAIL_HEADER_SQL = """
-    SELECT
+    SELECT TOP 1
         inv.AutoIndex     AS auto_index,
         inv.OrderNum      AS order_no,
         inv.Description   AS description,
@@ -431,6 +470,8 @@ DETAIL_HEADER_SQL = """
     LEFT JOIN Client c ON c.DCLink = inv.AccountID
     LEFT JOIN Project p ON p.ProjectLink = inv.ProjectID
     WHERE inv.OrderNum = :order_no AND inv.DocType = 4
+    ORDER BY CASE inv.DocState WHEN 1 THEN 1 WHEN 3 THEN 2 WHEN 4 THEN 3 ELSE 4 END,
+             inv.AutoIndex DESC
 """
 
 
@@ -603,6 +644,7 @@ def update_order(
     write_order_audit(
         db, result.order_no, "UPDATE", username, app_version,
         customer_account=payload.customer_account,
+        source_app=payload.source or "UNKNOWN",
     )
     short_cache.invalidate("orders_today")
     return result

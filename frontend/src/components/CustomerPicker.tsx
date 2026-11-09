@@ -9,13 +9,16 @@ type Props = {
   onChange?: (text: string) => void;
   placeholder?: string;
   onEnter?: () => void;
+  /** Restrict results to corporate groups (Spar / Checkers / Boxer /
+   *  Pick n Pay / OK). Used by Sales Order Entry; search filters leave it off. */
+  corporateOnly?: boolean;
 };
 
 type Pos = { top: number; left: number; width: number };
 
 export function CustomerPicker({
   value, onSelect,
-  onChange, placeholder = "Select a Customer", onEnter,
+  onChange, placeholder = "Select a Customer", onEnter, corporateOnly = false,
 }: Props) {
   const controlled = onChange !== undefined;
   const [query, setQuery] = useState<string | null>(null);
@@ -38,7 +41,7 @@ export function CustomerPicker({
     const t = setTimeout(async () => {
       setLoading(true);
       try {
-        const data = await api.searchCustomers(searchFor);
+        const data = await api.searchCustomers(searchFor, 50, { corporate_only: corporateOnly });
         if (alive) {
           setResults(data);
           setHighlightIdx(data.length > 0 ? 0 : -1);
@@ -48,7 +51,7 @@ export function CustomerPicker({
       }
     }, 80);
     return () => { alive = false; clearTimeout(t); };
-  }, [searchFor, open]);
+  }, [searchFor, open, corporateOnly]);
 
   useEffect(() => {
     if (highlightIdx < 0 || !dropdownRef.current) return;

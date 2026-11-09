@@ -18,6 +18,36 @@ and "the app is live".
 
 Order matters where noted. Everything else can be done in any order.
 
+### Release 2026-11-09 — Sales Order Entry, Written order, order source, Order Intake
+Do these in this order: **SQL first, then the app.** (If the backend goes
+first, Sales Order Entry orders placed in between get no source and the
+backfill would label them ORDER_ASSISTANT.)
+- [ ] Re-run `backend/sql/create_views.sql` end-to-end on the server. This release adds:
+      - `cSourceApp` column on `_tb_SOOrderAssistantAudit` (+ automatic
+        backfill: CREATE -> ORDER_ASSISTANT, UPDATE -> SALES_ORDER_ENTRY).
+      - Contact-log `cSourceApp` relabel `SO_ASSISTANT` -> `ORDER_ASSISTANT` (automatic).
+      - `CK_SOCustomerContactLog_Outcome` rebuilt to accept `WRITTEN_ORDER`.
+      - `IX_SOOrderAssistantAudit_InvNumAction` index + `_fn_SOOrderIntake`
+        (dropped and re-created each run — it's a multi-statement function).
+- [ ] Verify: `SELECT CASE WHEN OBJECT_DEFINITION(OBJECT_ID('[SOAssistant].dbo._fn_SOOrderIntake')) LIKE '%X.AgentID%' THEN 'current' ELSE 'OLD' END;` returns `current`.
+- [ ] Deploy the app (Runbook below). No new Python packages for prod
+      (`pytest` / `httpx` in requirements.txt are test-only).
+- [ ] Smoke test:
+      - Sales Order Entry -> Create a new order: only corporate customers
+        (Spar / Checkers / Boxer / Pick n Pay / OK) in the dropdown. Place
+        one; its `_tb_SOOrderAssistantAudit` CREATE row has
+        `cSourceApp = 'SALES_ORDER_ENTRY'` and the right `iInvNumAutoIndex`.
+      - Order Assistant: leave a customer without ordering -> modal has
+        "Written order"; saving it writes `cOutcome = 'WRITTEN_ORDER'`.
+      - Analytics -> Order Intake (Supervisor/Admin only; agents don't see
+        the card): a known app order shows in the hour it was placed
+        (local time); Evolution bars green, SO Assistant blue.
+      - Search `backend\logs\stdout_*.log` for `SLOW` at the end of day 1.
+- [ ] Forecasting ships switched OFF (`FORECASTING_UI_ENABLED = false`). If
+      the forecasting tables aren't on prod, the Order Assistant logs a
+      "Target lookup failed" line per customer and falls back to normal
+      suggestions — expected, harmless.
+
 ### SQL — safe to re-run end-to-end
 - [ ] Run `backend/sql/create_views.sql` on the server (SSMS). Adds /
       updates all views, tables, columns, indexes. Idempotent — guarded
@@ -199,6 +229,12 @@ Order matters where noted. Everything else can be done in any order.
   fresh installs.
 - Backfill templates → commented out by default; uncomment, review,
   run.
+
+- `_fn_SOOrderIntake` → `DROP FUNCTION IF EXISTS` + `CREATE` (a
+  multi-statement function can't be converted with `CREATE OR ALTER`;
+  it holds no data).
+- Automatic backfills (contact-log / audit `cSourceApp`) → only touch rows
+  still on the old value / NULL, so a re-run updates nothing.
 
 Nothing in the file deletes rows or re-inserts duplicates.
 

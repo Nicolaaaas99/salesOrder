@@ -19,3 +19,11 @@
  * when the redesign is ready to ship.
  */
 export const TARGETS_FEATURE_ENABLED = false;
+
+/**
+ * Forecasting management screens (Phase 5): Target Workbench, Scenarios,
+ * Opportunity Inbox, Model Leaderboard on the Analytics hub. Shown to
+ * SUPERVISOR + ADMIN only (backend enforces the role as well). Set to
+ * false to hide the four hub cards, e.g. for a demo.
+ */
+export const FORECASTING_UI_ENABLED = false;

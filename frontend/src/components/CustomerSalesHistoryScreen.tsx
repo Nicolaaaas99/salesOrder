@@ -40,7 +40,7 @@ const DIM_HAS_STALE: Record<PivotDim, boolean> = {
 
 const DEFAULT_PATH: PivotDim[] = ["route", "customer", "category", "stock"];
 
-/** Twelve Sunday-based week ranges, newest first. Matches the Order
+/** Twelve Monday-to-Sunday week ranges, newest first. Matches the Order
  *  Assistant's week definition so column headers stay consistent across
  *  the app. */
 function buildWeekColumnsDesc(): WeekRange[] {
@@ -871,7 +871,7 @@ type PivotRowViewProps = {
   onToggle: (v: VisibleRow) => void;
   onRetry: (depth: number, values: string[]) => void;
   /** Open the transactions modal for this row's bucket. `weekStart` is
-   *  the Sunday ISO of the clicked week, or null for the Total column. */
+   *  the Monday ISO of the clicked week, or null for the Total column. */
   onOpenTx: (v: VisibleRow, weekStart: string | null) => void;
   /** Open the customer-assignment edit modal. Only rendered for customer
    *  rows; the handler receives the customer account. */

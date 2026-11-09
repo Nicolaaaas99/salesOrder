@@ -82,7 +82,18 @@ export type SalesOrderCreate = {
   tax_mode?: "Exclusive" | "Inclusive";
   description?: string | null;
   lines: SalesOrderLineInput[];
+  /** Order Assistant only: ids of the suggestions shown for this customer.
+   *  When present (even empty) the backend records each suggestion's
+   *  ACCEPTED / MODIFIED / REJECTED decision + MANUAL_ADD rows. */
+  suggestion_ids?: number[];
+  /** Which screen saved the order. Stamped onto cSourceApp in both
+   *  _tb_SOOrderAssistantAudit and _tb_SOCustomerContactLog (PLACED row). */
+  source?: OrderSource;
 };
+
+/** Screen an order was saved from — lets reports tell Order Assistant
+ *  orders apart from ones keyed manually in Sales Order Entry. */
+export type OrderSource = "ORDER_ASSISTANT" | "SALES_ORDER_ENTRY";
 
 export type SalesOrderCreateResponse = {
   order_no: string;
@@ -224,7 +235,7 @@ export type PivotRow = {
   label: string;
   sublabel: string | null;
   has_children: boolean;
-  /** Keyed by Sunday-of-week ISO date (YYYY-MM-DD). */
+  /** Keyed by week-start (Monday) ISO date (YYYY-MM-DD). */
   weekly: Record<string, PivotWeekCell>;
   total_amount: number;
   total_litres: number;
@@ -271,6 +282,7 @@ export type TransactionListResponse = {
  *  server-side by the order-save path and is never submitted by the modal. */
 export type ContactOutcomeModal =
   | "NO_ORDER"
+  | "WRITTEN_ORDER"
   | "CALLBACK"
   | "NO_ANSWER"
   | "REFUSED";
@@ -298,7 +310,7 @@ export type ContactLogCreate = {
    *  Deliveries report can filter outcomes by the day the rep was
    *  prepping for (not necessarily today). */
   delivery_date?: string | null;
-  source_app?: string;
+  source_app?: OrderSource;
 };
 
 
@@ -323,6 +335,32 @@ export type OrderSuggestion = {
   warehouse_codes: string[];
   pack_size: number;
   price_source: string;   // 'Customer Deal' | 'Group Deal' | 'Price List' | 'None'
+
+  // Phase 4 — target-aware suggestions. suggested_quantity is always
+  // max(0, weekly basis − already covered) snapped to pack, where the weekly
+  // basis is the management target (source TARGET) or the weekly median.
+  source: "TARGET" | "BASE_MODEL";
+  base_weekly_qty: number | null;   // weekly median (null if too little history)
+  forecast_qty: number | null;      // active forecast for the delivery week
+  target_qty: number | null;        // weekly target (TARGET only)
+  target_source: "SCENARIO" | "OVERRIDE" | null;
+  scenario_names: string[];
+  week_start: string | null;        // Monday of the delivery week
+  suggestion_id: number | null;     // set when the presentation was recorded
+};
+
+/** A management target for one customer × stock in the delivery week. */
+export type WeekTarget = {
+  stock_code: string;
+  description: string;
+  category: string;
+  week_start: string;
+  target_qty: number;
+  forecast_qty: number;
+  covered_qty: number;   // invoiced that week + open sales orders
+  pack_size: number;
+  source: "SCENARIO" | "OVERRIDE";
+  scenario_names: string[];
 };
 
 
@@ -391,7 +429,7 @@ export type CustomerBulkAssignmentResult = {
 
 export type PerformanceWindow = {
   today: number;
-  week: number;   // Sunday-to-Saturday, anchored on the current week's Sunday
+  week: number;   // Monday-to-Sunday, anchored on the current week's Monday
   month: number;  // Calendar month to date
 };
 
@@ -466,4 +504,57 @@ export type TargetUpsert = {
   target_litres: number;
   effective_from: string;
   effective_to?: string | null;
+};
+
+
+// ---------- Order Intake dashboard ----------
+
+/** 'SO Assistant' (app wrote a CREATE audit row) or 'Evolution'. */
+export type OrderIntakeSource = "SO Assistant" | "Evolution";
+
+export type OrderIntakeMetrics = {
+  orders: number;
+  ordered_qty: number;
+  ordered_litres: number;
+  ordered_excl: number;
+  invoiced_qty: number;
+  invoiced_litres: number;
+  invoiced_excl: number;
+};
+
+/** One (date, hour, source, app screen, user, corp group) bucket. */
+export type OrderIntakeRow = OrderIntakeMetrics & {
+  date: string;
+  hour: number;
+  source: OrderIntakeSource;
+  /** ORDER_ASSISTANT | SALES_ORDER_ENTRY | UNKNOWN | null (Evolution / legacy). */
+  app_screen: string | null;
+  user: string;
+  corp_group: string;
+};
+
+export type OrderIntakeSummary = {
+  from_date: string;
+  to_date: string;
+  rows: OrderIntakeRow[];
+};
+
+export type OrderIntakeOrder = Omit<OrderIntakeMetrics, "orders"> & {
+  order_no: string;
+  created_at: string;
+  hour: number;
+  source: OrderIntakeSource;
+  app_screen: string | null;
+  user: string;
+  corp_group: string;
+  customer_account: string;
+  customer_name: string;
+  doc_state: number;
+};
+
+export type OrderIntakeDrillFilter = {
+  hour?: number | null;
+  source?: string | null;
+  user?: string | null;
+  corp_group?: string | null;
 };

@@ -3,7 +3,7 @@ import { AlertTriangle, XCircle } from "lucide-react";
 import type { ContactOutcomeModal as Outcome } from "../api/types";
 
 /** Modal shown when the agent leaves a customer without placing an order.
- *  The agent must either (1) pick one of the four outcomes — which logs a
+ *  The agent must either (1) pick one of the outcomes — which logs a
  *  row and lets them leave — or (2) press "Opened by mistake", which lets
  *  them leave WITHOUT writing a row (the dropdown dot stays red). There's
  *  no close/cancel button and the backdrop isn't clickable — those exits
@@ -19,6 +19,12 @@ const OUTCOMES: {
     value: "NO_ORDER",
     label: "No order needed",
     description: "Customer didn't need to order today.",
+    tone: "amber",
+  },
+  {
+    value: "WRITTEN_ORDER",
+    label: "Written order",
+    description: "Customer sent a written order — it'll be captured manually.",
     tone: "amber",
   },
   {

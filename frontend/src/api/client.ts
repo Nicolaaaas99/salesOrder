@@ -34,15 +34,19 @@ import type {
   AllAgentOption,
   AgentOption,
   OrderSuggestion,
+  WeekTarget,
   AgentPerformance,
   TargetListResponse,
   TargetWithActual,
   TargetUpsert,
+  OrderIntakeSummary,
+  OrderIntakeOrder,
+  OrderIntakeDrillFilter,
 } from "./types";
 
 // Serialize array params as repeated keys (`states=1&states=3`) rather than
 // axios's default `states[]=…` form, so FastAPI's `List[int]` reads them.
-const http = axios.create({
+export const http = axios.create({
   baseURL: "/api",
   paramsSerializer: (params) => {
     const sp = new URLSearchParams();
@@ -137,7 +141,14 @@ export const api = {
   searchCustomers: (
     q: string,
     limit = 50,
-    filters?: { route?: string | null; telesale?: string | null; sales_rep?: string | null },
+    filters?: {
+      route?: string | null;
+      telesale?: string | null;
+      sales_rep?: string | null;
+      /** Only corporate groups — Spar / Checkers / Boxer / Pick n Pay / OK
+       *  (Client.ulARCorpGroup; list lives in backend lookups.CORPORATE_GROUPS). */
+      corporate_only?: boolean;
+    },
   ) =>
     http
       .get<CustomerSummary[]>("/lookups/customers", {
@@ -147,6 +158,7 @@ export const api = {
           route: filters?.route || undefined,
           telesale: filters?.telesale || undefined,
           sales_rep: filters?.sales_rep || undefined,
+          corporate_only: filters?.corporate_only || undefined,
         },
       })
       .then((r) => r.data),
@@ -387,6 +399,41 @@ export const api = {
     URL.revokeObjectURL(url);
   },
 
+  // ---------- Order Intake dashboard ----------
+  /** Hourly buckets for orders created in [from, to] (max 31 days). Called
+   *  on screen open / Refresh / date change only — never on a timer. */
+  getOrderIntake: (from: string, to: string) =>
+    http
+      .get<OrderIntakeSummary>("/analytics/order-intake", { params: { from, to } })
+      .then((r) => r.data),
+
+  listOrderIntakeOrders: (from: string, to: string, filter: OrderIntakeDrillFilter) =>
+    http
+      .get<OrderIntakeOrder[]>("/analytics/order-intake/orders", {
+        params: {
+          from,
+          to,
+          hour: filter.hour ?? undefined,
+          source: filter.source || undefined,
+          user: filter.user || undefined,
+          corp_group: filter.corp_group || undefined,
+        },
+      })
+      .then((r) => r.data),
+
+  exportOrderIntakeXlsx: async (from: string, to: string) => {
+    const resp = await http.get<Blob>("/analytics/order-intake/export", {
+      params: { from, to },
+      responseType: "blob",
+    });
+    const url = URL.createObjectURL(resp.data);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = from === to ? `order-intake-${from}.xlsx` : `order-intake-${from}_to_${to}.xlsx`;
+    a.click();
+    URL.revokeObjectURL(url);
+  },
+
   listHistoryOrders: (customerId: string) =>
     http
       .get<HistoricalOrder[]>("/history/orders", { params: { customer_id: customerId } })
@@ -460,7 +507,7 @@ export const api = {
 
   /** Individual invoice/credit-note lines that roll up into a bucket.
    *  `values` has length = clicked row's depth + 1 (parent chain + the
-   *  row's own key). `weekStart` is the Sunday ISO date of the clicked
+   *  row's own key). `weekStart` is the Monday ISO date of the clicked
    *  week column — omit to span the full window (used by the Total
    *  column click). */
   getCustomerHistoryTransactions: (
@@ -489,6 +536,9 @@ export const api = {
     weeks = 6,
     minWeeks = 3,
     warehouseCode?: string | null,
+    /** Persist this presentation so the rep's decision can be captured on
+     *  save. Only the Order Assistant passes true. */
+    record = false,
   ) =>
     http
       .get<OrderSuggestion[]>("/history/suggestions", {
@@ -498,7 +548,15 @@ export const api = {
           weeks,
           min_weeks: minWeeks,
           ...(warehouseCode ? { warehouse_code: warehouseCode } : {}),
+          ...(record ? { record: true } : {}),
         },
+      })
+      .then((r) => r.data),
+
+  listWeekTargets: (customerId: string, asOf: string) =>
+    http
+      .get<WeekTarget[]>("/history/week-targets", {
+        params: { customer_id: customerId, as_of: asOf },
       })
       .then((r) => r.data),
 

@@ -303,7 +303,7 @@ Round half-up: 57
 Reasonableness checks against the leaf:
   - P95 of trailing 52w (only 9 non-zero so effective max ≈ 60):
       85.5 > 60  →  flag 'above_historical_p95'
-  - SKU launched < 52 weeks ago, no prior-year baseline:
+  - SKU first invoiced < 13 weeks ago (first invoice = W-9), no prior-year baseline:
       → flag 'new_product_requires_review'
 ```
 
@@ -517,5 +517,7 @@ management UI. Phase 6 is scheduling.
    - P95 of trailing 52 weeks
    - 25% implied YoY growth
    - New-product review for < 52 weeks since launch
+     → **Settled 2026-11-03:** < 13 weeks since the SKU's first invoice
+     (see FORECASTING_BUILD_PLAN.md decision #6)
    - Pack-size minimum = 1 pack
    Each is a tunable; happy to adjust.

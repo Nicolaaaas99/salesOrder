@@ -36,17 +36,16 @@ under-count. Lift the cap on the view if that becomes an issue.
 from datetime import date, timedelta
 from typing import Optional
 
+from services.forecasting import weeks as fc_weeks
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 
-def sunday_of_current_week(d: Optional[date] = None) -> date:
-    """Sunday that opens the given day's week (defaults to today).
+def start_of_current_week(d: Optional[date] = None) -> date:
+    """Monday that opens the given day's ISO week (defaults to today).
     Matches the Analytics 12-week pivot columns and the PerformanceStrip
     "this week" bucket."""
-    d = d or date.today()
-    # isoweekday: Mon=1..Sun=7. Modulo 7 maps Sunday→0.
-    return d - timedelta(days=d.isoweekday() % 7)
+    return fc_weeks.week_start(d or date.today())
 
 
 def resolve_window(period: str, eff_from: date, eff_to: Optional[date]) -> tuple[date, date]:
@@ -63,7 +62,7 @@ def resolve_window(period: str, eff_from: date, eff_to: Optional[date]) -> tuple
     if period == "DAILY":
         return today, today
     if period == "WEEKLY":
-        return sunday_of_current_week(today), today
+        return start_of_current_week(today), today
     if period == "MONTHLY":
         return today.replace(day=1), today
     if period == "CUSTOM":

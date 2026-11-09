@@ -7,7 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 import config
 from request_context import current_request_path
-from routers import auth, lookups, sales_orders, debug, history, contact_log, analytics, targets, admin
+from routers import auth, lookups, sales_orders, debug, history, contact_log, analytics, order_intake, targets, admin, forecasting
 from connection import connect
 
 # Log to stdout so IIS httpPlatformHandler writes it to backend\logs\stdout_*.log
@@ -53,8 +53,10 @@ api.include_router(debug.router)
 api.include_router(history.router)
 api.include_router(contact_log.router)
 api.include_router(analytics.router)
+api.include_router(order_intake.router)
 api.include_router(targets.router)
 api.include_router(admin.router)
+api.include_router(forecasting.router)
 app.include_router(api)
 
 

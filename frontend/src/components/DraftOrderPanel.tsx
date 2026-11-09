@@ -1,9 +1,10 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { ArrowRight, Trash2, Plus, Lock, Unlock, AlertCircle, X } from "lucide-react";
 import type {
   CustomerDetail,
   InventoryItem,
   TaxType,
+  WeekTarget,
 } from "../api/types";
 import { fmtCurrency, fmtNumber } from "../utils/format";
 import {
@@ -58,9 +59,95 @@ type Props = {
    *  rep clicks + on an item that's already in the draft so they can see
    *  which row is theirs on this panel. */
   focusRowFlash?: { code: string; bumpKey: number } | null;
+  /** Management targets for the delivery week (Phase 4). Renders the
+   *  "this week's targets" progress strip; nothing shows when empty. */
+  weekTargets?: WeekTarget[];
 };
 
 const taxMode: TaxMode = "Exclusive";
+
+const STRIP_COLLAPSED_ROWS = 3;
+
+/** Target-vs-committed progress for the delivery week. Committed = already
+ *  invoiced this week + open sales orders + what's in this draft. */
+function WeekTargetStrip({ targets, lines }: { targets: WeekTarget[]; lines: LineRow[] }) {
+  const [expanded, setExpanded] = useState(false);
+  const rows = useMemo(() => {
+    const drafted = new Map<string, number>();
+    lines.forEach((l) => {
+      if (!l.stock_code) return;
+      const k = l.stock_code.trim().toUpperCase();
+      drafted.set(k, (drafted.get(k) || 0) + (l.quantity || 0));
+    });
+    return targets
+      .map((t) => {
+        const inDraft = drafted.get(t.stock_code.trim().toUpperCase()) || 0;
+        const committed = t.covered_qty + inDraft;
+        const pct = t.target_qty > 0 ? Math.min(100, (committed / t.target_qty) * 100) : 100;
+        return { t, inDraft, committed, pct, met: committed >= t.target_qty - 1e-6 };
+      })
+      // Unmet first, then by how far behind they are.
+      .sort((a, b) => Number(a.met) - Number(b.met) || a.pct - b.pct);
+  }, [targets, lines]);
+
+  if (rows.length === 0) return null;
+  const metCount = rows.filter((r) => r.met).length;
+  const visible = expanded ? rows : rows.slice(0, STRIP_COLLAPSED_ROWS);
+
+  return (
+    <div className="border-b bg-blue-50/60 px-2 py-1.5 text-xs" data-testid="week-target-strip">
+      <div className="flex items-center justify-between mb-1">
+        <span className="font-semibold text-blue-900">
+          🎯 This week's targets
+        </span>
+        <span className={metCount === rows.length ? "text-emerald-700 font-semibold" : "text-gray-600"}>
+          {metCount} of {rows.length} met
+        </span>
+      </div>
+      <ul className="space-y-1">
+        {visible.map(({ t, inDraft, committed, pct, met }) => (
+          <li
+            key={t.stock_code}
+            title={
+              `${t.stock_code} — ${t.description}\n` +
+              `Target: ${fmtNumber(t.target_qty)} (forecast ${fmtNumber(t.forecast_qty)})\n` +
+              `Already ordered / invoiced this week: ${fmtNumber(t.covered_qty)}\n` +
+              `In this draft: ${fmtNumber(inDraft)}\n` +
+              (t.source === "OVERRIDE"
+                ? "Set manually by a manager"
+                : t.scenario_names.length ? `From: ${t.scenario_names.join(", ")}` : "")
+            }
+          >
+            <div className="flex items-center gap-2">
+              <span className="w-24 truncate font-medium text-gray-800">
+                {t.stock_code}
+                <span className="ml-1 font-normal text-gray-500">{t.description}</span>
+              </span>
+              <div className="flex-1 h-1.5 rounded bg-gray-200 overflow-hidden">
+                <div
+                  className={`h-full rounded ${met ? "bg-emerald-500" : "bg-blue-500"}`}
+                  style={{ width: `${pct}%` }}
+                />
+              </div>
+              <span className={`font-mono whitespace-nowrap ${met ? "text-emerald-700" : "text-gray-700"}`}>
+                {fmtNumber(committed)} / {fmtNumber(t.target_qty)}
+              </span>
+            </div>
+          </li>
+        ))}
+      </ul>
+      {rows.length > STRIP_COLLAPSED_ROWS && (
+        <button
+          type="button"
+          onClick={() => setExpanded((v) => !v)}
+          className="mt-1 text-blue-700 hover:underline"
+        >
+          {expanded ? "Show less" : `Show all ${rows.length}`}
+        </button>
+      )}
+    </div>
+  );
+}
 
 export function DraftOrderPanel({
   customer,
@@ -80,6 +167,7 @@ export function DraftOrderPanel({
   continueBlockMsg,
   onDismissContinueBlock,
   focusRowFlash,
+  weekTargets = [],
 }: Props) {
   // Refs so we can detect clicks outside the pop-ups and dismiss them.
   const blockedPickRef = useRef<HTMLDivElement | null>(null);
@@ -204,6 +292,8 @@ export function DraftOrderPanel({
           </button>
         )}
       </div>
+
+      <WeekTargetStrip targets={weekTargets} lines={lines} />
 
       <div className="flex-1 overflow-auto p-2 min-h-0">
         {lines.length === 0 ? (

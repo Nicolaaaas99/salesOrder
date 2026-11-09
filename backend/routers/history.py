@@ -1,9 +1,11 @@
+import logging
 from datetime import date, timedelta
 from io import BytesIO
 from statistics import median
 from typing import List, Optional
 from fastapi import APIRouter, Depends, Query
 from fastapi.responses import StreamingResponse
+from services.forecasting import weeks as fc_weeks
 from sqlalchemy import bindparam, text
 from sqlalchemy.orm import Session
 
@@ -12,6 +14,9 @@ from database import get_db
 import schemas
 from services.pricing import resolve_customer_prices
 from services import short_cache
+from services.forecasting import suggestions as sugg
+
+log = logging.getLogger(__name__)
 
 router = APIRouter(
     prefix="/history",
@@ -20,10 +25,9 @@ router = APIRouter(
 )
 
 
-def _week_start_sunday(d: date) -> date:
-    """Return the Sunday on or before d."""
-    days_since_sunday = (d.weekday() + 1) % 7
-    return d - timedelta(days=days_since_sunday)
+def _week_start(d: date) -> date:
+    """Monday that opens d's ISO week (see services/forecasting/weeks.py)."""
+    return fc_weeks.week_start(d)
 
 
 @router.get("/routes", response_model=List[schemas.HistoryRoute])
@@ -460,10 +464,19 @@ def order_suggestions(
     weeks: int = Query(6, ge=2, le=26),
     min_weeks: int = Query(3, ge=1),
     warehouse_code: Optional[str] = Query(None),
+    record: bool = Query(False, description="Persist this presentation to _tb_SOOrderSuggestion "
+                                            "(Order Assistant only) and return suggestion_id per row"),
     db: Session = Depends(get_db),
+    username: str = Depends(get_current_user),
 ):
     """
     Suggested reorder basket for a customer.
+
+    Phase 4 -- target-aware: when a materialised management target exists
+    for the delivery week (week of `as_of`), it replaces the weekly median
+    as the basis, and targeted SKUs are suggested even without enough
+    history. Step 6 below applies to both. See
+    services/forecasting/suggestions.py.
 
     Algorithm:
     1. Historical window = last `weeks` COMPLETED calendar weeks (Sun-Sat).
@@ -485,7 +498,7 @@ def order_suggestions(
        customer would actually be charged on the order being drafted.
     """
     today = date.today()
-    current_week_start = _week_start_sunday(today)
+    current_week_start = _week_start(today)
     # Fetch `weeks` completed weeks + the current (partial) week.
     window_start = current_week_start - timedelta(weeks=weeks)
     # Upper bound = end of CURRENT week (Sat), not just today. An invoiced
@@ -559,7 +572,7 @@ def order_suggestions(
             bucket["on_order_qty"] += qty
             continue
 
-        wk = _week_start_sunday(tx_date)
+        wk = _week_start(tx_date)
         if wk >= current_week_start:
             # Invoiced in the current (in-progress) week → coverage, NOT median.
             bucket["current_week_invoiced"] += qty
@@ -594,8 +607,64 @@ def order_suggestions(
                 total_weeks=weeks,
                 on_order_qty=bucket["on_order_qty"],
                 current_week_invoiced_qty=bucket["current_week_invoiced"],
+                base_weekly_qty=base_median,
             )
         )
+
+    # Phase 4: management targets + active forecast for the delivery week.
+    # Any failure here (e.g. forecasting tables not deployed) degrades to
+    # the legacy suggestion rather than breaking the rep's screen.
+    delivery_week = _week_start(as_of)
+    try:
+        targets_by_code = sugg.load_week_targets(db, customer_id, delivery_week)
+        week_forecasts = sugg.load_week_forecasts(db, customer_id, delivery_week)
+    except Exception:
+        db.rollback()
+        log.exception("Target lookup failed for %s; using base suggestions", customer_id)
+        targets_by_code, week_forecasts = {}, {}
+
+    targeted_done: set[str] = set()
+    for s in suggestions:
+        key = s.stock_code.strip().upper()
+        s.week_start = delivery_week
+        fc = week_forecasts.get(key)
+        s.forecast_qty = fc[1] if fc else None
+        t = targets_by_code.get(key)
+        if t and key not in targeted_done:
+            targeted_done.add(key)
+            s.source = sugg.SOURCE_TARGET
+            s.suggested_quantity = t.target_qty          # weekly basis; coverage subtracted below
+            s.target_qty = t.target_qty
+            s.target_source = t.source
+            s.scenario_names = t.scenario_names
+            if s.forecast_qty is None:
+                s.forecast_qty = t.forecast_qty
+
+    # Targeted SKUs without enough history for a base suggestion.
+    buckets_by_code: dict[str, dict] = {}
+    for b in buckets.values():
+        buckets_by_code.setdefault(b["stock_code"].strip().upper(), b)
+    for key, t in targets_by_code.items():
+        if key in targeted_done:
+            continue
+        b = buckets_by_code.get(key)
+        suggestions.append(schemas.OrderSuggestion(
+            stock_code=b["stock_code"] if b else t.stock_code,
+            description=b["description"] if b else "",          # filled from inventory below
+            category=(b["category"] if b else (t.category or "Uncategorized")),
+            suggested_quantity=t.target_qty,
+            unit_price=0.0,
+            non_zero_weeks=len([w for w in b["weekly_invoiced"].values() if w["qty"] > 0]) if b else 0,
+            total_weeks=weeks,
+            on_order_qty=b["on_order_qty"] if b else 0.0,
+            current_week_invoiced_qty=b["current_week_invoiced"] if b else 0.0,
+            source=sugg.SOURCE_TARGET,
+            forecast_qty=(week_forecasts[key][1] if key in week_forecasts else t.forecast_qty),
+            target_qty=t.target_qty,
+            target_source=t.source,
+            scenario_names=t.scenario_names,
+            week_start=delivery_week,
+        ))
 
     # Enrich with inventory info (warehouse list, tax type, uom, availability) in one round-trip
     if suggestions:
@@ -627,6 +696,8 @@ def order_suggestions(
             if not inv:
                 continue
             s.item_description = inv["description"] or s.description
+            if not s.description:
+                s.description = s.item_description
             s.is_uom_item = bool(inv["is_uom_item"])
             s.is_whse_item = bool(inv["is_whse_item"])
             s.uom = inv["uom"] or ""
@@ -643,11 +714,15 @@ def order_suggestions(
             # invoiced earlier this week) from the historical median, THEN snap
             # to pack size. Dropping both sources means the suggestion stays
             # the same whether the SO is still pending or just invoiced.
-            base_median = s.suggested_quantity
-            already_covered = s.on_order_qty + s.current_week_invoiced_qty
-            adjusted = max(0.0, base_median - already_covered)
-            crates = int(adjusted / pack + 0.5)
-            s.suggested_quantity = float(crates * pack)   # may be 0 → filtered
+            # (weekly basis = target for TARGET rows, median otherwise).
+            # Targets round UP to the next full pack so the ask is met;
+            # base suggestions keep the legacy nearest-pack rounding.
+            s.suggested_quantity = sugg.remaining_week_qty(   # may be 0 → filtered
+                s.suggested_quantity,
+                s.on_order_qty + s.current_week_invoiced_qty,
+                pack,
+                round_up=(s.source == sugg.SOURCE_TARGET),
+            )
 
         # Fill unit_price from the customer/deal price resolver. Suggestions
         # with no priced entry stay at 0 and the rep must enter a price.
@@ -670,7 +745,89 @@ def order_suggestions(
     # already shows the pending qty for that stock.
     suggestions = [s for s in suggestions if s.suggested_quantity > 0]
 
+    for s in suggestions:
+        if not s.description:
+            s.description = s.stock_code
+
     suggestions.sort(
-        key=lambda s: (-s.non_zero_weeks, -(s.suggested_quantity * s.unit_price))
+        key=lambda s: (s.source != sugg.SOURCE_TARGET, -s.non_zero_weeks,
+                       -(s.suggested_quantity * s.unit_price))
     )
+
+    if record and suggestions:
+        rows = []
+        for s in suggestions:
+            key = s.stock_code.strip().upper()
+            rows.append(sugg.PresentationRow(
+                stock_code=s.stock_code,
+                suggested_qty=s.suggested_quantity,
+                source=s.source,
+                target_id=(targets_by_code[key].target_id
+                           if s.source == sugg.SOURCE_TARGET and key in targets_by_code else None),
+                forecast_id=week_forecasts[key][0] if key in week_forecasts else None,
+                target_basis=s.target_qty,
+                forecast_basis=s.forecast_qty,
+            ))
+        ids = sugg.record_presentation(
+            db, customer=customer_id, delivery_date=as_of, username=username, rows=rows,
+        )
+        for s in suggestions:
+            s.suggestion_id = ids.get(s.stock_code.strip().upper())
     return suggestions
+
+
+@router.get("/week-targets", response_model=List[schemas.WeekTarget])
+def week_targets(
+    customer_id: str = Query(...),
+    as_of: date = Query(..., description="Delivery / session date; its week (Mon-Sun) is used"),
+    db: Session = Depends(get_db),
+):
+    """Management targets for the customer's delivery week with what's
+    already covered (invoiced in that week + open sales orders), for the
+    Order Assistant progress strip. Empty when no target is active."""
+    week = _week_start(as_of)
+    try:
+        targets = sugg.load_week_targets(db, customer_id, week)
+    except Exception:
+        db.rollback()
+        log.exception("Week-target lookup failed for %s", customer_id)
+        return []
+    if not targets:
+        return []
+
+    codes = sorted({t.stock_code for t in targets.values()})
+    covered: dict[str, float] = {}
+    for r in db.execute(text("""
+        SELECT StockCode, SUM(Quantity) AS qty
+          FROM [SOAssistant].dbo._vw_SOCustomerInvoiceHistory
+         WHERE CustomerAccount = :c AND StockCode IN :codes
+           AND (OnOrder = 1 OR (OnOrder = 0 AND TxDate >= :ws AND TxDate < :we))
+         GROUP BY StockCode
+    """).bindparams(bindparam("codes", expanding=True)),
+            {"c": customer_id, "codes": codes, "ws": week,
+             "we": week + timedelta(days=7)}).mappings():
+        covered[(r["StockCode"] or "").strip().upper()] = float(r["qty"] or 0)
+
+    meta: dict[str, dict] = {}
+    for r in db.execute(text("""
+        SELECT Code, Description_1, ulIIMainCategory, ISNULL(ulIIPerCrate, 1) AS pack
+          FROM dbo.StkItem WHERE Code IN :codes
+    """).bindparams(bindparam("codes", expanding=True)), {"codes": codes}).mappings():
+        meta[(r["Code"] or "").strip().upper()] = dict(r)
+
+    out = []
+    for key, t in sorted(targets.items()):
+        m = meta.get(key, {})
+        out.append(schemas.WeekTarget(
+            stock_code=t.stock_code,
+            description=(m.get("Description_1") or "").strip(),
+            category=(m.get("ulIIMainCategory") or t.category or ""),
+            week_start=week,
+            target_qty=t.target_qty,
+            forecast_qty=t.forecast_qty,
+            covered_qty=max(0.0, covered.get(key, 0.0)),
+            pack_size=max(1, int(m.get("pack") or 1)),
+            source=t.source,
+            scenario_names=t.scenario_names,
+        ))
+    return out

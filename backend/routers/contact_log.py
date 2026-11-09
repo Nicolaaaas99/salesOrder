@@ -1,11 +1,12 @@
 """
 Customer contact log — endpoints the Order Assistant uses to record what
-happened on each customer visit (no-order, callback, no-answer, refused)
+happened on each customer visit (no-order, written order, callback,
+no-answer, refused)
 and to colour the dropdown dots on the customer picker.
 
 PLACED outcomes are written server-side by the order-save path and should
 NOT come through POST /contact-log — the modal only ever picks one of the
-four non-placed outcomes.
+non-placed outcomes.
 """
 import logging
 from datetime import date
@@ -28,7 +29,7 @@ from services.contact_log import (
 logger = logging.getLogger(__name__)
 
 # PLACED only comes from the order-save path. The modal + POST /contact-log
-# are limited to the four outcomes a telesales agent can actually log by hand.
+# are limited to the outcomes a telesales agent can actually log by hand.
 MODAL_OUTCOMES = {o for o in ALLOWED_OUTCOMES if o != "PLACED"}
 
 

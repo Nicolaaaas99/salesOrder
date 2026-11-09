@@ -10,6 +10,7 @@ import {
   Plus,
 } from "lucide-react";
 import type { HistoricalOrder, OrderSuggestion } from "../api/types";
+
 import {
   aggregateOrders,
   detectProblemItems,
@@ -22,6 +23,29 @@ import {
   type ProblemInfo,
   type WeekRange,
 } from "../utils/history";
+
+/** Hover text for a target-driven suggestion: how the number was built,
+ *  forecast → target → already covered → suggested now. */
+function targetChainTitle(s: OrderSuggestion): string {
+  const fmt = (n: number) => formatQty(n);
+  const parts: string[] = ["🎯 Management target for this week"];
+  if (s.forecast_qty != null) parts.push(`Forecast: ${fmt(s.forecast_qty)}`);
+  if (s.target_qty != null) {
+    let line = `Target: ${fmt(s.target_qty)}`;
+    if (s.forecast_qty != null && s.forecast_qty > 0) {
+      const pct = (s.target_qty / s.forecast_qty - 1) * 100;
+      if (Math.abs(pct) >= 0.5) line += ` (${pct > 0 ? "+" : ""}${pct.toFixed(0)}% vs forecast)`;
+    }
+    parts.push(line);
+  }
+  if (s.target_source === "OVERRIDE") parts.push("Set manually by a manager");
+  else if (s.scenario_names.length) parts.push(`From: ${s.scenario_names.join(", ")}`);
+  const covered = (s.on_order_qty || 0) + (s.current_week_invoiced_qty || 0);
+  if (covered > 0) parts.push(`Already ordered / invoiced this week: −${fmt(covered)}`);
+  if (s.base_weekly_qty != null) parts.push(`(Usual weekly qty: ${fmt(s.base_weekly_qty)})`);
+  parts.push(`Suggested now: ${fmt(s.suggested_quantity)}`);
+  return parts.join("\n");
+}
 
 type Props = {
   orders: HistoricalOrder[];
@@ -611,9 +635,19 @@ function CategoryRow({
                   <td className="px-1 py-1 text-center border-l border-gray-100">
                     {suggestion ? (
                       <>
-                        <div className="font-mono text-sm font-bold text-blue-700">
-                          {formatQty(suggestion.suggested_quantity)}
-                        </div>
+                        {suggestion.source === "TARGET" ? (
+                          <div
+                            className="font-mono text-sm font-bold text-blue-700 whitespace-nowrap cursor-help"
+                            title={targetChainTitle(suggestion)}
+                          >
+                            <span className="mr-0.5" aria-label="Target">🎯</span>
+                            {formatQty(suggestion.suggested_quantity)}
+                          </div>
+                        ) : (
+                          <div className="font-mono text-sm font-bold text-blue-700">
+                            {formatQty(suggestion.suggested_quantity)}
+                          </div>
+                        )}
                         {/* Only surface the PENDING subtraction. Current-week
                             invoiced qty is also subtracted in the math, but
                             it's already visible in the current-week cell, so

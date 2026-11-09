@@ -1,15 +1,30 @@
-import { useState } from "react";
-import { History, Shield, Target as TargetIcon, Truck } from "lucide-react";
+import { Suspense, lazy, useState } from "react";
+import { BarChart3, Clock, History, Inbox, Shield, Target as TargetIcon, Truck } from "lucide-react";
 import { useAuth } from "../context/AuthContext";
 import { AdminUsersScreen } from "./AdminUsersScreen";
 import { DeliveriesScreen } from "./DeliveriesScreen";
+import { OrderIntakeScreen } from "./OrderIntakeScreen";
 import { CustomerSalesHistoryScreen } from "./CustomerSalesHistoryScreen";
 import { PerformanceScreen } from "./PerformanceScreen";
-import { TARGETS_FEATURE_ENABLED } from "../featureFlags";
+import { FORECASTING_UI_ENABLED, TARGETS_FEATURE_ENABLED } from "../featureFlags";
+
+// Management screens are code-split: agents never download them.
+const TargetsScreen = lazy(() =>
+  import("./TargetsScreen").then((m) => ({ default: m.TargetsScreen })));
+const OpportunityInboxScreen = lazy(() =>
+  import("./OpportunityInboxScreen").then((m) => ({ default: m.OpportunityInboxScreen })));
+const ModelLeaderboardScreen = lazy(() =>
+  import("./ModelLeaderboardScreen").then((m) => ({ default: m.ModelLeaderboardScreen })));
+
+const loadingScreen = (
+  <div className="h-full flex items-center justify-center text-sm text-gray-400">Loading…</div>
+);
 
 /** Hub landing for the Analytics tab. Contact Log card remains hidden
  *  until that phase is built — add it back here when ready. */
-type View = "hub" | "deliveries" | "customer-history" | "performance" | "admin-users";
+type View =
+  | "hub" | "deliveries" | "order-intake" | "customer-history" | "performance" | "admin-users"
+  | "targets" | "inbox" | "models";
 
 type Props = {
   /** Pass-through for the Deliveries screen's edit flow — opens a sales
@@ -20,11 +35,18 @@ type Props = {
 export function AnalyticsScreen({ onOpenOrder }: Props = {}) {
   const { role } = useAuth();
   const isAdmin = role === "ADMIN";
+  const isSupervisorPlus = role === "SUPERVISOR" || role === "ADMIN";
+  // Forecasting management screens: SUPERVISOR + ADMIN (backend enforces too).
+  const canManage = FORECASTING_UI_ENABLED && (role === "SUPERVISOR" || role === "ADMIN");
   const [view, setView] = useState<View>("hub");
   const backToHub = () => setView("hub");
 
   if (view === "deliveries") {
     return <DeliveriesScreen onOpenOrder={onOpenOrder} onBack={backToHub} />;
+  }
+  // Order Intake: SUPERVISOR + ADMIN only (backend enforces too).
+  if (view === "order-intake" && isSupervisorPlus) {
+    return <OrderIntakeScreen onOpenOrder={onOpenOrder} onBack={backToHub} />;
   }
   if (view === "customer-history") {
     return <CustomerSalesHistoryScreen onBack={backToHub} />;
@@ -34,6 +56,15 @@ export function AnalyticsScreen({ onOpenOrder }: Props = {}) {
   }
   if (view === "admin-users" && isAdmin) {
     return <AdminUsersScreen onBack={backToHub} />;
+  }
+  if (canManage && (view === "targets" || view === "inbox" || view === "models")) {
+    return (
+      <Suspense fallback={loadingScreen}>
+        {view === "targets" && <TargetsScreen onBack={backToHub} />}
+        {view === "inbox" && <OpportunityInboxScreen onBack={backToHub} />}
+        {view === "models" && <ModelLeaderboardScreen onBack={backToHub} />}
+      </Suspense>
+    );
   }
 
   return (
@@ -52,6 +83,15 @@ export function AnalyticsScreen({ onOpenOrder }: Props = {}) {
             description="Order counts per customer on a given date."
             onClick={() => setView("deliveries")}
           />
+          {isSupervisorPlus && (
+            <HubCard
+              icon={<Clock className="w-6 h-6" />}
+              iconClass="bg-sky-100 text-sky-700"
+              title="Order Intake"
+              description="Orders, qty, litres and amount per hour — SO Assistant vs Evolution."
+              onClick={() => setView("order-intake")}
+            />
+          )}
           <HubCard
             icon={<History className="w-6 h-6" />}
             iconClass="bg-emerald-100 text-emerald-700"
@@ -70,6 +110,31 @@ export function AnalyticsScreen({ onOpenOrder }: Props = {}) {
               description="Set and track litre targets."
               onClick={() => setView("performance")}
             />
+          )}
+          {canManage && (
+            <>
+              <HubCard
+                icon={<TargetIcon className="w-6 h-6" />}
+                iconClass="bg-amber-100 text-amber-700"
+                title="Targets"
+                description="Forecast, target and progress from company down to product. Set a target on any level and see the split before you approve it."
+                onClick={() => setView("targets")}
+              />
+              <HubCard
+                icon={<Inbox className="w-6 h-6" />}
+                iconClass="bg-teal-100 text-teal-700"
+                title="Opportunity Inbox"
+                description="Follow-up tasks from flagged targets and opportunity signals."
+                onClick={() => setView("inbox")}
+              />
+              <HubCard
+                icon={<BarChart3 className="w-6 h-6" />}
+                iconClass="bg-indigo-100 text-indigo-700"
+                title="Model Leaderboard"
+                description="Forecast accuracy per model and the promotion gate."
+                onClick={() => setView("models")}
+              />
+            </>
           )}
           {isAdmin && (
             <HubCard

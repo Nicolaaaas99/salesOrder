@@ -12,6 +12,7 @@ import type {
   OrderSuggestion,
   SalesOrderSearchResult,
   TaxType,
+  WeekTarget,
 } from "../api/types";
 import {
   ContactOutcomeModal,
@@ -215,6 +216,9 @@ export function OrderAssistantScreen({ onOpenOrder }: OrderAssistantProps = {}) 
   useCustomerAutoRefresh(customerDetail?.account ?? null, setCustomerDetail);
   const [orders, setOrders] = useState<HistoricalOrder[]>([]);
   const [suggestions, setSuggestions] = useState<OrderSuggestion[]>([]);
+  // Management targets for the customer's delivery week (Phase 4) — drive
+  // the progress strip in the draft panel. Empty when none are active.
+  const [weekTargets, setWeekTargets] = useState<WeekTarget[]>([]);
   const [packSizes, setPackSizes] = useState<Map<string, number>>(new Map());
   const [priceSources, setPriceSources] = useState<Map<string, string>>(new Map());
   // Stock codes that showed up only via active Customer / Group Deals (i.e.
@@ -405,6 +409,7 @@ export function OrderAssistantScreen({ onOpenOrder }: OrderAssistantProps = {}) 
     if (!selectedCustomer) {
       setOrders([]);
       setSuggestions([]);
+      setWeekTargets([]);
       setPackSizes(new Map());
       setPriceSources(new Map());
       setNewDealStocks(new Set());
@@ -426,13 +431,17 @@ export function OrderAssistantScreen({ onOpenOrder }: OrderAssistantProps = {}) 
       setIsLoadingOrders(true);
       setError(null);
       try {
-        const [ordersData, suggestionsData, detail, dealItems] = await Promise.all([
+        const [ordersData, suggestionsData, detail, dealItems, weekTargetsData] = await Promise.all([
           api.listHistoryOrders(selectedCustomer.value),
-          api.listOrderSuggestions(selectedCustomer.value, sessionDate!, undefined, undefined, defaultWarehouseCode),
+          // record=true: this presentation is persisted so the rep's
+          // accept / modify / reject decision is captured on save.
+          api.listOrderSuggestions(selectedCustomer.value, sessionDate!, undefined, undefined, defaultWarehouseCode, true),
           api.getCustomer(selectedCustomer.value).catch(() => null),
           api
             .listCustomerDealItems(selectedCustomer.value, sessionDate!, defaultWarehouseCode)
             .catch(() => []),
+          // Targets are an add-on — never let them block the screen.
+          api.listWeekTargets(selectedCustomer.value, sessionDate!).catch(() => [] as WeekTarget[]),
         ]);
 
         // Inject synthetic 0-qty "orders" for dealed stocks the customer
@@ -443,6 +452,14 @@ export function OrderAssistantScreen({ onOpenOrder }: OrderAssistantProps = {}) 
           o.items.forEach((it) => it.stockCode && stocksInHistory.add(it.stockCode)),
         );
         const todayIso = today();
+        // Targeted stocks the customer has never bought (e.g. a launch push)
+        // also need a grid row, otherwise the suggestion has nowhere to show.
+        // The row's description must match the suggestion's so the
+        // productKey lookup lines up.
+        const targetOnly = suggestionsData.filter(
+          (s) => s.source === "TARGET" && !stocksInHistory.has(s.stock_code),
+        );
+        const targetDesc = new Map(targetOnly.map((s) => [s.stock_code, s.description]));
         const dealOnlyOrders = dealItems
           .filter((d) => d.stock_code && !stocksInHistory.has(d.stock_code))
           .map((d, i) => ({
@@ -453,7 +470,7 @@ export function OrderAssistantScreen({ onOpenOrder }: OrderAssistantProps = {}) 
             items: [
               {
                 stockCode: d.stock_code,
-                description: d.description,
+                description: targetDesc.get(d.stock_code) ?? d.description,
                 category: d.category,
                 quantity: 0,
                 exclAmount: 0,
@@ -469,8 +486,36 @@ export function OrderAssistantScreen({ onOpenOrder }: OrderAssistantProps = {}) 
             totalInclAmount: 0,
           }));
 
-        setOrders([...ordersData, ...dealOnlyOrders]);
+        const dealStocks = new Set(dealOnlyOrders.map((o) => o.items[0].stockCode));
+        const targetOnlyOrders = targetOnly
+          .filter((s) => !dealStocks.has(s.stock_code))
+          .map((s, i) => ({
+            orderNum: `__target_${s.stock_code}_${i}`,
+            orderDate: todayIso,
+            route: "",
+            customerName: "",
+            items: [
+              {
+                stockCode: s.stock_code,
+                description: s.description,
+                category: s.category,
+                quantity: 0,
+                exclAmount: 0,
+                vat: 0,
+                inclAmount: 0,
+                onOrder: false,
+              },
+            ],
+            itemCount: 1,
+            totalQuantity: 0,
+            totalExclAmount: 0,
+            totalVat: 0,
+            totalInclAmount: 0,
+          }));
+
+        setOrders([...ordersData, ...dealOnlyOrders, ...targetOnlyOrders]);
         setSuggestions(suggestionsData);
+        setWeekTargets(weekTargetsData);
         setCustomerDetail(detail);
         setNewDealStocks(
           new Set(dealOnlyOrders.map((o) => o.items[0].stockCode)),
@@ -559,6 +604,18 @@ export function OrderAssistantScreen({ onOpenOrder }: OrderAssistantProps = {}) 
     });
     return m;
   }, [suggestions, draftLines]);
+
+  // Ids of every suggestion shown for this customer (recorded presentation).
+  // Sent with the order so the backend can mark each one accepted /
+  // modified / rejected. Empty array (not undefined) when nothing was
+  // suggested, so manual-only orders are still recorded as MANUAL_ADD.
+  const presentedSuggestionIds = useMemo(
+    () =>
+      suggestions
+        .map((s) => s.suggestion_id)
+        .filter((id): id is number => typeof id === "number"),
+    [suggestions],
+  );
 
   // Route progress counter shown at the top of the Customer picker. Total
   // comes from the route-customer-count state (populated once the list has
@@ -1268,6 +1325,7 @@ export function OrderAssistantScreen({ onOpenOrder }: OrderAssistantProps = {}) 
               continueBlockMsg={continueBlockMsg}
               onDismissContinueBlock={() => setContinueBlockMsg(null)}
               focusRowFlash={focusRowFlash}
+              weekTargets={weekTargets}
             />
           </div>
         </div>
@@ -1283,6 +1341,8 @@ export function OrderAssistantScreen({ onOpenOrder }: OrderAssistantProps = {}) 
                 initialCustomer={customerDetail}
                 controlledLines={draftLines}
                 onControlledLinesChange={setDraftLines}
+                suggestionIds={presentedSuggestionIds}
+                source="ORDER_ASSISTANT"
                 lockedCustomer
                 hideOpenButton
                 onClose={handleFinalizeClose}

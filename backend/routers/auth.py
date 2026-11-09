@@ -2,6 +2,7 @@ from datetime import date, timedelta
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from services.forecasting import weeks as fc_weeks
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
@@ -174,13 +175,10 @@ def me(username: str = Depends(get_current_user), db: Session = Depends(get_db))
     )
 
 
-def _sunday_of_current_week() -> date:
-    """Sunday that opens the current week (matches the Analytics 12-week
-    pivot columns + the stale-cutoff logic). Python isoweekday: Mon=1 ..
-    Sun=7; modulo 7 maps Sunday → 0."""
-    today = date.today()
-    days_since_sunday = today.isoweekday() % 7
-    return today - timedelta(days=days_since_sunday)
+def _start_of_current_week() -> date:
+    """Monday that opens the current ISO week (matches the Analytics
+    12-week pivot columns + the stale-cutoff logic)."""
+    return fc_weeks.week_start(date.today())
 
 
 @router.get("/me/performance", response_model=schemas.AgentPerformance)
@@ -203,7 +201,7 @@ def my_performance(
     repeat call to the same customer the same window doesn't double-
     count — "unique customers I reached" is the useful signal."""
     today = date.today()
-    week_start = _sunday_of_current_week()
+    week_start = _start_of_current_week()
     month_start = today.replace(day=1)
     bind = {
         "username": username,

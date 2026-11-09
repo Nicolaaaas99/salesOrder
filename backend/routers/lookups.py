@@ -23,6 +23,31 @@ router = APIRouter(
 )
 
 
+# Client.ulARCorpGroup values that count as corporate. Sales Order Entry
+# may only place orders for these customers (Order Assistant is
+# unrestricted). 'OK' = OK Foods. Allowlist rather than
+# "<> 'Non Corporate'" so NULL and any group added later stay excluded
+# until someone opts them in here.
+CORPORATE_GROUPS = ("Spar", "Checkers", "Boxer", "Pick n Pay", "OK")
+
+# SQL predicate on alias CL. NULL is folded to 'Non Corporate' explicitly
+# (it would be excluded anyway, but this reads unambiguously).
+CORPORATE_GROUP_SQL = (
+    "LTRIM(RTRIM(ISNULL(CL.ulARCorpGroup, 'Non Corporate'))) IN :corp_groups"
+)
+
+
+def is_corporate_customer(db: Session, account: str) -> bool:
+    row = db.execute(
+        text(
+            f"SELECT 1 FROM [BA_00_LPD_CON].dbo.Client CL "
+            f"WHERE CL.Account = :account AND {CORPORATE_GROUP_SQL}"
+        ).bindparams(bindparam("corp_groups", expanding=True)),
+        {"account": (account or "").strip(), "corp_groups": list(CORPORATE_GROUPS)},
+    ).first()
+    return row is not None
+
+
 def _join_address(*parts) -> str:
     return "\n".join([str(p).strip() for p in parts if p is not None and str(p).strip()])
 
@@ -46,6 +71,14 @@ def list_customers(
             "this value (joins Client.RepID → SalesRep.Code)."
         ),
     ),
+    corporate_only: bool = Query(
+        False,
+        description=(
+            "Only customers whose Client.ulARCorpGroup is a corporate "
+            "group (Spar / Checkers / Boxer / Pick n Pay). Used by the "
+            "Sales Order Entry customer picker."
+        ),
+    ),
     db: Session = Depends(get_db),
 ):
     """Customer search for pickers. Optional dim filters narrow the list
@@ -56,7 +89,8 @@ def list_customers(
     # _vw_SOCustomers view, which already filters out On_Hold). We re-apply
     # the On_Hold = 0 guard here to keep behaviour identical when none of
     # the filters are set.
-    sql = """
+    corp_clause = f"AND {CORPORATE_GROUP_SQL}" if corporate_only else ""
+    sql = f"""
         SELECT TOP (:limit)
             LTRIM(RTRIM(CL.Account)) AS account,
             CL.Name                  AS name
@@ -72,20 +106,23 @@ def list_customers(
                OR LTRIM(RTRIM(ISNULL(CL.ulARTelesalesRep, ''))) = :telesale)
           AND (:sales_rep IS NULL
                OR LTRIM(RTRIM(ISNULL(REP.Code, ''))) = :sales_rep)
+          {corp_clause}
         ORDER BY CL.Name
     """
     q_stripped = (q or "").strip()
     like = f"%{q_stripped}%" if q_stripped else None
-    rows = db.execute(
-        text(sql),
-        {
-            "like": like,
-            "limit": limit,
-            "route": (route or "").strip() or None,
-            "telesale": (telesale or "").strip() or None,
-            "sales_rep": (sales_rep or "").strip() or None,
-        },
-    ).mappings().all()
+    params = {
+        "like": like,
+        "limit": limit,
+        "route": (route or "").strip() or None,
+        "telesale": (telesale or "").strip() or None,
+        "sales_rep": (sales_rep or "").strip() or None,
+    }
+    stmt = text(sql)
+    if corporate_only:
+        stmt = stmt.bindparams(bindparam("corp_groups", expanding=True))
+        params["corp_groups"] = list(CORPORATE_GROUPS)
+    rows = db.execute(stmt, params).mappings().all()
     return [
         schemas.CustomerSummary(
             account=(r["account"] or "").strip(),

@@ -11,7 +11,7 @@ import { SalesOrderSearchModal } from "./SalesOrderSearchModal";
 
 // Flip to re-enable the "Create a new order" card. Keeping the code in place
 // so flipping back is a one-line change if telesales needs manual entry again.
-const CREATE_NEW_ORDER_ENABLED = false;
+const CREATE_NEW_ORDER_ENABLED = true;
 
 type Mode =
   | { kind: "landing" }
@@ -107,6 +107,7 @@ export function SalesOrderTab({
     return (
       <SalesOrderScreen
         key={`new-${formSessionKey}`}
+        source="SALES_ORDER_ENTRY"
         onBack={backToLanding}
       />
     );
@@ -118,6 +119,7 @@ export function SalesOrderTab({
     return (
       <SalesOrderScreen
         key={`loaded-${formSessionKey}`}
+        source="SALES_ORDER_ENTRY"
         initialLoadedOrder={{ detail: mode.detail, customer: mode.customer }}
         onBack={backToLanding}
         // Fires after the user dismisses the success modal; routing back to

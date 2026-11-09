@@ -1,5 +1,5 @@
 from datetime import date, datetime
-from typing import Optional, List
+from typing import Dict, Literal, Optional, List
 from pydantic import BaseModel, Field
 
 
@@ -72,7 +72,7 @@ class AdminUserUpdate(BaseModel):
 
 class PerformanceWindow(BaseModel):
     """Three rolling windows (anchored to today) for the agent-performance
-    bar. `week` starts on the current Sunday — matches the Analytics 12-
+    bar. `week` starts on the current Monday — matches the Analytics 12-
     week pivot columns. `month` is the calendar month to date."""
     today: float = 0.0
     week: float = 0.0
@@ -225,6 +225,15 @@ class SalesOrderCreate(BaseModel):
     tax_mode: str = "Exclusive"
     description: Optional[str] = None
     lines: List[SalesOrderLineInput]
+    # Order Assistant only: ids of the suggestions shown for this customer
+    # (OrderSuggestion.suggestion_id). Present (even empty) => record each
+    # suggestion's ACCEPTED / MODIFIED / REJECTED decision + MANUAL_ADDs.
+    # Omitted by the plain Sales Order screen.
+    suggestion_ids: Optional[List[int]] = None
+    # Which screen saved the order — stamped onto cSourceApp in the audit
+    # and contact-log tables. Optional only so a stale cached SPA build
+    # doesn't 422; such rows land as UNKNOWN.
+    source: Optional[Literal["ORDER_ASSISTANT", "SALES_ORDER_ENTRY"]] = None
 
 
 class SalesOrderCreateResponse(BaseModel):
@@ -379,7 +388,7 @@ class PivotRow(BaseModel):
     label: str
     sublabel: Optional[str] = None        # customer name / stock description
     has_children: bool
-    # Keyed by Sunday-of-week ISO date (YYYY-MM-DD).
+    # Keyed by week-start (Monday) ISO date (YYYY-MM-DD).
     weekly: dict[str, PivotWeekCell] = {}
     total_amount: float = 0.0
     total_litres: float = 0.0
@@ -422,13 +431,63 @@ class TransactionListResponse(BaseModel):
     transactions: List[Transaction] = []
 
 
+# ---------- Order Intake dashboard ----------
+
+class OrderIntakeMetrics(BaseModel):
+    orders: int = 0
+    ordered_qty: float = 0.0
+    ordered_litres: float = 0.0
+    ordered_excl: float = 0.0
+    invoiced_qty: float = 0.0
+    invoiced_litres: float = 0.0
+    invoiced_excl: float = 0.0
+
+
+class OrderIntakeRow(OrderIntakeMetrics):
+    """One (date, hour, source, app screen, user, corp group) bucket."""
+    date: date
+    hour: int
+    # 'SO Assistant' | 'Evolution'
+    source: str
+    # ORDER_ASSISTANT | SALES_ORDER_ENTRY | UNKNOWN | None (Evolution / legacy)
+    app_screen: Optional[str] = None
+    user: str
+    corp_group: str
+
+
+class OrderIntakeSummary(BaseModel):
+    from_date: date
+    to_date: date
+    rows: List[OrderIntakeRow] = []
+
+
+class OrderIntakeOrder(BaseModel):
+    order_no: str
+    created_at: datetime
+    hour: int
+    source: str
+    app_screen: Optional[str] = None
+    user: str
+    corp_group: str
+    customer_account: str
+    customer_name: str
+    doc_state: int
+    ordered_qty: float = 0.0
+    ordered_litres: float = 0.0
+    ordered_excl: float = 0.0
+    invoiced_qty: float = 0.0
+    invoiced_litres: float = 0.0
+    invoiced_excl: float = 0.0
+
+
 # ---------- Customer contact log (route call outcomes) ----------
 
 class ContactLogCreate(BaseModel):
     customer_account: str
     route_code: Optional[str] = None
-    # One of: NO_ORDER, CALLBACK, NO_ANSWER, REFUSED. PLACED is written
-    # internally by the order-save path and should not come from this endpoint.
+    # One of: NO_ORDER, WRITTEN_ORDER, CALLBACK, NO_ANSWER, REFUSED. PLACED is
+    # written internally by the order-save path and should not come from
+    # this endpoint.
     outcome: str
     note: Optional[str] = Field(None, max_length=200)
     follow_up_date: Optional[date] = None
@@ -437,7 +496,9 @@ class ContactLogCreate(BaseModel):
     # filters strictly by this column; omit (None) for callers that have
     # no target delivery date.
     delivery_date: Optional[date] = None
-    source_app: str = "SO_ASSISTANT"
+    # Only the Order Assistant's leave-customer modal posts here today.
+    # Rows written before 2026-11-06 carry the legacy value 'SO_ASSISTANT'.
+    source_app: Literal["ORDER_ASSISTANT", "SALES_ORDER_ENTRY"] = "ORDER_ASSISTANT"
 
 
 class ContactLogEntry(BaseModel):
@@ -574,6 +635,34 @@ class OrderSuggestion(BaseModel):
     warehouse_codes: List[str] = []       # warehouses this stock is set up in
     pack_size: int = 1                    # ulIIPerCrate — suggested_quantity is already snapped to a multiple of this
     price_source: str = "None"            # 'Customer Deal' | 'Group Deal' | 'Price List' | 'None'
+    # --- Phase 4: target-aware suggestions ---
+    # 'TARGET' = weekly basis is the materialised management target;
+    # 'BASE_MODEL' = legacy weekly median. suggested_quantity is always
+    # max(0, weekly basis − already covered) snapped to pack.
+    source: str = "BASE_MODEL"
+    base_weekly_qty: Optional[float] = None   # legacy weekly median (None if < min_weeks of history)
+    forecast_qty: Optional[float] = None      # active forecast for the delivery week, if any
+    target_qty: Optional[float] = None        # weekly target (source TARGET only)
+    target_source: Optional[str] = None       # 'SCENARIO' | 'OVERRIDE'
+    scenario_names: List[str] = []
+    week_start: Optional[date] = None         # Monday of the delivery week
+    # _tb_SOOrderSuggestion id when the presentation was recorded
+    # (record=true). Sent back on order save to capture the rep's decision.
+    suggestion_id: Optional[int] = None
+
+
+class WeekTarget(BaseModel):
+    """A customer x SKU target for one delivery week (progress strip)."""
+    stock_code: str
+    description: str = ""
+    category: str = ""
+    week_start: date
+    target_qty: float
+    forecast_qty: float
+    covered_qty: float                    # invoiced this week + open sales orders
+    pack_size: int = 1
+    source: str                           # 'SCENARIO' | 'OVERRIDE'
+    scenario_names: List[str] = []
 
 
 # ---------- Litre targets (Analytics → Performance) ----------
@@ -643,3 +732,311 @@ class TargetWithActual(Target):
 
 class TargetListResponse(BaseModel):
     targets: List[TargetWithActual] = []
+
+
+# ---------- Forecasting & Scenarios (Phase 3) ----------
+# Lever semantics, scope keys and lifecycle are documented in
+# services/forecasting/scenarios.py.
+
+
+class ForecastModelRow(BaseModel):
+    model_config = {"protected_namespaces": ()}
+    model_code: str
+    model_name: str
+    family: str
+    is_enabled: bool
+    leaves_scored: int = 0
+    weighted_mape: Optional[float] = None
+    mae: Optional[float] = None
+    bias: Optional[float] = None
+    first_scored_week: Optional[date] = None
+    last_scored_week: Optional[date] = None
+
+
+class ForecastRow(BaseModel):
+    model_config = {"protected_namespaces": ()}
+    forecast_id: int
+    run_id: int
+    customer_account: str
+    stock_code: str
+    week_start: date
+    route: Optional[str] = None
+    dist_centre: Optional[str] = None
+    category: Optional[str] = None
+    telesales: Optional[str] = None
+    sales_rep: Optional[str] = None
+    forecast_qty: float
+    model_code: str
+    is_active: bool
+    is_fallback: bool
+    fallback_reason: Optional[str] = None
+    demand_pattern: Optional[str] = None
+    confidence_grade: Optional[str] = None
+
+
+class ForecastListResponse(BaseModel):
+    forecasts: List[ForecastRow] = []
+    total: int
+
+
+class ExcludedLeaf(BaseModel):
+    customer: str
+    sku: str
+
+
+class ScenarioScopeModel(BaseModel):
+    """AND across dimensions, OR within one. Empty = every forecast leaf."""
+    distCentre: List[str] = []
+    route: List[str] = []
+    customer: List[str] = []
+    category: List[str] = []
+    sku: List[str] = []
+    salesRep: List[str] = []
+    telesales: List[str] = []
+    excludeLeaves: List[ExcludedLeaf] = []
+
+
+LeverType = Literal["PERCENT", "ABSOLUTE_DELTA", "FIXED_QTY"]
+Measure = Literal["UNITS", "LITRES"]
+AnchorLevel = Literal["company", "dist_centre", "route", "customer", "category", "sku"]
+
+
+class ScenarioCreate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=100)
+    description: Optional[str] = Field(None, max_length=500)
+    scope: ScenarioScopeModel = ScenarioScopeModel()
+    lever_type: LeverType = "PERCENT"
+    lever_value: float              # PERCENT: 5 = +5%; others: qty per week for the whole scope
+    period_from: date
+    period_to: date
+    measure: Measure = "UNITS"      # what lever_value is in (ABSOLUTE_DELTA / FIXED_QTY)
+    anchor_level: Optional[AnchorLevel] = None   # Targets-screen level it was set on
+
+
+class ScenarioUpdate(BaseModel):
+    name: Optional[str] = Field(None, min_length=1, max_length=100)
+    description: Optional[str] = Field(None, max_length=500)
+    scope: Optional[ScenarioScopeModel] = None
+    lever_type: Optional[LeverType] = None
+    lever_value: Optional[float] = None
+    period_from: Optional[date] = None
+    period_to: Optional[date] = None
+    measure: Optional[Measure] = None
+
+
+class ScenarioOut(BaseModel):
+    id: int
+    name: str
+    description: Optional[str] = None
+    scope: ScenarioScopeModel
+    lever_type: str
+    lever_value: float
+    period_from: date
+    period_to: date
+    status: str
+    created_by: str
+    created_at: datetime
+    approved_by: Optional[str] = None
+    approved_at: Optional[datetime] = None
+    cancel_reason: Optional[str] = None
+    cancelled_at: Optional[datetime] = None
+    measure: str = "UNITS"
+    anchor_level: Optional[str] = None
+
+
+class ReasonablenessFlagOut(BaseModel):
+    code: str
+    message: str
+    metric_value: float
+    threshold_value: float
+
+
+class CascadedTargetOut(BaseModel):
+    customer_account: str
+    stock_code: str
+    week_start: date
+    route: Optional[str] = None
+    dist_centre: Optional[str] = None
+    category: Optional[str] = None
+    telesales: Optional[str] = None
+    sales_rep: Optional[str] = None
+    forecast_qty: float
+    target_qty: float                       # resolved target (all active scenarios + this one)
+    override_qty: Optional[float] = None    # existing manager override, if any
+    effective_target_qty: float             # what the rep will see
+    before_qty: Optional[float] = None      # target before this scenario
+    in_scope: bool = True                   # False = outside it, rebalanced by it
+    scenario_ids: List[int] = []
+    flags: List[ReasonablenessFlagOut] = []
+
+
+class TargetConflictOut(BaseModel):
+    scenario_id: Optional[int] = None
+    week: date
+    goal: float
+    inner_total: float
+    measure: str
+    message: str
+
+
+class FlaggedLeafOut(BaseModel):
+    customer_account: str
+    stock_code: str
+    flag_codes: List[str]
+    weeks: List[date]
+    messages: List[str]
+
+
+class ScenarioCascadeResponse(BaseModel):
+    scenario: ScenarioOut
+    as_of_week: date
+    weeks: List[date]
+    leaf_count: int
+    leaf_week_count: int
+    total_forecast_qty: float
+    total_target_qty: float
+    total_effective_target_qty: float
+    total_before_qty: float = 0.0           # in-scope targets before this scenario
+    rebalanced_count: int = 0               # customer-product weeks outside it that it moves
+    rebalanced_delta_qty: float = 0.0
+    conflicts: List[TargetConflictOut] = [] # block approval
+    locked_skipped: int = 0
+    warnings: List[str] = []
+    flagged_leaves: List[FlaggedLeafOut] = []
+    targets: List[CascadedTargetOut] = []    # one page (see targets_offset / limit)
+    targets_offset: int = 0
+    rows_written: Optional[int] = None       # approve only
+    # Targets screen "Proposed" column: change per row at `rollup_level`
+    # for `rollup_week`, in units or litres (preview with rollup_level only)
+    rollup_level: Optional[str] = None
+    rollup_deltas: Dict[str, float] = {}
+    rollup_total_delta: float = 0.0
+    rollup_scope_delta: float = 0.0      # inside the scenario (its node), that week
+    rollup_outside_delta: float = 0.0    # rebalanced customer-products outside it, that week
+
+
+class FlagReview(BaseModel):
+    customer_account: str
+    stock_code: str
+    decision: Literal["ACCEPT", "EXCLUDE"]
+    note: Optional[str] = Field(None, max_length=200)
+
+
+class ScenarioApproveRequest(BaseModel):
+    reviews: List[FlagReview] = []
+    # {flag code: ACCEPT|EXCLUDE} -- decides every flagged customer-product
+    # with that warning that has no individual review.
+    group_decisions: Dict[str, Literal["ACCEPT", "EXCLUDE"]] = {}
+
+
+class ScenarioCancelRequest(BaseModel):
+    reason: str = Field(..., min_length=1, max_length=500)
+
+
+class ScenarioCancelResponse(BaseModel):
+    scenario: ScenarioOut
+    targets_recomputed: int
+    targets_deleted: int
+
+
+class ScenarioTargetRow(BaseModel):
+    id: int
+    customer_account: str
+    stock_code: str
+    week_start: date
+    route: Optional[str] = None
+    dist_centre: Optional[str] = None
+    category: Optional[str] = None
+    forecast_qty: float
+    target_qty: float                       # effective target
+    override_qty: Optional[float] = None
+    override_reason: Optional[str] = None
+    override_by: Optional[str] = None
+    source: str
+    scenario_ids: List[int] = []
+    is_flagged: bool
+    flag_codes: List[str] = []
+    is_locked: bool
+
+
+class TargetRollupRow(BaseModel):
+    dim_value: Optional[str] = None
+    week_start: date
+    forecast_qty: float
+    target_qty: float
+    leaf_count: int
+    flagged_count: int
+
+
+class ScenarioTargetListResponse(BaseModel):
+    rollup: Optional[str] = None
+    total: int
+    targets: List[ScenarioTargetRow] = []       # when rollup is None
+    rollup_rows: List[TargetRollupRow] = []     # when rollup is set
+
+
+class TargetOverrideRequest(BaseModel):
+    override_qty: Optional[float] = Field(..., ge=0)   # null clears the override
+    reason: str = Field(..., min_length=1, max_length=500)
+    break_lock: bool = False
+
+
+# ---------- Forecasting management UI (Phase 5) ----------
+
+class WorkbenchRowOut(BaseModel):
+    key: str
+    label: str = ""
+    forecast: float
+    target: float
+    delivered: float
+    on_order: float
+    committed: float
+    leaf_count: int
+    targeted_count: int
+    flagged_count: int
+    override_count: int
+    # SKU level only
+    target_id: Optional[int] = None
+    override: Optional[float] = None
+    source: Optional[str] = None
+    is_locked: bool = False
+
+
+class WorkbenchResponse(BaseModel):
+    week_start: date
+    level: str                       # dist_centre | route | customer | sku
+    measure: str                     # units | litres
+    filters: dict = {}
+    total: WorkbenchRowOut
+    rows: List[WorkbenchRowOut] = []
+
+
+class ScopeOption(BaseModel):
+    value: str
+    label: str = ""
+
+
+class ForecastTaskOut(BaseModel):
+    id: int
+    task_type: str
+    priority: str
+    assigned_to: Optional[str] = None
+    customer_account: Optional[str] = None
+    stock_code: Optional[str] = None
+    category: Optional[str] = None
+    route: Optional[str] = None
+    dist_centre: Optional[str] = None
+    scenario_id: Optional[int] = None
+    title: str
+    description: Optional[str] = None
+    due_date: date
+    status: str
+    resolution_notes: Optional[str] = None
+    resolved_by: Optional[str] = None
+    created_at: datetime
+    resolved_at: Optional[datetime] = None
+
+
+class ForecastTaskUpdate(BaseModel):
+    status: Literal["OPEN", "IN_PROGRESS", "SNOOZED", "RESOLVED", "DISMISSED"]
+    resolution_notes: Optional[str] = Field(None, max_length=1000)

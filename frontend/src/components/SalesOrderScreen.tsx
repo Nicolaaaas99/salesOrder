@@ -7,6 +7,7 @@ import type {
   SalesOrderCreate,
   SalesOrderDetail,
   SalesOrderSearchResult,
+  OrderSource,
 } from "../api/types";
 import { CustomerPicker } from "./CustomerPicker";
 import { AddressPanel } from "./AddressPanel";
@@ -45,6 +46,15 @@ type Props = {
   onClose?: () => void;
   onBack?: () => void;
   onPlaced?: () => void;
+  /** Order Assistant only: ids of the suggestions shown for this customer.
+   *  Sent with a NEW order so the backend records each suggestion's
+   *  decision. Leave undefined everywhere else (plain sales order screen,
+   *  edits) — nothing is recorded then. */
+  suggestionIds?: number[];
+  /** Which screen is hosting this form. Sent with every save so the audit
+   *  + contact-log rows record where the order came from. SALES_ORDER_ENTRY
+   *  also restricts the customer picker to corporate groups. */
+  source: OrderSource;
 };
 
 
@@ -102,7 +112,9 @@ export function SalesOrderScreen({
   onClose,
   onBack,
   onPlaced,
-}: Props = {}) {
+  suggestionIds,
+  source,
+}: Props) {
   const isControlled =
     controlledLines !== undefined && onControlledLinesChange !== undefined;
 
@@ -189,6 +201,11 @@ export function SalesOrderScreen({
       ? { order_no: seed.order_no, mode: seed.is_archived ? "template" : "edit" }
       : null
   );
+  // Set when a loaded order (edit or template) came back with no lines —
+  // shown as a warning instead of a silently empty grid.
+  const [loadedOrderEmpty, setLoadedOrderEmpty] = useState<string | null>(
+    seed && seed.lines.length === 0 ? seed.order_no : null
+  );
   const [searchOpen, setSearchOpen] = useState(openSearchOnMount);
   const [loadingOrder, setLoadingOrder] = useState(false);
 
@@ -264,6 +281,7 @@ export function SalesOrderScreen({
     setLines(initialLinesFor());
     setErrorMsg(null);
     setEditing(null);
+    setLoadedOrderEmpty(null);
   }
 
   async function loadOrder(result: SalesOrderSearchResult) {
@@ -297,6 +315,7 @@ export function SalesOrderScreen({
     setDescription(detail.description || "Sales Order");
     setTaxMode(detail.tax_mode);
     setLines(detailToLines(detail, cust));
+    setLoadedOrderEmpty(detail.lines.length === 0 ? detail.order_no : null);
     setEditing({ order_no: detail.order_no, mode });
   }
 
@@ -399,6 +418,8 @@ export function SalesOrderScreen({
         discount_percent: l.discount_percent || 0,
         project_code: null,
       })),
+      ...(!isUpdate && suggestionIds !== undefined ? { suggestion_ids: suggestionIds } : {}),
+      source,
     };
 
     setSubmitting(true);
@@ -507,6 +528,14 @@ export function SalesOrderScreen({
         </div>
       )}
 
+      {loadedOrderEmpty && (
+        <div className="banner banner-err">
+          Order <strong>{loadedOrderEmpty}</strong> has no lines in the
+          database, so there is nothing to copy. Add the lines manually or
+          open a different order.
+        </div>
+      )}
+
       <div className="two-col">
         <div className="two-col-stack">
           <section className="panel">
@@ -521,6 +550,7 @@ export function SalesOrderScreen({
                 <CustomerPicker
                   value={customer ? `${customer.account} — ${customer.name}` : ""}
                   onSelect={onSelectCustomer}
+                  corporateOnly={source === "SALES_ORDER_ENTRY"}
                 />
               )}
             </div>

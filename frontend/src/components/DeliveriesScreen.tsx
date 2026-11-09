@@ -480,7 +480,7 @@ export function DeliveriesScreen({ onOpenOrder, onBack }: DeliveriesProps = {}) 
 /** One Reason-column cell. Mirrors the Order Assistant dropdown-dot
  *  colours exactly (see outcomeDot in OrderAssistantScreen.tsx):
  *    • green  → placed (any orders in range OR PLACED log row)
- *    • yellow → contacted but no order (NO_ORDER / CALLBACK / NO_ANSWER / REFUSED)
+ *    • yellow → contacted but no order (NO_ORDER / WRITTEN_ORDER / CALLBACK / NO_ANSWER / REFUSED)
  *    • red    → no log row and no orders → "Not contacted"
  *  For ranges that end before the contact-log table went live, we render
  *  a muted dash instead of the red chip so historical data isn't

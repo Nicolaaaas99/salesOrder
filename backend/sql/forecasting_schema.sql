@@ -9,9 +9,9 @@
 -- They never collapse into one number and we track accuracy for each
 -- transition independently.
 --
--- Week convention: Sunday-aligned (matches history.py:_week_start_sunday()
--- and services/targets.py:sunday_of_current_week()). Every forecast /
--- target / scorecard row carries dWeekStart DATE which is always a Sunday.
+-- Week convention: ISO weeks, Monday to Sunday (services/forecasting/weeks.py;
+-- switched from Sunday-aligned on 2026-11-06). Every forecast / target /
+-- scorecard row carries dWeekStart DATE which is always a Monday.
 -- Not ISO weeks (ISO starts Monday) -- resist the urge.
 --
 -- DC hierarchy: Customer.ulARDistCentre on [BA_00_LPD_CON].dbo.Client is
@@ -170,9 +170,10 @@ GO
 
 -- -----------------------------------------------------------------------------
 -- _tb_SOForecast  (leaf prediction -- one row per customer x SKU x week x
--- model x run). The key UNIQUE constraint is (run, customer, SKU, week)
--- so one model can predict the same leaf for different horizons in one
--- run. Dimensions are DENORMALIZED (route / DC / category) because:
+-- model x run). The key UNIQUE constraint is (run, model, customer, SKU,
+-- week): every enabled model writes its own row per leaf-week (shadow
+-- predictions), and UX_SOForecast_OneActive guarantees exactly one active
+-- row per leaf-week across all runs (migration 001). Dimensions are DENORMALIZED (route / DC / category) because:
 --   1. Inspection queries don't want cross-DB joins to [BA_00_LPD_CON]
 --   2. We want frozen attributions for the forecast's effective date
 --      (customer re-routed mid-period doesn't retroactively shift
@@ -214,8 +215,8 @@ BEGIN
         dtCreatedAt         DATETIME2(7)  NOT NULL
             CONSTRAINT DF_SOForecast_dt DEFAULT (sysdatetime()),
         CONSTRAINT PK_SOForecast PRIMARY KEY CLUSTERED (idForecast),
-        CONSTRAINT UX_SOForecast_RunLeaf UNIQUE
-            (idForecastRun, cCustomerAccount, cStockCode, dWeekStart),
+        CONSTRAINT UX_SOForecast_RunModelLeaf UNIQUE
+            (idForecastRun, idForecastModel, cCustomerAccount, cStockCode, dWeekStart),
         CONSTRAINT CK_SOForecast_ConfidenceGrade CHECK
             (cConfidenceGrade IS NULL OR cConfidenceGrade IN
              ('A+','A','B','C','D','F')),
@@ -256,6 +257,19 @@ BEGIN
 END;
 GO
 
+IF NOT EXISTS (
+    SELECT 1 FROM sys.indexes
+    WHERE name = 'UX_SOForecast_OneActive'
+      AND object_id = OBJECT_ID('[SOAssistant].dbo._tb_SOForecast')
+)
+BEGIN
+    -- Design cornerstone: exactly ONE active forecast per leaf-week.
+    CREATE UNIQUE INDEX UX_SOForecast_OneActive
+        ON [SOAssistant].dbo._tb_SOForecast (cCustomerAccount, cStockCode, dWeekStart)
+        WHERE bIsActive = 1;
+END;
+GO
+
 -- -----------------------------------------------------------------------------
 -- _tb_SOScenario  (management scenarios -- "+5% Milk at DC-WC for Q1").
 -- A scenario is a scoped multiplier (or absolute delta or fixed qty) over
@@ -290,7 +304,12 @@ BEGIN
         dtApprovedAt        DATETIME2(7)   NULL,
         cCancelReason       NVARCHAR(500)  NULL,
         dtCancelledAt       DATETIME2(7)   NULL,
+        -- migration 002: lever unit + the Targets-screen level it was set on
+        cMeasure            VARCHAR(8)     NOT NULL
+            CONSTRAINT DF_SOScenario_cMeasure DEFAULT ('UNITS'),
+        cAnchorLevel        VARCHAR(16)    NULL,
         CONSTRAINT PK_SOScenario PRIMARY KEY CLUSTERED (idScenario),
+        CONSTRAINT CK_SOScenario_Measure CHECK (cMeasure IN ('UNITS', 'LITRES')),
         CONSTRAINT CK_SOScenario_LeverType CHECK
             (cLeverType IN ('PERCENT','ABSOLUTE_DELTA','FIXED_QTY')),
         CONSTRAINT CK_SOScenario_Status CHECK
@@ -744,7 +763,7 @@ USING (VALUES
      'Base: 6-week non-zero median',
      'base',
      'Current production algorithm. Median of non-zero weekly qtys over '
-     + 'last 6 completed Sunday-weeks. Requires >= 3 non-zero weeks to '
+     + 'last 6 completed weeks (Mon-Sun). Requires >= 3 non-zero weeks to '
      + 'produce a prediction. Snaps to pack size downstream. Replicates '
      + 'history.py:order_suggestions.',
      '{"window_weeks":6,"min_non_zero_weeks":3,"round":"half_up"}'),

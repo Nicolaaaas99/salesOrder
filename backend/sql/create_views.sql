@@ -11,7 +11,7 @@
  The USE + GO batches are required because CREATE/ALTER VIEW must be the
  first statement in its batch.
 
- Object list (19 views + 1 function + 4 tables):
+ Object list (19 views + 2 functions + 5 tables):
    Views     — _vw_SOActiveDeals, _vw_SOAgentDefaultWhse, _vw_SOCustomerDetail,
                _vw_SOCustomerInvoiceHistory, _vw_SOCustomerOrdersPerDay,
                _vw_SOCustomers, _vw_SOInventory,
@@ -22,6 +22,8 @@
                _vw_SOSettlementTerms, _vw_SOTaxTypes, _vw_SOWarehouses
    Functions — _fn_SOCustomerPriceAsOf(@asOf date) — resolves deal/list price
                for a given session date; replaces the old _vw_SOCustomerPrice.
+               _fn_SOOrderIntake(@from date, @to date) — one row per order
+               created in the range (Order Intake dashboard).
    Tables    — _tb_SOOrderAssistantAudit, _tb_SOCustomerContactLog,
                _tb_SOCustomerAssignmentAudit, _tb_SOTargets, _tb_SOAppUsers
 ******************************************************************************/
@@ -649,8 +651,26 @@ BEGIN
         cAppVersion        VARCHAR(32)    NULL,
         dtActionAt         DATETIME2(7)   NOT NULL
             CONSTRAINT DF_SOOrderAssistantAudit_dt DEFAULT (sysdatetime()),
+        -- Screen that performed the action: ORDER_ASSISTANT or
+        -- SALES_ORDER_ENTRY (UNKNOWN = stale client). Same column name +
+        -- values as _tb_SOCustomerContactLog.cSourceApp. NULL on
+        -- RESCHEDULE / CANCEL rows; older CREATE / UPDATE rows are
+        -- backfilled further down.
+        cSourceApp         VARCHAR(32)    NULL,
         CONSTRAINT PK_SOOrderAssistantAudit PRIMARY KEY CLUSTERED (idSOAppAudit)
     );
+END;
+GO
+
+-- Idempotent migration: adds cSourceApp to pre-existing deployments.
+IF NOT EXISTS (
+    SELECT 1 FROM sys.columns
+    WHERE name = 'cSourceApp'
+      AND object_id = OBJECT_ID('[SOAssistant].dbo._tb_SOOrderAssistantAudit')
+)
+BEGIN
+    ALTER TABLE [SOAssistant].dbo._tb_SOOrderAssistantAudit
+        ADD cSourceApp VARCHAR(32) NULL;
 END;
 GO
 
@@ -663,12 +683,19 @@ GO
 --   PLACED      — order was placed (written by the order-save path, not
 --                 the modal — PLACED customers never see the modal).
 --   NO_ORDER    — customer did not want / need to order today.
+--   WRITTEN_ORDER — customer sent a written order (email / paper) that is
+--                 keyed in manually instead of through the assistant.
 --   CALLBACK    — customer asked to be called back (optional dFollowUpDate).
 --   NO_ANSWER   — call went to voicemail / no answer.
 --   REFUSED     — refused, on stop, closed, or similar hard-stop.
 --
 -- "Opened by mistake" is NOT a stored outcome — the modal lets the agent
 -- escape without writing a row, so the dropdown dot stays red.
+--
+-- cSourceApp — screen that wrote the row: ORDER_ASSISTANT or
+-- SALES_ORDER_ENTRY (UNKNOWN = stale client). Rows written before
+-- 2026-11-06 carried the legacy value 'SO_ASSISTANT'; the backfill further
+-- down relabels them ORDER_ASSISTANT.
 -- -----------------------------------------------------------------------------
 IF OBJECT_ID('[SOAssistant].dbo._tb_SOCustomerContactLog', 'U') IS NULL
 BEGIN
@@ -699,8 +726,26 @@ BEGIN
             CONSTRAINT DF_SOCustomerContactLog_dt DEFAULT (sysdatetime()),
         CONSTRAINT PK_SOCustomerContactLog PRIMARY KEY CLUSTERED (idContactLog),
         CONSTRAINT CK_SOCustomerContactLog_Outcome CHECK
-            (cOutcome IN ('PLACED','NO_ORDER','CALLBACK','NO_ANSWER','REFUSED'))
+            (cOutcome IN ('PLACED','NO_ORDER','WRITTEN_ORDER','CALLBACK','NO_ANSWER','REFUSED'))
     );
+END;
+GO
+
+-- Rebuild CK_SOCustomerContactLog_Outcome on pre-existing deployments so
+-- it accepts WRITTEN_ORDER. Acts only while the current definition lacks
+-- it, so re-running the script is a no-op.
+IF EXISTS (
+    SELECT 1 FROM sys.check_constraints
+    WHERE name = 'CK_SOCustomerContactLog_Outcome'
+      AND parent_object_id = OBJECT_ID('[SOAssistant].dbo._tb_SOCustomerContactLog')
+      AND OBJECT_DEFINITION(object_id) NOT LIKE '%WRITTEN[_]ORDER%'
+)
+BEGIN
+    ALTER TABLE [SOAssistant].dbo._tb_SOCustomerContactLog
+        DROP CONSTRAINT CK_SOCustomerContactLog_Outcome;
+    ALTER TABLE [SOAssistant].dbo._tb_SOCustomerContactLog
+        ADD CONSTRAINT CK_SOCustomerContactLog_Outcome CHECK
+            (cOutcome IN ('PLACED','NO_ORDER','WRITTEN_ORDER','CALLBACK','NO_ANSWER','REFUSED'));
 END;
 GO
 
@@ -808,7 +853,7 @@ GO
 --
 -- cPeriod values:
 --   DAILY   → measure today's litres
---   WEEKLY  → Sunday-aligned current week (matches PerformanceStrip)
+--   WEEKLY  → current ISO week, Mon-Sun (matches PerformanceStrip)
 --   MONTHLY → calendar month to date
 --   CUSTOM  → fixed window: dEffectiveFrom..dEffectiveTo are the
 --             measurement bounds (one-shot, non-rolling). Think promos.
@@ -1032,6 +1077,233 @@ BEGIN
 END;
 GO
 
+-- Supporting index for _fn_SOOrderIntake: one CREATE row per order,
+-- looked up by InvNum.AutoIndex.
+IF NOT EXISTS (
+    SELECT 1 FROM sys.indexes
+    WHERE name = 'IX_SOOrderAssistantAudit_InvNumAction'
+      AND object_id = OBJECT_ID('[SOAssistant].dbo._tb_SOOrderAssistantAudit')
+)
+BEGIN
+    CREATE INDEX IX_SOOrderAssistantAudit_InvNumAction
+        ON [SOAssistant].dbo._tb_SOOrderAssistantAudit (iInvNumAutoIndex, cAction)
+        INCLUDE (cUsername, cSourceApp, dtActionAt, iAgentID);
+END;
+GO
+
+-- =============================================================================
+-- _fn_SOOrderIntake(@from date, @to date)  — Order Intake dashboard source.
+--
+-- One row per sales order CREATED (InvNum_dCreatedDate) in [@from, @to],
+-- with ordered + invoiced qty / litres / excl amount and who placed it.
+-- Lives down here (not with the other functions) because it reads
+-- _tb_SOOrderAssistantAudit, which must exist first.
+--
+-- Split orders: when Evolution partially processes an order it archives the
+-- original (DocState 4) and creates a COPY carrying the full order lines
+-- (DocState 3, OrigDocID = original AutoIndex), stamped with the processing
+-- time. Only the original row is counted — counting the copy would double
+-- every split order and invent a second "order" at processing time.
+--
+-- OrderSource: 'SO Assistant' when the app wrote a CREATE audit row for the
+-- order, else 'Evolution'. AppScreen keeps the finer split
+-- (ORDER_ASSISTANT / SALES_ORDER_ENTRY) for later use.
+-- AgentID / UserName: resolved by Evolution agent ID, and the name is always
+-- read from _rtblAgents.cAgentName — one place, so 'Brendas' / 'BrendaS'
+-- collapse into one person and a rename in Evolution shows the new name on
+-- old orders too. App orders: the audit row's iAgentID (falls back to a
+-- case-insensitive name match if it was never resolved). Evolution orders:
+-- InvNum_iCreatedAgentID. No agent found -> the audit username, else
+-- 'Evolution'.
+--
+-- Shape: MULTI-STATEMENT on purpose (2026-11-08 measurement). The inline
+-- version used a per-order OUTER APPLY over _btblInvoiceLines; SQL Server
+-- spooled every invoice line ever and re-read the spool once per order
+-- (56M worktable reads, ~64 s for ONE day). Here the day's orders land in
+-- @orders first, then their lines are summed in ONE set-based join, so
+-- invoice lines cost at most a single pass no matter how many orders.
+--
+-- InvNum itself is still scanned (no index on InvNum_dCreatedDate, and
+-- AutoIndex can't bound it: branch ID ranges mean it isn't in date order).
+-- An index on InvNum_dCreatedDate would remove that — Evolution table, so
+-- agree it with IT / the Evolution partner first (PERFORMANCE.md).
+--
+-- Time zone: Evolution stamps InvNum_dCreatedDate in UTC, while our audit
+-- dtActionAt is SQL Server local time (SAST). Verified 2026-11-08: an
+-- app order's created date was exactly 2 h before its audit row. All
+-- dates/hours here are LOCAL: the @from/@to day bounds are shifted to UTC
+-- for the InvNum filter, and CreatedAt = audit dtActionAt for app orders
+-- (exact capture time) else InvNum_dCreatedDate + the server's UTC offset.
+-- App orders whose InvNum_dCreatedDate is NULL (seen on a dev copy where
+-- the SDK didn't stamp it) are still picked up via the audit table.
+--
+-- Keep ranges short (the API caps at 31 days).
+-- =============================================================================
+-- Inline -> multi-statement can't be done with ALTER; drop first.
+DROP FUNCTION IF EXISTS dbo._fn_SOOrderIntake;
+GO
+
+CREATE FUNCTION dbo._fn_SOOrderIntake (@from date, @to date)
+RETURNS @out TABLE (
+    AutoIndex         INT            NOT NULL PRIMARY KEY,
+    OrderNum          VARCHAR(50)    NULL,
+    OrderDate         DATETIME       NULL,
+    InvDate           DATETIME       NULL,
+    DocState          INT            NULL,
+    CreatedAt         DATETIME       NULL,
+    CreatedDate       DATE           NULL,
+    CreatedHour       INT            NULL,
+    OrderSource       VARCHAR(20)    NOT NULL,
+    AppScreen         VARCHAR(32)    NULL,
+    AgentID           INT            NULL,
+    UserName          VARCHAR(100)   NOT NULL,
+    CorpGroup         VARCHAR(100)   NOT NULL,
+    CustomerAccount   VARCHAR(50)    NULL,
+    CustomerName      VARCHAR(200)   NULL,
+    OrderedQty        FLOAT          NOT NULL,
+    InvoicedQty       FLOAT          NOT NULL,
+    OrderedLitres     FLOAT          NOT NULL,
+    InvoicedLitres    FLOAT          NOT NULL,
+    OrderedExclAmnt   FLOAT          NOT NULL,
+    InvoicedExclAmnt  FLOAT          NOT NULL
+)
+AS
+BEGIN
+    -- 1. The orders captured in the range (originals only — see header).
+    DECLARE @orders TABLE (
+        AutoIndex   INT      NOT NULL PRIMARY KEY,
+        OrderNum    VARCHAR(50) NULL,
+        OrderDate   DATETIME NULL,
+        InvDate     DATETIME NULL,
+        DocState    INT      NULL,
+        CreatedAt   DATETIME NULL,
+        AccountID   INT      NULL,
+        CreatedAgentID INT   NULL
+    );
+
+    -- Local day bounds, and the same bounds in UTC for InvNum. The offset
+    -- is read from the server clock (SAST = +120 min, no daylight saving).
+    DECLARE @offsetMin INT       = DATEDIFF(MINUTE, SYSUTCDATETIME(), SYSDATETIME());
+    DECLARE @fromLocal DATETIME  = CAST(@from AS DATETIME);
+    DECLARE @toLocal   DATETIME  = DATEADD(DAY, 1, CAST(@to AS DATETIME));
+    DECLARE @fromUtc   DATETIME  = DATEADD(MINUTE, -@offsetMin, @fromLocal);
+    DECLARE @toUtc     DATETIME  = DATEADD(MINUTE, -@offsetMin, @toLocal);
+
+    -- 1a. Orders whose (UTC) created date falls in the range.
+    INSERT INTO @orders
+    SELECT NUM.AutoIndex, NUM.OrderNum, NUM.OrderDate, NUM.InvDate, NUM.DocState,
+           DATEADD(MINUTE, @offsetMin, NUM.InvNum_dCreatedDate),
+           NUM.AccountID, NUM.InvNum_iCreatedAgentID
+    FROM [BA_00_LPD_CON].dbo.InvNum NUM
+    WHERE NUM.DocType = 4
+      AND NUM.DocState IN (1, 3, 4)
+      -- originals only: split-order copies carry OrigDocID = original
+      AND (NUM.OrigDocID IS NULL OR NUM.OrigDocID = 0 OR NUM.OrigDocID = NUM.AutoIndex)
+      AND NUM.InvNum_dCreatedDate >= @fromUtc
+      AND NUM.InvNum_dCreatedDate <  @toUtc;
+
+    -- 1b. App orders captured in the range that 1a missed (NULL created
+    -- date). PK seeks on InvNum — the audit table is small.
+    INSERT INTO @orders
+    SELECT NUM.AutoIndex, NUM.OrderNum, NUM.OrderDate, NUM.InvDate, NUM.DocState,
+           NULL, NUM.AccountID, NUM.InvNum_iCreatedAgentID
+    FROM [BA_00_LPD_CON].dbo.InvNum NUM
+    WHERE NUM.AutoIndex IN (
+            SELECT A.iInvNumAutoIndex
+            FROM [SOAssistant].dbo._tb_SOOrderAssistantAudit A
+            WHERE A.cAction = 'CREATE'
+              AND A.dtActionAt >= @fromLocal
+              AND A.dtActionAt <  @toLocal)
+      AND NUM.InvNum_dCreatedDate IS NULL
+      AND NUM.DocType = 4
+      AND NUM.DocState IN (1, 3, 4);
+
+    -- 2. Line totals for exactly those orders, in one set-based pass.
+    DECLARE @lines TABLE (
+        AutoIndex         INT   NOT NULL PRIMARY KEY,
+        OrderedQty        FLOAT NULL,
+        InvoicedQty       FLOAT NULL,
+        OrderedLitres     FLOAT NULL,
+        InvoicedLitres    FLOAT NULL,
+        OrderedExclAmnt   FLOAT NULL,
+        InvoicedExclAmnt  FLOAT NULL
+    );
+
+    INSERT INTO @lines
+    SELECT O.AutoIndex,
+           SUM(LIN.fQuantity),
+           SUM(LIN.fQtyProcessed),
+           SUM(STK.ulIISize * LIN.fQuantity),
+           SUM(STK.ulIISize * LIN.fQtyProcessed),
+           SUM(LIN.fQuantityLineTotExcl),
+           SUM(LIN.fQtyLastProcessLineTotExcl)
+    FROM @orders O
+    JOIN [BA_00_LPD_CON].dbo._btblInvoiceLines LIN ON LIN.iInvoiceID = O.AutoIndex
+    JOIN [BA_00_LPD_CON].dbo.StkItem STK           ON STK.StockLink  = LIN.iStockCodeID
+    GROUP BY O.AutoIndex;
+
+    -- 3. Who / where, plus the totals.
+    INSERT INTO @out
+    SELECT
+        O.AutoIndex,
+        O.OrderNum,
+        O.OrderDate,
+        O.InvDate,
+        O.DocState,
+        -- Local capture time: the app's own audit timestamp when we have
+        -- it (exact), else Evolution's created date shifted from UTC.
+        COALESCE(CAST(AA.dtActionAt AS DATETIME), O.CreatedAt),
+        CAST(COALESCE(CAST(AA.dtActionAt AS DATETIME), O.CreatedAt) AS date),
+        DATEPART(HOUR, COALESCE(CAST(AA.dtActionAt AS DATETIME), O.CreatedAt)),
+        CASE WHEN AA.idSOAppAudit IS NULL THEN 'Evolution' ELSE 'SO Assistant' END,
+        AA.cSourceApp,
+        X.AgentID,
+        -- [SOAssistant] and [BA_00_LPD_CON] have different collations
+        -- (Latin1_General_CI_AS vs SQL_Latin1_General_CP1_CI_AS); mixing
+        -- them in one COALESCE needs an explicit COLLATE (Msg 457).
+        COALESCE(AG.cAgentName COLLATE DATABASE_DEFAULT,
+                 AA.cUsername  COLLATE DATABASE_DEFAULT,
+                 'Evolution'),
+        ISNULL(NULLIF(LTRIM(RTRIM(CL.ulARCorpGroup)), ''), 'Non Corporate'),
+        LTRIM(RTRIM(CL.Account)),
+        CL.Name,
+        ISNULL(L.OrderedQty, 0),
+        ISNULL(L.InvoicedQty, 0),
+        ISNULL(L.OrderedLitres, 0),
+        ISNULL(L.InvoicedLitres, 0),
+        ISNULL(L.OrderedExclAmnt, 0),
+        ISNULL(L.InvoicedExclAmnt, 0)
+    FROM @orders O
+    JOIN [BA_00_LPD_CON].dbo.Client CL ON CL.DCLink = O.AccountID
+    LEFT JOIN @lines L ON L.AutoIndex = O.AutoIndex
+    OUTER APPLY (
+        SELECT TOP 1 A.idSOAppAudit, A.cUsername, A.cSourceApp, A.dtActionAt, A.iAgentID
+        FROM [SOAssistant].dbo._tb_SOOrderAssistantAudit A
+        WHERE A.iInvNumAutoIndex = O.AutoIndex
+          AND A.cAction = 'CREATE'
+        ORDER BY A.idSOAppAudit
+    ) AA
+    -- App order whose audit row has no iAgentID: match the username to the
+    -- agent master (case-insensitive) so it still lands on the right person.
+    OUTER APPLY (
+        SELECT TOP 1 AN.idAgents
+        FROM [BA_00_LPD_CON].dbo._rtblAgents AN
+        WHERE AA.idSOAppAudit IS NOT NULL
+          AND AA.iAgentID IS NULL
+          AND AN.cAgentName COLLATE DATABASE_DEFAULT = AA.cUsername COLLATE DATABASE_DEFAULT
+        ORDER BY AN.bAgentActive DESC, AN.idAgents
+    ) AN
+    CROSS APPLY (
+        SELECT AgentID = CASE WHEN AA.idSOAppAudit IS NOT NULL
+                              THEN COALESCE(AA.iAgentID, AN.idAgents)
+                              ELSE NULLIF(O.CreatedAgentID, 0) END
+    ) X
+    LEFT JOIN [BA_00_LPD_CON].dbo._rtblAgents AG ON AG.idAgents = X.AgentID;
+
+    RETURN;
+END;
+GO
+
 
 -- =============================================================================
 -- One-time data migration: copy existing audit rows from the Evolution-side
@@ -1179,6 +1451,61 @@ WHERE log.cOutcome = 'PLACED'
 
 
 -- =============================================================================
+-- One-time backfill: legacy cSourceApp = 'SO_ASSISTANT' -> 'ORDER_ASSISTANT'.
+--
+-- Before 2026-11-06 every contact-log row was stamped 'SO_ASSISTANT'
+-- ("this app"). Safe to relabel because:
+--   • Non-PLACED rows are only ever written by the Order Assistant's
+--     leave-customer modal -> certainly ORDER_ASSISTANT.
+--   • PLACED rows: the table went live 2026-10-23, and Sales Order Entry's
+--     "Create a new order" card was disabled from 2026-10-19 until
+--     2026-11-06. The only other way Sales Order Entry could create an
+--     order was re-using an ARCHIVED order as a template — rare, and not
+--     distinguishable after the fact. Accept that small error margin.
+--
+-- Runs automatically and is idempotent: once relabelled, no rows match
+-- 'SO_ASSISTANT' any more, so re-running the script updates nothing.
+-- =============================================================================
+UPDATE [SOAssistant].dbo._tb_SOCustomerContactLog
+SET cSourceApp = 'ORDER_ASSISTANT'
+WHERE cSourceApp = 'SO_ASSISTANT';
+
+PRINT CONCAT('Relabelled ', @@ROWCOUNT, ' contact-log rows SO_ASSISTANT -> ORDER_ASSISTANT.');
+GO
+
+
+-- =============================================================================
+-- One-time backfill: cSourceApp on pre-existing _tb_SOOrderAssistantAudit
+-- rows (NULL because the column didn't exist when they were written).
+--
+--   • CREATE -> ORDER_ASSISTANT. Audit writes started 2026-10-21, after
+--     Sales Order Entry's "Create a new order" card was disabled
+--     (2026-10-19). Same archived-order-as-template caveat as the
+--     contact-log backfill above.
+--   • UPDATE -> SALES_ORDER_ENTRY. Edits always run through the Sales Order
+--     Entry screen (the Order Assistant hands the order over to it), which
+--     is also what new UPDATE rows are stamped with.
+--   • RESCHEDULE / CANCEL stay NULL — they come from the shared order-
+--     summary modal, and new rows of those types are NULL too.
+--
+-- Idempotent: only touches rows still NULL. Run this script BEFORE
+-- deploying the backend — if the backend goes first, Sales Order Entry
+-- creates written before the column exists would also land NULL and be
+-- relabelled ORDER_ASSISTANT here.
+-- =============================================================================
+UPDATE [SOAssistant].dbo._tb_SOOrderAssistantAudit
+SET cSourceApp = CASE cAction
+                     WHEN 'CREATE' THEN 'ORDER_ASSISTANT'
+                     WHEN 'UPDATE' THEN 'SALES_ORDER_ENTRY'
+                 END
+WHERE cSourceApp IS NULL
+  AND cAction IN ('CREATE', 'UPDATE');
+
+PRINT CONCAT('Backfilled cSourceApp on ', @@ROWCOUNT, ' audit rows.');
+GO
+
+
+-- =============================================================================
 -- One-time backfill: canonicalise historical cUsername casing + fill
 -- iAgentID on existing target rows.
 --
@@ -1262,7 +1589,7 @@ SELECT name FROM [SOAssistant].sys.views  WHERE name LIKE '_vw_SO%' ORDER BY nam
 -- Expected 19 rows.
 
 SELECT name FROM [SOAssistant].sys.objects WHERE name LIKE '_fn_SO%' AND type IN ('IF','TF','FN') ORDER BY name;
--- Expected 1 row: _fn_SOCustomerPriceAsOf.
+-- Expected 2 rows: _fn_SOCustomerPriceAsOf, _fn_SOOrderIntake.
 
 SELECT name FROM [SOAssistant].sys.tables WHERE name LIKE '_tb_SO%' ORDER BY name;
 -- Expected 5 rows: _tb_SOAppUsers, _tb_SOCustomerAssignmentAudit, _tb_SOCustomerContactLog, _tb_SOOrderAssistantAudit, _tb_SOTargets.

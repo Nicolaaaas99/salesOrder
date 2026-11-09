@@ -39,6 +39,30 @@ def _detect_doc_version(db: Session) -> bool:
     return _has_doc_version
 
 
+_has_source_app: Optional[bool] = None
+
+
+def _detect_source_app(db: Session) -> bool:
+    """Cache whether the audit table has cSourceApp yet. Lets the backend
+    deploy ahead of the create_views.sql migration without every audit
+    INSERT failing (and with it the litres on the performance strip).
+    Only a positive result is cached, so once the migration runs the
+    column is picked up without a restart."""
+    global _has_source_app
+    if not _has_source_app:
+        row = db.execute(
+            text(
+                "SELECT 1 FROM [SOAssistant].sys.columns "
+                "WHERE object_id = OBJECT_ID('[SOAssistant].dbo._tb_SOOrderAssistantAudit') "
+                "AND name = 'cSourceApp'"
+            )
+        ).first()
+        _has_source_app = row is not None
+        if not _has_source_app:
+            logger.warning("audit: cSourceApp column missing — run create_views.sql")
+    return _has_source_app
+
+
 def _fetch_invnum_meta(db: Session, order_no: str) -> Optional[dict]:
     """One lookup for the fields we denormalize into the audit row."""
     doc_col = (
@@ -46,15 +70,20 @@ def _fetch_invnum_meta(db: Session, order_no: str) -> Optional[dict]:
         if _detect_doc_version(db)
         else ", NULL AS doc_version"
     )
+    # TOP 1 ... ORDER BY AutoIndex DESC: an OrderNum isn't unique in InvNum
+    # (split-order copies share it, and a reissued number can collide with
+    # an older order — seen on a dev copy where the audit row pointed at the
+    # wrong order). The row just saved is the newest one.
     row = db.execute(
         text(f"""
-            SELECT inv.AutoIndex AS auto_index,
+            SELECT TOP 1 inv.AutoIndex AS auto_index,
                    inv.OrdTotIncl AS total_incl,
                    c.Account      AS customer_account
                    {doc_col}
             FROM InvNum inv
             LEFT JOIN Client c ON c.DCLink = inv.AccountID
             WHERE inv.OrderNum = :order_no AND inv.DocType = 4
+            ORDER BY inv.AutoIndex DESC
         """),
         {"order_no": order_no},
     ).mappings().first()
@@ -79,25 +108,33 @@ def write_order_audit(
     username: str,
     app_version: Optional[str],
     customer_account: Optional[str] = None,
+    source_app: Optional[str] = None,
 ) -> None:
     """Insert one audit row for a sales-order action. Swallows errors so a
     failed audit never blocks the user's save. The _tb_SOOrderAssistantAudit
-    table must exist beforehand — see the SQL script shared with the admin."""
+    table must exist beforehand — see the SQL script shared with the admin.
+
+    `source_app` is the screen that performed the action (ORDER_ASSISTANT /
+    SALES_ORDER_ENTRY). Left NULL for RESCHEDULE / CANCEL, which come from
+    the shared order-summary modal rather than an order-entry screen."""
     try:
         meta = _fetch_invnum_meta(db, order_no) or {}
         agent_id = _resolve_agent_id(db, username)
         customer = customer_account or meta.get("customer_account")
+        with_source = _detect_source_app(db)
+        src_col = ", cSourceApp" if with_source else ""
+        src_val = ", :source_app" if with_source else ""
 
         db.execute(
             text(f"""
                 INSERT INTO {AUDIT_TABLE}
                     (iInvNumAutoIndex, cOrderNum, cAction, iDocVersion,
                      iAgentID, cUsername, cCustomerAccount,
-                     fOrderTotalIncl, cAppVersion)
+                     fOrderTotalIncl, cAppVersion{src_col})
                 VALUES
                     (:auto_index, :order_no, :action, :doc_version,
                      :agent_id, :username, :customer,
-                     :total_incl, :app_version)
+                     :total_incl, :app_version{src_val})
             """),
             {
                 "auto_index": meta.get("auto_index"),
@@ -109,12 +146,13 @@ def write_order_audit(
                 "customer": customer,
                 "total_incl": meta.get("total_incl"),
                 "app_version": app_version,
+                "source_app": (source_app or "")[:32] or None,
             },
         )
         db.commit()
         logger.info(
-            "audit: %s %s by %s (agent=%s, ver=%s)",
-            action, order_no, username, agent_id, app_version,
+            "audit: %s %s by %s (agent=%s, ver=%s, source=%s)",
+            action, order_no, username, agent_id, app_version, source_app,
         )
     except Exception as e:
         try:

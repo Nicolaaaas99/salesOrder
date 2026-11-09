@@ -355,10 +355,11 @@ SELECT
     s.cName AS cScenarioName, s.cStatus AS cScenarioStatus,
     s.cLeverType, s.fLeverValue, s.dPeriodFrom, s.dPeriodTo
   FROM [SOAssistant].dbo._tb_SOScenarioTarget st
+  -- OPENJSON, not LIKE: '[' is a LIKE wildcard, so '%[5]%' matched any
+  -- target whose JSON merely contained the digit 5.
   JOIN [SOAssistant].dbo._tb_SOScenario s
-    ON st.cScenariosAppliedJson LIKE CONCAT('%[', s.idScenario, ']%')
-    OR st.cScenariosAppliedJson LIKE CONCAT('%', s.idScenario, ',%')
-    OR st.cScenariosAppliedJson LIKE CONCAT('%', s.idScenario, ']%')
+    ON EXISTS (SELECT 1 FROM OPENJSON(st.cScenariosAppliedJson) j
+                WHERE TRY_CAST(j.value AS INT) = s.idScenario)
  WHERE st.cCustomerAccount = 'TEST_D_CAFE_ARDERNE';
 
 -- Scenario D: the auto-generated REVIEW_FLAGGED_TARGET task
