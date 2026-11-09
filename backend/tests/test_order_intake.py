@@ -39,6 +39,8 @@ SUMMARY_ROW = {
     "UserName": "BrendaS", "CorpGroup": "Spar",
     "orders": 3, "ordered_qty": 120, "ordered_litres": 450.5, "ordered_excl": 9000.25,
     "invoiced_qty": 100, "invoiced_litres": 400, "invoiced_excl": 8000,
+    "lost_qty": 15, "lost_litres": 30.5, "lost_excl": 750.5,
+    "pending_qty": 5, "pending_litres": 20, "pending_excl": 249.75,
 }
 
 ORDER_ROW = {
@@ -47,6 +49,7 @@ ORDER_ROW = {
     "CorpGroup": "Non Corporate", "CustomerAccount": "C1", "CustomerName": "Cust ",
     "DocState": 1, "OrderedQty": 10, "OrderedLitres": 20, "OrderedExclAmnt": 300,
     "InvoicedQty": 0, "InvoicedLitres": 0, "InvoicedExclAmnt": None,
+    "LostQty": 0, "LostLitres": 0, "LostExclAmnt": None,
 }
 
 
@@ -92,6 +95,8 @@ def test_summary_maps_rows(make_client):
     row = body["rows"][0]
     assert row["hour"] == 8 and row["source"] == "SO Assistant" and row["user"] == "BrendaS"
     assert row["orders"] == 3 and row["ordered_litres"] == 450.5
+    assert row["lost_qty"] == 15 and row["lost_excl"] == 750.5
+    assert row["pending_litres"] == 20 and row["pending_excl"] == 249.75
     assert db.calls[0][1] == {"from_date": date(2026, 11, 5), "to_date": date(2026, 11, 5)}
 
 
@@ -139,6 +144,9 @@ def test_orders_drill_passes_filters_and_defaults_user(make_client):
     o = r.json()[0]
     assert o["user"] == "Evolution" and o["customer_name"] == "Cust"
     assert o["invoiced_excl"] == 0.0
+    assert o["lost_excl"] == 0.0
+    # DocState 1 = unprocessed: the whole order is pending.
+    assert o["pending_qty"] == 10 and o["pending_excl"] == 300
 
 
 def test_orders_rejects_bad_hour(make_client):

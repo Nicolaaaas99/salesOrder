@@ -520,6 +520,14 @@ export type OrderIntakeMetrics = {
   invoiced_qty: number;
   invoiced_litres: number;
   invoiced_excl: number;
+  /** Ordered - invoiced on ARCHIVED orders only (unprocessed orders aren't lost yet). */
+  lost_qty: number;
+  lost_litres: number;
+  lost_excl: number;
+  /** Ordered on orders still unprocessed in Evolution (not invoiced yet). */
+  pending_qty: number;
+  pending_litres: number;
+  pending_excl: number;
 };
 
 /** One (date, hour, source, app screen, user, corp group) bucket. */

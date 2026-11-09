@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { ArrowLeft, Calendar, Download, RefreshCw, X, XCircle } from "lucide-react";
+import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { ArrowLeft, Calendar, ChevronDown, ChevronRight, Download, RefreshCw, X, XCircle } from "lucide-react";
 import { api } from "../api/client";
 import type {
   OrderIntakeDrillFilter,
@@ -30,7 +30,16 @@ const SOURCE_COLOR: Record<OrderIntakeSource, string> = {
 };
 
 type MetricKey = "orders" | "qty" | "litres" | "excl";
-type Basis = "ordered" | "invoiced";
+// Lost = ordered - invoiced on ARCHIVED orders only (an unprocessed order
+// isn't lost, it just isn't invoiced yet). Pending = ordered on orders still
+// unprocessed in Evolution. Ordered = Invoiced + Lost + Pending.
+type Basis = "ordered" | "invoiced" | "lost" | "pending";
+const BASES: { value: Basis; label: string }[] = [
+  { value: "ordered", label: "Ordered" },
+  { value: "invoiced", label: "Invoiced" },
+  { value: "lost", label: "Lost" },
+  { value: "pending", label: "Pending" },
+];
 
 const METRICS: { key: MetricKey; label: string }[] = [
   { key: "orders", label: "Orders" },
@@ -41,24 +50,18 @@ const METRICS: { key: MetricKey; label: string }[] = [
 
 function metricValue(m: OrderIntakeMetrics, key: MetricKey, basis: Basis): number {
   if (key === "orders") return m.orders;
-  if (key === "qty") return basis === "ordered" ? m.ordered_qty : m.invoiced_qty;
-  if (key === "litres") return basis === "ordered" ? m.ordered_litres : m.invoiced_litres;
-  return basis === "ordered" ? m.ordered_excl : m.invoiced_excl;
+  return m[`${basis}_${key}`];
 }
 
 const EMPTY: OrderIntakeMetrics = {
   orders: 0, ordered_qty: 0, ordered_litres: 0, ordered_excl: 0,
   invoiced_qty: 0, invoiced_litres: 0, invoiced_excl: 0,
+  lost_qty: 0, lost_litres: 0, lost_excl: 0,
+  pending_qty: 0, pending_litres: 0, pending_excl: 0,
 };
 
 function addInto(acc: OrderIntakeMetrics, r: OrderIntakeMetrics) {
-  acc.orders += r.orders;
-  acc.ordered_qty += r.ordered_qty;
-  acc.ordered_litres += r.ordered_litres;
-  acc.ordered_excl += r.ordered_excl;
-  acc.invoiced_qty += r.invoiced_qty;
-  acc.invoiced_litres += r.invoiced_litres;
-  acc.invoiced_excl += r.invoiced_excl;
+  for (const k of Object.keys(EMPTY) as (keyof OrderIntakeMetrics)[]) acc[k] += r[k];
 }
 
 const int = new Intl.NumberFormat("en-ZA", { maximumFractionDigits: 0 });
@@ -68,6 +71,13 @@ function fmtMetric(v: number, key: MetricKey, short = false): string {
   return key === "excl" ? `R ${n}` : n;
 }
 const hh = (h: number) => `${String(h).padStart(2, "0")}:00`;
+/** "2026-11-03" -> "Mon 03 Nov" (or "Monday 03 November 2026" when long). */
+function fmtDay(iso: string, long = false): string {
+  const d = new Date(`${iso}T00:00:00`);
+  return d.toLocaleDateString("en-ZA", long
+    ? { weekday: "long", day: "2-digit", month: "long", year: "numeric" }
+    : { weekday: "short", day: "2-digit", month: "short" });
+}
 
 type Props = {
   onBack?: () => void;
@@ -179,6 +189,9 @@ export function OrderIntakeScreen({ onBack, onOpenOrder }: Props) {
   return (
     <div className="h-full bg-gray-50 p-2 flex flex-col overflow-y-auto">
       <div className="max-w-[1600px] mx-auto w-full flex flex-col gap-2">
+        {/* Frozen pane: back link, dates, filters, toggles and KPI tiles stay
+            on screen while the chart and table scroll underneath. */}
+        <div className="sticky -top-2 z-20 -mx-2 -mt-2 px-2 pt-2 pb-2 bg-gray-50 border-b border-gray-200 shadow-sm flex flex-col gap-2">
         {onBack && (
           <div className="flex items-center">
             <button
@@ -191,47 +204,49 @@ export function OrderIntakeScreen({ onBack, onOpenOrder }: Props) {
           </div>
         )}
 
-        {/* Top bar: date range + actions */}
-        <div className="flex items-end gap-2 flex-wrap">
-          <DateBox label="Created From">
-            <DateInput
-              value={fromDate}
-              onChange={(v) => {
-                setFromDate(v);
-                if (v > toDate) setToDate(v);
-              }}
-            />
-          </DateBox>
-          <DateBox label="Created To">
-            <DateInput
-              value={toDate}
-              onChange={(v) => {
-                setToDate(v);
-                if (v < fromDate) setFromDate(v);
-              }}
-            />
-          </DateBox>
-          <button
-            onClick={load}
-            disabled={loading}
-            className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold bg-white border rounded-md shadow-sm hover:bg-gray-50 disabled:opacity-60"
-            title="Reload the figures"
-          >
-            <RefreshCw className={`w-3.5 h-3.5 ${loading ? "animate-spin" : ""}`} />
-            Refresh
-          </button>
-          <button
-            onClick={handleExport}
-            disabled={exporting}
-            className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold bg-emerald-600 text-white rounded-md shadow-sm hover:bg-emerald-700 disabled:opacity-60"
-            title="Download every order in this range as .xlsx"
-          >
-            <Download className="w-3.5 h-3.5" />
-            {exporting ? "Exporting…" : "Export"}
-          </button>
-        </div>
+        <div className="grid grid-cols-[auto_minmax(0,1fr)] gap-2">
+        {/* Left column (both rows): stacked dates + Refresh. Right column:
+            toggles on top, the three KPI cards underneath. */}
+        <div className="row-span-2 flex flex-col gap-1.5">
+            <DateBox label="Created From">
+              <DateInput
+                value={fromDate}
+                onChange={(v) => {
+                  setFromDate(v);
+                  if (v > toDate) setToDate(v);
+                }}
+              />
+            </DateBox>
+            <DateBox label="Created To">
+              <DateInput
+                value={toDate}
+                onChange={(v) => {
+                  setToDate(v);
+                  if (v < fromDate) setFromDate(v);
+                }}
+              />
+            </DateBox>
+            <button
+              onClick={load}
+              disabled={loading}
+              className="inline-flex items-center justify-center gap-1.5 px-3 py-1.5 text-xs font-semibold bg-white border rounded-md shadow-sm hover:bg-gray-50 disabled:opacity-60"
+              title="Reload the figures"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 ${loading ? "animate-spin" : ""}`} />
+              Refresh
+            </button>
+            <button
+              onClick={handleExport}
+              disabled={exporting}
+              className="inline-flex items-center justify-center gap-1.5 px-3 py-1.5 text-xs font-semibold bg-emerald-600 text-white rounded-md shadow-sm hover:bg-emerald-700 disabled:opacity-60"
+              title="Download every order in this range as .xlsx"
+            >
+              <Download className="w-3.5 h-3.5" />
+              {exporting ? "Exporting…" : "Export"}
+            </button>
+          </div>
 
-        {/* Filters + metric controls — one row above the charts */}
+        {/* Filters + metric controls: top row */}
         <div className="flex items-center gap-3 flex-wrap bg-white border rounded p-2 shadow-sm text-xs">
           <Segmented
             options={[
@@ -283,15 +298,31 @@ export function OrderIntakeScreen({ onBack, onOpenOrder }: Props) {
               onChange={(v) => setMetric(v as MetricKey)}
             />
             <Segmented
-              options={[
-                { value: "ordered", label: "Ordered" },
-                { value: "invoiced", label: "Invoiced" },
-              ]}
+              options={BASES}
               value={basis}
               onChange={(v) => setBasis(v as Basis)}
               disabled={metric === "orders"}
             />
           </div>
+        </div>
+
+        {/* Right column, row 2: the three KPI cards */}
+        <div className="contents">
+          <div className="flex-1 min-w-0 grid grid-cols-3 gap-2">
+            <KpiTile title="Total" metrics={total} total={total} basis={basis} />
+            {SOURCES.map((s) => (
+              <KpiTile
+                key={s}
+                title={s}
+                color={SOURCE_COLOR[s]}
+                metrics={bySource.get(s)!}
+                total={total}
+                muted={!visibleSources.includes(s)}
+                basis={basis}
+              />
+            ))}
+          </div>
+        </div>
         </div>
 
         {error && (
@@ -300,20 +331,6 @@ export function OrderIntakeScreen({ onBack, onOpenOrder }: Props) {
             {error}
           </div>
         )}
-
-        {/* KPI tiles */}
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
-          <KpiTile title="Total" metrics={total} total={total} />
-          {SOURCES.map((s) => (
-            <KpiTile
-              key={s}
-              title={s}
-              color={SOURCE_COLOR[s]}
-              metrics={bySource.get(s)!}
-              total={total}
-              muted={!visibleSources.includes(s)}
-            />
-          ))}
         </div>
 
         {/* Hourly chart */}
@@ -366,6 +383,7 @@ export function OrderIntakeScreen({ onBack, onOpenOrder }: Props) {
             corp_group: corpFilter || null,
             user: drill.user ?? (userFilter || null),
           }}
+          pendingOnlyAtStart={basis === "pending"}
           onClose={() => setDrill(null)}
           onOpenOrder={onOpenOrder}
         />
@@ -391,12 +409,13 @@ function DateBox({ label, children }: { label: string; children: React.ReactNode
 }
 
 function Segmented({
-  options, value, onChange, disabled,
+  options, value, onChange, disabled, small,
 }: {
   options: { value: string; label: string }[];
   value: string;
   onChange: (v: string) => void;
   disabled?: boolean;
+  small?: boolean;
 }) {
   return (
     <div className={`inline-flex rounded border overflow-hidden ${disabled ? "opacity-50" : ""}`}>
@@ -406,7 +425,7 @@ function Segmented({
           type="button"
           disabled={disabled}
           onClick={() => onChange(o.value)}
-          className={`px-2.5 py-1 border-l first:border-l-0 ${
+          className={`${small ? "px-2 py-0.5" : "px-2.5 py-1"} border-l first:border-l-0 ${
             value === o.value ? "bg-gray-800 text-white" : "bg-white text-gray-700 hover:bg-gray-50"
           }`}
         >
@@ -435,9 +454,10 @@ function Legend({ sources }: { sources: OrderIntakeSource[] }) {
 }
 
 function KpiTile({
-  title, color, metrics, total, muted,
+  title, color, metrics, total, muted, basis,
 }: {
   title: string;
+  basis: Basis;
   color?: string;
   metrics: OrderIntakeMetrics;
   total: OrderIntakeMetrics;
@@ -445,30 +465,56 @@ function KpiTile({
 }) {
   const share = total.orders > 0 && color ? Math.round((metrics.orders / total.orders) * 100) : null;
   return (
-    <div className={`bg-white border rounded shadow-sm p-3 ${muted ? "opacity-50" : ""}`}>
+    <div className={`bg-white border rounded shadow-sm px-3 py-2 ${muted ? "opacity-50" : ""}`}>
       <div className="flex items-center gap-1.5 text-xs font-semibold text-gray-700">
         {color && <Swatch color={color} />}
         {title}
         {share !== null && <span className="ml-auto font-normal text-gray-500">{share}% of orders</span>}
       </div>
-      <div className="mt-1 text-2xl font-semibold text-gray-900 tabular-nums">
-        {int.format(metrics.orders)} <span className="text-sm font-normal text-gray-500">orders</span>
+      <div className="mt-0.5 text-sm font-medium text-gray-700 tabular-nums">
+        {int.format(metrics.orders)} <span className="font-normal text-gray-500">orders</span>
       </div>
-      <dl className="mt-2 grid grid-cols-3 gap-x-2 text-xs tabular-nums">
-        <Stat label="Qty" ordered={metrics.ordered_qty} invoiced={metrics.invoiced_qty} k="qty" />
-        <Stat label="Litres" ordered={metrics.ordered_litres} invoiced={metrics.invoiced_litres} k="litres" />
-        <Stat label="Amount (excl)" ordered={metrics.ordered_excl} invoiced={metrics.invoiced_excl} k="excl" />
+      <dl className="mt-1.5 grid grid-cols-3 gap-x-3 text-sm tabular-nums">
+        <Stat label="Qty" ordered={metrics.ordered_qty} invoiced={metrics.invoiced_qty} lost={metrics.lost_qty} pending={metrics.pending_qty} k="qty" basis={basis} />
+        <Stat label="Litres" ordered={metrics.ordered_litres} invoiced={metrics.invoiced_litres} lost={metrics.lost_litres} pending={metrics.pending_litres} k="litres" basis={basis} />
+        <Stat label="Amount (excl)" ordered={metrics.ordered_excl} invoiced={metrics.invoiced_excl} lost={metrics.lost_excl} pending={metrics.pending_excl} k="excl" basis={basis} />
       </dl>
     </div>
   );
 }
 
-function Stat({ label, ordered, invoiced, k }: { label: string; ordered: number; invoiced: number; k: MetricKey }) {
+function Stat({
+  label, ordered, invoiced, lost, pending, k, basis,
+}: {
+  label: string; ordered: number; invoiced: number; lost: number; pending: number; k: MetricKey; basis: Basis;
+}) {
+  // The figure picked on the Ordered / Invoiced / Lost toggle is the big
+  // bold one; the others sit underneath as small labelled lines.
+  const lines: { key: Basis; tag: string; v: number; title: string }[] = [
+    { key: "ordered", tag: "ord", v: ordered, title: "Ordered" },
+    { key: "invoiced", tag: "inv", v: invoiced, title: "Invoiced" },
+    { key: "lost", tag: "lost", v: lost, title: "Lost: ordered but not invoiced on processed (archived) orders" },
+    { key: "pending", tag: "pending", v: pending,
+      title: "Pending: on orders still unprocessed in Evolution, not invoiced yet (ordered = inv + lost + pending)" },
+  ];
   return (
     <div>
-      <dt className="text-gray-500">{label}</dt>
-      <dd className="text-gray-900 font-medium">{fmtMetric(ordered, k, true)}</dd>
-      <dd className="text-gray-500" title="Invoiced">inv {fmtMetric(invoiced, k, true)}</dd>
+      <dt className="text-xs text-gray-500">{label}</dt>
+      {lines.map((l) =>
+        l.key === basis ? (
+          <dd key={l.key} className="text-xl font-semibold text-gray-900 leading-tight" title={l.title}>
+            {fmtMetric(l.v, k, true)}
+            {basis !== "ordered" && <span className="ml-1 text-xs font-normal text-gray-500">{l.tag}</span>}
+          </dd>
+        ) : null,
+      )}
+      {lines.map((l) =>
+        l.key !== basis ? (
+          <dd key={l.key} className="text-gray-600" title={l.title}>
+            {l.tag} {fmtMetric(l.v, k, true)}
+          </dd>
+        ) : null,
+      )}
     </div>
   );
 }
@@ -735,12 +781,35 @@ function UserHourTable({
 // Drill-down: the orders behind a bar / cell
 // ---------------------------------------------------------------------------
 
+type TotalKey =
+  | "ordered_qty" | "ordered_litres" | "ordered_excl"
+  | "invoiced_litres" | "invoiced_excl" | "lost_litres" | "lost_excl";
+
+/** The 7 metric cells of a drill-modal row, summed over a list of orders. */
+function Totals({ list, bold }: { list: OrderIntakeOrder[]; bold?: boolean }) {
+  const t = (k: TotalKey) => list.reduce((a, o) => a + o[k], 0);
+  const cls = `text-right px-2 py-1.5 ${bold ? "font-semibold text-gray-900" : "text-gray-800"}`;
+  return (
+    <>
+      <td className={cls}>{int.format(t("ordered_qty"))}</td>
+      <td className={cls}>{int.format(t("ordered_litres"))}</td>
+      <td className={cls}>{fmtMetric(t("ordered_excl"), "excl")}</td>
+      <td className={cls}>{int.format(t("invoiced_litres"))}</td>
+      <td className={cls}>{fmtMetric(t("invoiced_excl"), "excl")}</td>
+      <td className={cls}>{int.format(t("lost_litres"))}</td>
+      <td className={`${cls} pr-3`}>{fmtMetric(t("lost_excl"), "excl")}</td>
+    </>
+  );
+}
+
 function DrillModal({
-  from, to, filter, onClose, onOpenOrder,
+  from, to, filter, pendingOnlyAtStart, onClose, onOpenOrder,
 }: {
   from: string;
   to: string;
   filter: OrderIntakeDrillFilter;
+  /** Opened while the Pending toggle is on: start on pending orders only. */
+  pendingOnlyAtStart?: boolean;
   onClose: () => void;
   onOpenOrder?: (orderNo: string) => void;
 }) {
@@ -771,14 +840,72 @@ function DrillModal({
   // Clicking a source card narrows the list to that source; click it again
   // (or "Show all") to clear. The cards themselves always show both.
   const [sourcePick, setSourcePick] = useState<OrderIntakeSource | null>(null);
-  const shown = (orders ?? []).filter((o) => !sourcePick || o.source === sourcePick);
+  // Day chips (only when the orders span more than one day) narrow the list
+  // to one capture date; the source cards then show that day's split.
+  const [dayPick, setDayPick] = useState<string | null>(null);
+  // Pending only = orders still unprocessed in Evolution (not invoiced yet).
+  const [pendingOnly, setPendingOnly] = useState(!!pendingOnlyAtStart);
+  const pendingCount = (orders ?? []).filter((o) => o.doc_state === 1).length;
+  const dayOf = (o: OrderIntakeOrder) => o.created_at.slice(0, 10);
+  const days = Array.from(
+    (orders ?? []).reduce((m, o) => m.set(dayOf(o), (m.get(dayOf(o)) ?? 0) + 1), new Map<string, number>()),
+  ).sort(([a], [b]) => a.localeCompare(b));
+  const multiDay = days.length > 1;
+  const dayOrders = (orders ?? []).filter((o) => !dayPick || dayOf(o) === dayPick);
+  const shown = useMemo(
+    () =>
+      (orders ?? [])
+        .filter(
+          (o) =>
+            (!dayPick || dayOf(o) === dayPick) &&
+            (!sourcePick || o.source === sourcePick) &&
+            (!pendingOnly || o.doc_state === 1),
+        )
+        .sort((x, y) => x.created_at.localeCompare(y.created_at)),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [orders, dayPick, sourcePick, pendingOnly],
+  );
 
-  const sum = (k: keyof OrderIntakeOrder) =>
-    shown.reduce((a, o) => a + (o[k] as number), 0);
+  // Hierarchy: corporate group -> customer -> orders. Groups and customers
+  // are ordered by litres ordered (biggest first), orders by capture time.
+  const tree = useMemo(() => {
+    const groups = new Map<string, Map<string, OrderIntakeOrder[]>>();
+    for (const o of shown) {
+      if (!groups.has(o.corp_group)) groups.set(o.corp_group, new Map());
+      const cm = groups.get(o.corp_group)!;
+      if (!cm.has(o.customer_account)) cm.set(o.customer_account, []);
+      cm.get(o.customer_account)!.push(o);
+    }
+    const litres = (l: OrderIntakeOrder[]) => l.reduce((a, o) => a + o.ordered_litres, 0);
+    return Array.from(groups, ([name, cm]) => {
+      const customers = Array.from(cm, ([account, list]) => ({
+        account,
+        name: list[0].customer_name,
+        orders: list,
+      })).sort((x, y) => litres(y.orders) - litres(x.orders));
+      return { name, customers, orders: customers.flatMap((c) => c.orders) };
+    }).sort((x, y) => litres(y.orders) - litres(x.orders));
+  }, [shown]);
+
+  const [open, setOpen] = useState<Set<string>>(new Set());
+  const toggle = (k: string) =>
+    setOpen((prev) => {
+      const next = new Set(prev);
+      if (next.has(k)) next.delete(k);
+      else next.add(k);
+      return next;
+    });
+  const expandAll = () =>
+    setOpen(new Set(tree.flatMap((g) => [`g:${g.name}`, ...g.customers.map((c) => `c:${g.name}|${c.account}`)])));
+  // A single group has nothing to choose between, so open it straight away.
+  const singleGroup = tree.length === 1 ? tree[0].name : null;
+  useEffect(() => {
+    if (singleGroup) setOpen((prev) => new Set(prev).add(`g:${singleGroup}`));
+  }, [singleGroup]);
 
   // Same SO Assistant / Evolution split the bar's hover tooltip shows.
   const bySource = SOURCES.map((s) => {
-    const list = (orders ?? []).filter((o) => o.source === s);
+    const list = dayOrders.filter((o) => o.source === s);
     return {
       source: s,
       orders: list.length,
@@ -791,7 +918,7 @@ function DrillModal({
   return (
     <div className="fixed inset-0 z-40 bg-black/30 flex items-center justify-center p-4" onClick={onClose}>
       <div
-        className="bg-white rounded shadow-lg max-w-6xl w-full max-h-[85vh] flex flex-col overflow-hidden"
+        className="bg-white rounded shadow-lg max-w-[90rem] w-full max-h-[85vh] flex flex-col overflow-hidden"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="px-4 py-3 border-b bg-gray-50 flex items-center justify-between">
@@ -803,6 +930,29 @@ function DrillModal({
             <X className="w-5 h-5" />
           </button>
         </div>
+        {orders && multiDay && (
+          <div className="px-4 py-2 border-b flex flex-wrap items-center gap-1.5 text-xs">
+            <span className="text-gray-500 mr-1">Day:</span>
+            {[["", orders.length] as [string, number], ...days].map(([d, n]) => {
+              const active = (dayPick ?? "") === d;
+              return (
+                <button
+                  key={d || "all"}
+                  type="button"
+                  onClick={() => setDayPick(d || null)}
+                  aria-pressed={active}
+                  className={`px-2 py-0.5 rounded-full border tabular-nums ${
+                    active
+                      ? "bg-gray-800 text-white border-gray-800"
+                      : "bg-white text-gray-700 hover:bg-gray-50"
+                  }`}
+                >
+                  {d ? fmtDay(d) : "All days"} <span className={active ? "text-gray-300" : "text-gray-400"}>{n}</span>
+                </button>
+              );
+            })}
+          </div>
+        )}
         {orders && orders.length > 0 && (
           <div className="px-4 py-2 border-b flex flex-wrap items-center gap-2 text-xs">
             {bySource.map((b) => {
@@ -826,7 +976,7 @@ function DrillModal({
                   <Swatch color={SOURCE_COLOR[b.source]} />
                   {b.source}
                   <span className="ml-auto font-normal text-gray-500">
-                    {Math.round((b.orders / orders.length) * 100)}% of orders
+                    {Math.round((b.orders / Math.max(1, dayOrders.length)) * 100)}% of orders
                   </span>
                 </div>
                 <div className="mt-0.5 text-gray-600 tabular-nums">
@@ -848,68 +998,154 @@ function DrillModal({
             )}
           </div>
         )}
+        {orders && orders.length > 0 && (
+          <div className="px-4 py-1.5 border-b flex items-center gap-3 text-xs">
+            <Segmented
+              small
+              options={[
+                { value: "all", label: "All orders" },
+                { value: "pending", label: `Pending only (${pendingCount})` },
+              ]}
+              value={pendingOnly ? "pending" : "all"}
+              onChange={(v) => setPendingOnly(v === "pending")}
+            />
+            <span className="text-gray-500">Corporate group → customer → order</span>
+            <button type="button" className="text-blue-700 hover:underline" onClick={expandAll}>
+              Expand all
+            </button>
+            <button type="button" className="text-blue-700 hover:underline" onClick={() => setOpen(new Set())}>
+              Collapse all
+            </button>
+          </div>
+        )}
         <div className="overflow-auto">
           {error && <div className="p-3 text-xs text-red-700">{error}</div>}
           {!orders && !error && <div className="p-6 text-center text-sm text-gray-400">Loading…</div>}
           {orders && (
             <table className="w-full text-xs tabular-nums">
-              <thead className="sticky top-0 bg-white">
+              <thead className="sticky top-0 bg-white z-10">
                 <tr className="text-gray-500 border-b">
-                  <th className="text-left font-medium px-3 py-1.5">Captured</th>
-                  <th className="text-left font-medium px-2 py-1.5">Order</th>
-                  <th className="text-left font-medium px-2 py-1.5">Customer</th>
-                  <th className="text-left font-medium px-2 py-1.5">Group</th>
+                  <th className="text-left font-medium px-3 py-1.5">Group / customer / order</th>
+                  <th className="text-left font-medium px-2 py-1.5">Captured</th>
                   <th className="text-left font-medium px-2 py-1.5">User</th>
                   <th className="text-left font-medium px-2 py-1.5">Source</th>
                   <th className="text-right font-medium px-2 py-1.5">Qty</th>
                   <th className="text-right font-medium px-2 py-1.5">Litres</th>
                   <th className="text-right font-medium px-2 py-1.5">Excl</th>
                   <th className="text-right font-medium px-2 py-1.5">Inv litres</th>
-                  <th className="text-right font-medium px-3 py-1.5">Inv excl</th>
+                  <th className="text-right font-medium px-2 py-1.5">Inv excl</th>
+                  <th className="text-right font-medium px-2 py-1.5">Lost litres</th>
+                  <th className="text-right font-medium px-3 py-1.5">Lost excl</th>
                 </tr>
               </thead>
               <tbody>
-                {shown.map((o) => (
-                  <tr key={o.order_no} className="border-b hover:bg-gray-50">
-                    <td className="px-3 py-1.5 whitespace-nowrap">{o.created_at.replace("T", " ").slice(0, 16)}</td>
-                    <td className="px-2 py-1.5">
-                      <button className="text-blue-700 hover:underline" onClick={() => setViewing(o.order_no)}>
-                        {o.order_no}
-                      </button>
-                    </td>
-                    <td className="px-2 py-1.5 truncate max-w-[16rem]" title={o.customer_name}>
-                      {o.customer_account} · {o.customer_name}
-                    </td>
-                    <td className="px-2 py-1.5">{o.corp_group}</td>
-                    <td className="px-2 py-1.5">{o.user}</td>
-                    <td className="px-2 py-1.5">
-                      <span className="inline-flex items-center gap-1.5">
-                        <Swatch color={SOURCE_COLOR[o.source]} />
-                        {o.source}
-                      </span>
-                    </td>
-                    <td className="text-right px-2 py-1.5">{int.format(o.ordered_qty)}</td>
-                    <td className="text-right px-2 py-1.5">{int.format(o.ordered_litres)}</td>
-                    <td className="text-right px-2 py-1.5">{fmtMetric(o.ordered_excl, "excl")}</td>
-                    <td className="text-right px-2 py-1.5">{int.format(o.invoiced_litres)}</td>
-                    <td className="text-right px-3 py-1.5">{fmtMetric(o.invoiced_excl, "excl")}</td>
-                  </tr>
-                ))}
-                {orders.length === 0 && (
-                  <tr><td colSpan={11} className="p-6 text-center text-gray-400">No orders.</td></tr>
+                {tree.map((g) => {
+                  const gKey = `g:${g.name}`;
+                  const gOpen = open.has(gKey);
+                  return (
+                    <Fragment key={gKey}>
+                      <tr
+                        className="bg-slate-100 border-b border-slate-200 cursor-pointer hover:bg-slate-200"
+                        onClick={() => toggle(gKey)}
+                      >
+                        <td className="px-3 py-1.5 font-semibold text-slate-800">
+                          <span className="inline-flex items-center gap-1">
+                            {gOpen ? <ChevronDown className="w-3.5 h-3.5" /> : <ChevronRight className="w-3.5 h-3.5" />}
+                            {g.name}
+                          </span>
+                        </td>
+                        <td className="px-2 py-1.5 text-slate-600" colSpan={3}>
+                          {g.orders.length} orders · {g.customers.length} customers
+                        </td>
+                        <Totals list={g.orders} bold />
+                      </tr>
+                      {gOpen &&
+                        g.customers.map((c) => {
+                          const cKey = `c:${g.name}|${c.account}`;
+                          const cOpen = open.has(cKey);
+                          return (
+                            <Fragment key={cKey}>
+                              <tr className="border-b cursor-pointer hover:bg-gray-50" onClick={() => toggle(cKey)}>
+                                <td className="py-1.5 pl-8 pr-2 truncate max-w-[22rem]" title={c.name}>
+                                  <span className="inline-flex items-center gap-1 font-medium text-gray-800">
+                                    {cOpen ? <ChevronDown className="w-3.5 h-3.5" /> : <ChevronRight className="w-3.5 h-3.5" />}
+                                    {c.account} · {c.name}
+                                  </span>
+                                </td>
+                                <td className="px-2 py-1.5 text-gray-500" colSpan={3}>
+                                  {c.orders.length} {c.orders.length === 1 ? "order" : "orders"}
+                                </td>
+                                <Totals list={c.orders} />
+                              </tr>
+                              {cOpen &&
+                                c.orders.map((o) => (
+                                  <tr key={o.order_no} className="border-b bg-white hover:bg-blue-50/40">
+                                    <td className="py-1.5 pl-14 pr-2">
+                                      <button
+                                        className="text-blue-700 hover:underline"
+                                        onClick={() => setViewing(o.order_no)}
+                                      >
+                                        {o.order_no}
+                                      </button>
+                                    </td>
+                                    <td className="px-2 py-1.5 whitespace-nowrap">
+                                      {multiDay
+                                        ? o.created_at.replace("T", " ").slice(0, 16)
+                                        : o.created_at.slice(11, 16)}
+                                    </td>
+                                    <td className="px-2 py-1.5">{o.user}</td>
+                                    <td className="px-2 py-1.5">
+                                      <span className="inline-flex items-center gap-1.5">
+                                        <Swatch color={SOURCE_COLOR[o.source]} />
+                                        {o.source}
+                                      </span>
+                                    </td>
+                                    <td className="text-right px-2 py-1.5">{int.format(o.ordered_qty)}</td>
+                                    <td className="text-right px-2 py-1.5">{int.format(o.ordered_litres)}</td>
+                                    <td className="text-right px-2 py-1.5">{fmtMetric(o.ordered_excl, "excl")}</td>
+                                    <td className="text-right px-2 py-1.5">{int.format(o.invoiced_litres)}</td>
+                                    <td className="text-right px-2 py-1.5">{fmtMetric(o.invoiced_excl, "excl")}</td>
+                                    {o.doc_state === 1 ? (
+                                      <td
+                                        colSpan={2}
+                                        className="text-right px-3 py-1.5 text-gray-400"
+                                        title="Unprocessed in Evolution, so nothing is lost yet"
+                                      >
+                                        not invoiced yet
+                                      </td>
+                                    ) : (
+                                      <>
+                                        <td className="text-right px-2 py-1.5">{int.format(o.lost_litres)}</td>
+                                        <td className="text-right px-3 py-1.5">{fmtMetric(o.lost_excl, "excl")}</td>
+                                      </>
+                                    )}
+                                  </tr>
+                                ))}
+                            </Fragment>
+                          );
+                        })}
+                    </Fragment>
+                  );
+                })}
+                {shown.length === 0 && (
+                  <tr><td colSpan={11} className="p-6 text-center text-gray-400">
+                    {orders.length === 0
+                      ? "No orders."
+                      : pendingOnly
+                      ? "No pending orders here: everything has been invoiced."
+                      : "No orders for this day / source."}
+                  </td></tr>
                 )}
               </tbody>
               {shown.length > 0 && (
-                <tfoot>
+                <tfoot className="sticky bottom-0">
                   <tr className="border-t bg-gray-50 font-semibold">
-                    <td className="px-3 py-1.5" colSpan={6}>
+                    <td className="px-3 py-1.5" colSpan={4}>
                       {shown.length} orders{sourcePick && ` · ${sourcePick} only`}
+                      {dayPick && ` · ${fmtDay(dayPick)}`}
+                      {pendingOnly && " · pending only"}
                     </td>
-                    <td className="text-right px-2 py-1.5">{int.format(sum("ordered_qty"))}</td>
-                    <td className="text-right px-2 py-1.5">{int.format(sum("ordered_litres"))}</td>
-                    <td className="text-right px-2 py-1.5">{fmtMetric(sum("ordered_excl"), "excl")}</td>
-                    <td className="text-right px-2 py-1.5">{int.format(sum("invoiced_litres"))}</td>
-                    <td className="text-right px-3 py-1.5">{fmtMetric(sum("invoiced_excl"), "excl")}</td>
+                    <Totals list={shown} bold />
                   </tr>
                 </tfoot>
               )}

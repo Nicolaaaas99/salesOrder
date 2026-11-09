@@ -1,5 +1,5 @@
 """
-Order Intake dashboard — ordered / invoiced qty, litres and excl amount per
+Order Intake dashboard — ordered / invoiced / lost qty, litres and excl amount per
 hour of capture, split by where the order was created (SO Assistant app vs
 Evolution) and by who captured it.
 
@@ -50,7 +50,14 @@ _METRICS_SQL = """
     SUM(OrderedExclAmnt)    AS ordered_excl,
     SUM(InvoicedQty)        AS invoiced_qty,
     SUM(InvoicedLitres)     AS invoiced_litres,
-    SUM(InvoicedExclAmnt)   AS invoiced_excl
+    SUM(InvoicedExclAmnt)   AS invoiced_excl,
+    SUM(LostQty)            AS lost_qty,
+    SUM(LostLitres)         AS lost_litres,
+    SUM(LostExclAmnt)       AS lost_excl,
+    -- Pending: ordered on orders still unprocessed (DocState 1) in Evolution.
+    SUM(CASE WHEN DocState = 1 THEN OrderedQty      ELSE 0 END) AS pending_qty,
+    SUM(CASE WHEN DocState = 1 THEN OrderedLitres   ELSE 0 END) AS pending_litres,
+    SUM(CASE WHEN DocState = 1 THEN OrderedExclAmnt ELSE 0 END) AS pending_excl
 """
 
 SUMMARY_SQL = f"""
@@ -65,7 +72,8 @@ ORDERS_SQL = f"""
     SELECT OrderNum, CreatedAt, CreatedHour, OrderSource, AppScreen, UserName,
            CorpGroup, CustomerAccount, CustomerName, DocState,
            OrderedQty, OrderedLitres, OrderedExclAmnt,
-           InvoicedQty, InvoicedLitres, InvoicedExclAmnt
+           InvoicedQty, InvoicedLitres, InvoicedExclAmnt,
+           LostQty, LostLitres, LostExclAmnt
     FROM {_FN}
     WHERE (:hour IS NULL OR CreatedHour = :hour)
       AND (:source IS NULL OR OrderSource = :source)
@@ -99,6 +107,22 @@ def _metrics(r) -> dict:
         invoiced_qty=_f(r["invoiced_qty"]),
         invoiced_litres=_f(r["invoiced_litres"]),
         invoiced_excl=_f(r["invoiced_excl"]),
+        lost_qty=_f(r["lost_qty"]),
+        lost_litres=_f(r["lost_litres"]),
+        lost_excl=_f(r["lost_excl"]),
+        pending_qty=_f(r["pending_qty"]),
+        pending_litres=_f(r["pending_litres"]),
+        pending_excl=_f(r["pending_excl"]),
+    )
+
+
+def _pending(r) -> dict:
+    """An order is pending while it is unprocessed (DocState 1): all of it."""
+    is_open = int(r["DocState"] or 0) == 1
+    return dict(
+        pending_qty=_f(r["OrderedQty"]) if is_open else 0.0,
+        pending_litres=_f(r["OrderedLitres"]) if is_open else 0.0,
+        pending_excl=_f(r["OrderedExclAmnt"]) if is_open else 0.0,
     )
 
 
@@ -182,6 +206,10 @@ def order_intake_orders(
             invoiced_qty=_f(r["InvoicedQty"]),
             invoiced_litres=_f(r["InvoicedLitres"]),
             invoiced_excl=_f(r["InvoicedExclAmnt"]),
+            lost_qty=_f(r["LostQty"]),
+            lost_litres=_f(r["LostLitres"]),
+            lost_excl=_f(r["LostExclAmnt"]),
+            **_pending(r),
         )
         for r in rows
     ]
@@ -192,6 +220,8 @@ EXPORT_HEADERS = [
     "CorpGroup", "CustomerAccount", "CustomerName",
     "OrderedQty", "OrderedLitres", "OrderedExclAmnt",
     "InvoicedQty", "InvoicedLitres", "InvoicedExclAmnt",
+    "LostQty", "LostLitres", "LostExclAmnt",
+    "PendingQty", "PendingLitres", "PendingExclAmnt", "Status",
 ]
 
 
@@ -216,14 +246,18 @@ def order_intake_export(
     for cell in ws[1]:
         cell.font = Font(bold=True)
     for r in rows:
+        pend = _pending(r)
         ws.append([
             r["CreatedAt"], int(r["CreatedHour"]), r["OrderNum"], r["OrderSource"],
             r["AppScreen"] or "", (r["UserName"] or "").strip(), r["CorpGroup"],
             r["CustomerAccount"], (r["CustomerName"] or "").strip(),
             _f(r["OrderedQty"]), _f(r["OrderedLitres"]), _f(r["OrderedExclAmnt"]),
             _f(r["InvoicedQty"]), _f(r["InvoicedLitres"]), _f(r["InvoicedExclAmnt"]),
+            _f(r["LostQty"]), _f(r["LostLitres"]), _f(r["LostExclAmnt"]),
+            pend["pending_qty"], pend["pending_litres"], pend["pending_excl"],
+            "Pending" if int(r["DocState"] or 0) == 1 else "Processed",
         ])
-    for i, width in enumerate((19, 6, 16, 13, 18, 16, 14, 16, 40, 11, 13, 15, 11, 13, 15)):
+    for i, width in enumerate((19, 6, 16, 13, 18, 16, 14, 16, 40, 11, 13, 15, 11, 13, 15, 11, 13, 15, 11, 13, 15, 11)):
         ws.column_dimensions[chr(ord("A") + i)].width = width
     ws.freeze_panes = "A2"
 

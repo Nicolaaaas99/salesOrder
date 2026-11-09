@@ -18,6 +18,27 @@ and "the app is live".
 
 Order matters where noted. Everything else can be done in any order.
 
+### Release — Order Intake: Lost toggle, unprocessed + archived only
+**SQL first, then the app.** The new backend reads the `Lost*` columns, so
+the new app on the old function would error. The old app on the new
+function is fine, so applying the SQL first causes no downtime.
+- [ ] Re-run `backend/sql/create_views.sql` end-to-end on the server (safe to re-run).
+      `_fn_SOOrderIntake` now counts DocState 1 + 4 only (DocState 3 is
+      always a split copy), takes Invoiced amount from
+      `fQtyProcessedLineTotExcl`, and adds `LostQty` / `LostLitres` /
+      `LostExclAmnt` (ordered − invoiced on archived orders only).
+- [ ] Verify: `SELECT CASE WHEN OBJECT_DEFINITION(OBJECT_ID('[SOAssistant].dbo._fn_SOOrderIntake')) LIKE '%LostExclAmnt%' THEN 'current' ELSE 'OLD' END;` returns `current`.
+- [ ] Deploy the app with `deploy.ps1`.
+- [ ] Smoke test: Analytics → Order Intake → toggle **Lost**. The KPI tiles show
+      a "lost" line, and the drill modal has Lost litres / Lost excl columns,
+      with "not invoiced yet" shown for unprocessed orders. Check `01.HOFSO871054` (5 Aug 2026):
+      lost = 6 × Fruit Coctail 1 KG = R157.02. The **Pending** toggle and the
+      modal's "Pending only" switch list the unprocessed orders.
+- [ ] Smoke test: Order Assistant top strip (Today / This week / This month)
+      shows non-zero litres + called for an agent who placed an order today.
+      It showed 0 for everyone since 80d2045 (2026-11-06): a `:min_id` inside
+      a SQL comment made `/auth/me/performance` fail on every call.
+
 ### Release 2026-11-09 — Sales Order Entry, Written order, order source, Order Intake
 Do these in this order: **SQL first, then the app.** (If the backend goes
 first, Sales Order Entry orders placed in between get no source and the

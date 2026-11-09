@@ -441,6 +441,14 @@ class OrderIntakeMetrics(BaseModel):
     invoiced_qty: float = 0.0
     invoiced_litres: float = 0.0
     invoiced_excl: float = 0.0
+    # Ordered - invoiced on ARCHIVED orders only (unprocessed orders aren't lost yet).
+    lost_qty: float = 0.0
+    lost_litres: float = 0.0
+    lost_excl: float = 0.0
+    # Ordered on orders still unprocessed in Evolution (not invoiced yet).
+    pending_qty: float = 0.0
+    pending_litres: float = 0.0
+    pending_excl: float = 0.0
 
 
 class OrderIntakeRow(OrderIntakeMetrics):
@@ -478,6 +486,14 @@ class OrderIntakeOrder(BaseModel):
     invoiced_qty: float = 0.0
     invoiced_litres: float = 0.0
     invoiced_excl: float = 0.0
+    # Ordered - invoiced on ARCHIVED orders only (unprocessed orders aren't lost yet).
+    lost_qty: float = 0.0
+    lost_litres: float = 0.0
+    lost_excl: float = 0.0
+    # Ordered on orders still unprocessed in Evolution (not invoiced yet).
+    pending_qty: float = 0.0
+    pending_litres: float = 0.0
+    pending_excl: float = 0.0
 
 
 # ---------- Customer contact log (route call outcomes) ----------

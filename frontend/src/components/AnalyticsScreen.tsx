@@ -1,5 +1,5 @@
 import { Suspense, lazy, useState } from "react";
-import { BarChart3, Clock, History, Inbox, Shield, Target as TargetIcon, Truck } from "lucide-react";
+import { BarChart3, ClipboardList, History, Inbox, Shield, Target as TargetIcon, Truck } from "lucide-react";
 import { useAuth } from "../context/AuthContext";
 import { AdminUsersScreen } from "./AdminUsersScreen";
 import { DeliveriesScreen } from "./DeliveriesScreen";
@@ -85,7 +85,7 @@ export function AnalyticsScreen({ onOpenOrder }: Props = {}) {
           />
           {isSupervisorPlus && (
             <HubCard
-              icon={<Clock className="w-6 h-6" />}
+              icon={<ClipboardList className="w-6 h-6" />}
               iconClass="bg-sky-100 text-sky-700"
               title="Order Intake"
               description="Orders, qty, litres and amount per hour — SO Assistant vs Evolution."

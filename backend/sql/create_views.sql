@@ -1099,11 +1099,22 @@ GO
 -- Lives down here (not with the other functions) because it reads
 -- _tb_SOOrderAssistantAudit, which must exist first.
 --
--- Split orders: when Evolution partially processes an order it archives the
--- original (DocState 4) and creates a COPY carrying the full order lines
--- (DocState 3, OrigDocID = original AutoIndex), stamped with the processing
--- time. Only the original row is counted — counting the copy would double
+-- Which orders: originals in DocState 1 (unprocessed) or 4 (archived).
+-- When Evolution partially processes an order it archives the original
+-- (DocState 4) and creates a COPY carrying the same lines (DocState 3,
+-- OrigDocID = original AutoIndex), stamped with the processing time. The
+-- archived original already holds what was ordered AND what was invoiced,
+-- so DocState 3 is left out entirely (verified 2026-11-09: no DocState-3
+-- order exists that isn't such a copy). Counting the copy would double
 -- every split order and invent a second "order" at processing time.
+--
+-- Metrics, per line then summed:
+--   Ordered  = fQuantity              / fQuantityLineTotExcl
+--   Invoiced = fQtyProcessed          / fQtyProcessedLineTotExcl
+--   Lost     = ordered - invoiced, ARCHIVED (DocState 4) orders only —
+--              an unprocessed order isn't lost, it just isn't invoiced yet.
+--   So: Ordered = Invoiced + Lost + still open (unprocessed).
+--   Litres = qty x StkItem.ulIISize. Cancelled orders are not included.
 --
 -- OrderSource: 'SO Assistant' when the app wrote a CREATE audit row for the
 -- order, else 'Evolution'. AppScreen keeps the finer split
@@ -1165,7 +1176,10 @@ RETURNS @out TABLE (
     OrderedLitres     FLOAT          NOT NULL,
     InvoicedLitres    FLOAT          NOT NULL,
     OrderedExclAmnt   FLOAT          NOT NULL,
-    InvoicedExclAmnt  FLOAT          NOT NULL
+    InvoicedExclAmnt  FLOAT          NOT NULL,
+    LostQty           FLOAT          NOT NULL,
+    LostLitres        FLOAT          NOT NULL,
+    LostExclAmnt      FLOAT          NOT NULL
 )
 AS
 BEGIN
@@ -1196,7 +1210,7 @@ BEGIN
            NUM.AccountID, NUM.InvNum_iCreatedAgentID
     FROM [BA_00_LPD_CON].dbo.InvNum NUM
     WHERE NUM.DocType = 4
-      AND NUM.DocState IN (1, 3, 4)
+      AND NUM.DocState IN (1, 4)   -- unprocessed + archived (see header)
       -- originals only: split-order copies carry OrigDocID = original
       AND (NUM.OrigDocID IS NULL OR NUM.OrigDocID = 0 OR NUM.OrigDocID = NUM.AutoIndex)
       AND NUM.InvNum_dCreatedDate >= @fromUtc
@@ -1216,7 +1230,8 @@ BEGIN
               AND A.dtActionAt <  @toLocal)
       AND NUM.InvNum_dCreatedDate IS NULL
       AND NUM.DocType = 4
-      AND NUM.DocState IN (1, 3, 4);
+      AND NUM.DocState IN (1, 4)
+      AND (NUM.OrigDocID IS NULL OR NUM.OrigDocID = 0 OR NUM.OrigDocID = NUM.AutoIndex);
 
     -- 2. Line totals for exactly those orders, in one set-based pass.
     DECLARE @lines TABLE (
@@ -1226,7 +1241,10 @@ BEGIN
         OrderedLitres     FLOAT NULL,
         InvoicedLitres    FLOAT NULL,
         OrderedExclAmnt   FLOAT NULL,
-        InvoicedExclAmnt  FLOAT NULL
+        InvoicedExclAmnt  FLOAT NULL,
+        LostQty           FLOAT NULL,
+        LostLitres        FLOAT NULL,
+        LostExclAmnt      FLOAT NULL
     );
 
     INSERT INTO @lines
@@ -1236,7 +1254,15 @@ BEGIN
            SUM(STK.ulIISize * LIN.fQuantity),
            SUM(STK.ulIISize * LIN.fQtyProcessed),
            SUM(LIN.fQuantityLineTotExcl),
-           SUM(LIN.fQtyLastProcessLineTotExcl)
+           SUM(LIN.fQtyProcessedLineTotExcl),
+           -- Lost: archived orders only. Per line, never below 0 (a line
+           -- invoiced above its ordered qty doesn't cancel another's loss).
+           SUM(CASE WHEN O.DocState = 4 AND LIN.fQuantity > LIN.fQtyProcessed
+                    THEN LIN.fQuantity - LIN.fQtyProcessed ELSE 0 END),
+           SUM(CASE WHEN O.DocState = 4 AND LIN.fQuantity > LIN.fQtyProcessed
+                    THEN STK.ulIISize * (LIN.fQuantity - LIN.fQtyProcessed) ELSE 0 END),
+           SUM(CASE WHEN O.DocState = 4 AND LIN.fQuantityLineTotExcl > LIN.fQtyProcessedLineTotExcl
+                    THEN LIN.fQuantityLineTotExcl - LIN.fQtyProcessedLineTotExcl ELSE 0 END)
     FROM @orders O
     JOIN [BA_00_LPD_CON].dbo._btblInvoiceLines LIN ON LIN.iInvoiceID = O.AutoIndex
     JOIN [BA_00_LPD_CON].dbo.StkItem STK           ON STK.StockLink  = LIN.iStockCodeID
@@ -1272,7 +1298,10 @@ BEGIN
         ISNULL(L.OrderedLitres, 0),
         ISNULL(L.InvoicedLitres, 0),
         ISNULL(L.OrderedExclAmnt, 0),
-        ISNULL(L.InvoicedExclAmnt, 0)
+        ISNULL(L.InvoicedExclAmnt, 0),
+        ISNULL(L.LostQty, 0),
+        ISNULL(L.LostLitres, 0),
+        ISNULL(L.LostExclAmnt, 0)
     FROM @orders O
     JOIN [BA_00_LPD_CON].dbo.Client CL ON CL.DCLink = O.AccountID
     LEFT JOIN @lines L ON L.AutoIndex = O.AutoIndex

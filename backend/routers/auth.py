@@ -264,7 +264,10 @@ def my_performance(
             -- (observed 2026-11-06: 70-145 s CPU / 17-36M reads per
             -- call, pinning the server). UNION ALL keeps the exact same
             -- row semantics: branch 1 is a PK seek, branch 2 is a PK
-            -- range seek from :min_id (see min_row above).
+            -- range seek from the min_id param (see min_row above).
+            -- NB: never write colon-prefixed param names in these SQL
+            -- comments: SQLAlchemy binds them, SQL Server ignores them,
+            -- and the call fails with "N markers but N+1 parameters".
             matched AS (
                 SELECT c.action_date, NUM.AutoIndex
                 FROM my_creates c
