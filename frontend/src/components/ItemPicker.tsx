@@ -6,11 +6,16 @@ import type { InventoryItem } from "../api/types";
 type Props = {
   value: string;
   onSelect: (item: InventoryItem) => void;
+  /** Focus (and open) as soon as it mounts — for pickers that replace a
+   *  "Change" button, so the user can type straight away. */
+  autoFocus?: boolean;
+  /** Called on Escape, or when focus leaves without a pick. */
+  onCancel?: () => void;
 };
 
 type Pos = { top: number; left: number; width: number };
 
-export function ItemPicker({ value, onSelect }: Props) {
+export function ItemPicker({ value, onSelect, autoFocus, onCancel }: Props) {
   const [query, setQuery] = useState<string | null>(null);
   const [results, setResults] = useState<InventoryItem[]>([]);
   const [open, setOpen] = useState(false);
@@ -38,6 +43,15 @@ export function ItemPicker({ value, onSelect }: Props) {
     }, 80);
     return () => { alive = false; clearTimeout(t); };
   }, [searchFor, open]);
+
+  useEffect(() => {
+    if (autoFocus && inputRef.current) {
+      inputRef.current.focus();
+      inputRef.current.select();
+    }
+    // Mount only.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   useLayoutEffect(() => {
     if (!open || !inputRef.current) return;
@@ -94,6 +108,7 @@ export function ItemPicker({ value, onSelect }: Props) {
         onBlur={() => {
           setOpen(false);
           setQuery(null);
+          onCancel?.();
         }}
         onChange={(e) => {
           setQuery(e.target.value);
@@ -130,6 +145,7 @@ export function ItemPicker({ value, onSelect }: Props) {
             e.preventDefault();
             setQuery(null);
             setOpen(false);
+            onCancel?.();
           }
         }}
       />

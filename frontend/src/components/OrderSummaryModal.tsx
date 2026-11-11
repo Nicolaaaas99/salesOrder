@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Pencil, X, Ban, CalendarDays } from "lucide-react";
+import { Pencil, X, Ban, CalendarDays, FileText } from "lucide-react";
 import { api } from "../api/client";
 import type { SalesOrderDetail } from "../api/types";
 import { fmtCurrency } from "../utils/format";
@@ -189,7 +189,22 @@ export function OrderSummaryModal({
                 <HeaderCell label="Due Date" value={fmtDmy(detail.due_date)} />
                 <HeaderCell label="Invoice Date" value={fmtDmy(detail.invoice_date)} />
                 <HeaderCell label="Delivery Date" value={fmtDmy(detail.delivery_date)} />
-                <HeaderCell label="External Order" value={detail.external_order || "—"} />
+                <HeaderCell label="External Order">
+                  <span>{detail.external_order || "—"}</span>
+                  {detail.source_document_id && (
+                    <button
+                      className="ml-2 text-blue-700 hover:underline"
+                      onClick={() =>
+                        api
+                          .openImportDocument(detail.source_document_id!)
+                          .catch(() => setError("Could not open the source document"))
+                      }
+                      title="Open the document this order was imported from"
+                    >
+                      <FileText className="w-3.5 h-3.5 inline" /> Source document
+                    </button>
+                  )}
+                </HeaderCell>
                 <HeaderCell label="Description" value={detail.description || "—"} />
                 <HeaderCell label="Tax Mode" value={detail.tax_mode} />
               </div>

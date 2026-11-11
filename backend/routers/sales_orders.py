@@ -20,6 +20,7 @@ from services.contact_log import write_contact_log
 from services.forecasting.suggestions import record_order_decisions
 from services.sales_order_service import create_sales_order, update_sales_order
 from services import short_cache
+from services.order_import import store as import_store
 
 
 def _app_version(
@@ -144,10 +145,11 @@ def place_order(
 
     customer = _build_customer_detail(row)
 
-    # Sales Order Entry is limited to corporate customers (the picker only
-    # offers those); re-check here so a stale or hand-crafted request can't
-    # bypass it. Only on CREATE — editing an existing order is unaffected.
-    if payload.source == "SALES_ORDER_ENTRY" and not is_corporate_customer(
+    # Sales Order Entry (and Order Import, which lives inside it) is limited
+    # to corporate customers (the picker only offers those); re-check here so
+    # a stale or hand-crafted request can't bypass it. Only on CREATE —
+    # editing an existing order is unaffected.
+    if payload.source in ("SALES_ORDER_ENTRY", "ORDER_IMPORT") and not is_corporate_customer(
         db, payload.customer_account
     ):
         raise HTTPException(
@@ -596,6 +598,9 @@ def _load_sales_order(order_no: str, db: Session) -> schemas.SalesOrderDetail:
         doc_state=doc_state,
         doc_state_label=DOC_STATE_LABELS.get(doc_state, "Unknown"),
         is_archived=doc_state == 4,
+        source_document_id=import_store.document_for_order(
+            db, header["order_no"] or order_no
+        ),
         lines=lines,
     )
 

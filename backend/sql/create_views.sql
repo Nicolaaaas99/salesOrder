@@ -11,7 +11,7 @@
  The USE + GO batches are required because CREATE/ALTER VIEW must be the
  first statement in its batch.
 
- Object list (19 views + 2 functions + 5 tables):
+ Object list (19 views + 2 functions + 6 tables):
    Views     — _vw_SOActiveDeals, _vw_SOAgentDefaultWhse, _vw_SOCustomerDetail,
                _vw_SOCustomerInvoiceHistory, _vw_SOCustomerOrdersPerDay,
                _vw_SOCustomers, _vw_SOInventory,
@@ -25,7 +25,9 @@
                _fn_SOOrderIntake(@from date, @to date) — one row per order
                created in the range (Order Intake dashboard).
    Tables    — _tb_SOOrderAssistantAudit, _tb_SOCustomerContactLog,
-               _tb_SOCustomerAssignmentAudit, _tb_SOTargets, _tb_SOAppUsers
+               _tb_SOCustomerAssignmentAudit, _tb_SOTargets, _tb_SOAppUsers,
+               _tb_SOCustomerItemMap, _tb_SOImportPriceDecision,
+               _tb_SOImportDocument, _tb_SOImportReview
 ******************************************************************************/
 
 USE [SOAssistant];
@@ -227,6 +229,8 @@ GO
 --       • Id    — the PostST posting type (passed through; set to 'SO' for
 --                 open sales-order rows so a downstream consumer can tell
 --                 the source apart without re-joining).
+--       • Size  — StkItem.ulIISize (litres/kg per unit). The Order
+--                 Assistant history grid sorts items in a category by it.
 --       • Litre — ulIISize * signed Quantity, so volume aggregation (per
 --                 category or per week) works directly off the view.
 --
@@ -264,6 +268,7 @@ SELECT
     STK.ulIIMainCategory             Category,
     STK.StockLink,
     STK.Code                         StockCode,
+    STK.ulIISize                     Size,
     STK.Code+'-'+STK.Description_1   StockCodeDesc,
     ST.TxDate,
     ST.Order_No,
@@ -295,6 +300,7 @@ SELECT
     STK.ulIIMainCategory                      Category,
     STK.StockLink,
     STK.Code                                  StockCode,
+    STK.ulIISize                              Size,
     STK.Code+'-'+STK.Description_1            StockCodeDesc,
     NUM.OrderDate                             TxDate,
     NUM.OrderNum                              Order_No,
@@ -1077,6 +1083,294 @@ BEGIN
 END;
 GO
 
+-- -----------------------------------------------------------------------------
+-- _tb_SOCustomerItemMap  (Order Import: customer's item code -> our stock
+-- code). Written when a user manually resolves a line on an imported
+-- purchase order that didn't match our stock automatically, so the same
+-- line matches by itself on the next import.
+--
+-- cScope: whose codes these are. 'GROUP:<Client.ulARCorpGroup>' (e.g.
+-- 'GROUP:Boxer') so one mapping serves every store in the chain, or
+-- 'ACCOUNT:<Client.Account>' for customers without a corporate group.
+-- cCustCode / cCustItemCode: the line's "Supplier Code" and "Item"
+-- (article / barcode) columns as printed on the order; '' when blank.
+-- cCustomerAccount: the customer (Client.Account) the mapping was captured
+-- for — recorded for traceability; the mapping applies to the whole scope.
+-- Lookup order: both codes match > supplier code > item code.
+-- Upserted on (cScope, cCustCode, cCustItemCode).
+-- -----------------------------------------------------------------------------
+IF OBJECT_ID('[SOAssistant].dbo._tb_SOCustomerItemMap', 'U') IS NULL
+BEGIN
+    CREATE TABLE [SOAssistant].dbo._tb_SOCustomerItemMap (
+        idItemMap         INT IDENTITY(1,1) NOT NULL,
+        cCustomerAccount  VARCHAR(20)    NULL,
+        cScope            VARCHAR(120)   NOT NULL,
+        cCustCode         VARCHAR(40)    NOT NULL,
+        cCustItemCode     VARCHAR(40)    NOT NULL,
+        cCustDescription  NVARCHAR(200)  NULL,
+        cStockCode        VARCHAR(20)    NOT NULL,
+        cCreatedBy        VARCHAR(50)    NOT NULL,
+        dtCreatedAt       DATETIME2(7)   NOT NULL
+            CONSTRAINT DF_SOCustomerItemMap_dt DEFAULT (sysdatetime()),
+        cUpdatedBy        VARCHAR(50)    NULL,
+        dtUpdatedAt       DATETIME2(7)   NULL,
+        CONSTRAINT PK_SOCustomerItemMap PRIMARY KEY CLUSTERED (idItemMap),
+        CONSTRAINT UX_SOCustomerItemMap_Key UNIQUE (cScope, cCustCode, cCustItemCode),
+        CONSTRAINT CK_SOCustomerItemMap_HasCode CHECK (cCustCode <> '' OR cCustItemCode <> '')
+    );
+END;
+GO
+
+-- Idempotent migration: adds cCustomerAccount if the table was created
+-- before the column existed.
+IF NOT EXISTS (
+    SELECT 1 FROM sys.columns
+    WHERE name = 'cCustomerAccount'
+      AND object_id = OBJECT_ID('[SOAssistant].dbo._tb_SOCustomerItemMap')
+)
+BEGIN
+    ALTER TABLE [SOAssistant].dbo._tb_SOCustomerItemMap
+        ADD cCustomerAccount VARCHAR(20) NULL;
+END;
+GO
+
+-- -----------------------------------------------------------------------------
+-- _tb_SOImportPriceDecision  (Order Import: which price was charged on a
+-- purchase-order line whose PO price differs from our Evolution price).
+--
+-- One row per differing line on every imported order that was CREATED.
+-- cChoice: 'EVOLUTION' (charged our price; bAuto = 1 when automatic — the
+-- PO was at most 5c above ours), 'PO' (a supervisor charged the PO price)
+-- or 'OVERRIDE' (a supervisor typed the price). Read by
+-- sql/diagnostics/broken_price_list_rows.sql (section "PO prices that
+-- disagree with our price list"); written on button clicks only.
+-- -----------------------------------------------------------------------------
+IF OBJECT_ID('[SOAssistant].dbo._tb_SOImportPriceDecision', 'U') IS NULL
+BEGIN
+    CREATE TABLE [SOAssistant].dbo._tb_SOImportPriceDecision (
+        idPriceDecision   INT IDENTITY(1,1) NOT NULL,
+        dtCreatedAt       DATETIME2(7)   NOT NULL
+            CONSTRAINT DF_SOImportPriceDecision_dt DEFAULT (sysdatetime()),
+        cUsername         VARCHAR(50)    NOT NULL,
+        cCustomerAccount  VARCHAR(20)    NOT NULL,
+        cScope            VARCHAR(120)   NOT NULL,   -- GROUP:<corp group> / ACCOUNT:<acc>
+        cPONumber         VARCHAR(50)    NOT NULL,
+        cOrderNum         VARCHAR(50)    NOT NULL,   -- our sales order number
+        cStockCode        VARCHAR(20)    NOT NULL,
+        cWhseCode         VARCHAR(20)    NULL,
+        cPriceSource      VARCHAR(20)    NULL,       -- Price List / Customer Deal / Group Deal
+        fQty              FLOAT          NOT NULL,
+        fEvoExcl          FLOAT          NOT NULL,
+        fEvoIncl          FLOAT          NOT NULL,   -- what our price would charge
+        fPOIncl           FLOAT          NOT NULL,
+        fChargedIncl      FLOAT          NOT NULL,
+        cChoice           VARCHAR(10)    NOT NULL,
+        bAuto             BIT            NOT NULL,
+        CONSTRAINT PK_SOImportPriceDecision PRIMARY KEY CLUSTERED (idPriceDecision),
+        CONSTRAINT CK_SOImportPriceDecision_Choice
+            CHECK (cChoice IN ('PO', 'EVOLUTION', 'OVERRIDE'))
+    );
+    CREATE INDEX IX_SOImportPriceDecision_Item
+        ON [SOAssistant].dbo._tb_SOImportPriceDecision (cScope, cStockCode, dtCreatedAt);
+END;
+GO
+
+-- Rebuild the choice constraint on tables created before 'OVERRIDE' existed.
+IF EXISTS (
+    SELECT 1 FROM sys.check_constraints
+    WHERE name = 'CK_SOImportPriceDecision_Choice'
+      AND parent_object_id = OBJECT_ID('[SOAssistant].dbo._tb_SOImportPriceDecision')
+      AND OBJECT_DEFINITION(object_id) NOT LIKE '%OVERRIDE%'
+)
+BEGIN
+    ALTER TABLE [SOAssistant].dbo._tb_SOImportPriceDecision
+        DROP CONSTRAINT CK_SOImportPriceDecision_Choice;
+    ALTER TABLE [SOAssistant].dbo._tb_SOImportPriceDecision
+        ADD CONSTRAINT CK_SOImportPriceDecision_Choice
+            CHECK (cChoice IN ('PO', 'EVOLUTION', 'OVERRIDE'));
+END;
+GO
+
+-- Archive (Price Review → PO price differences, 2026-11-10). Opening the
+-- tab re-prices the open lines; a line that no longer needs fixing is
+-- archived so later loads skip it (still viewable on demand):
+--   cArchiveStatus FIXED      ours now matches the PO
+--                  TOLERANCE  the PO is up to 5c above ours
+--                  DISMISSED  a supervisor chose not to fix it; the reason
+--                             is in cArchiveNote (required).
+-- fOursAtArchive / cSourceAtArchive: our price + its source at that moment.
+IF NOT EXISTS (
+    SELECT 1 FROM sys.columns
+    WHERE name = 'dtArchivedAt'
+      AND object_id = OBJECT_ID('[SOAssistant].dbo._tb_SOImportPriceDecision')
+)
+BEGIN
+    ALTER TABLE [SOAssistant].dbo._tb_SOImportPriceDecision
+        ADD dtArchivedAt     DATETIME2(7) NULL,
+            cArchiveStatus   VARCHAR(10)  NULL,
+            cArchivedBy      VARCHAR(50)  NULL,
+            fOursAtArchive   FLOAT        NULL,
+            cSourceAtArchive VARCHAR(20)  NULL;
+END;
+GO
+
+-- Settled lines are split by what they were AT IMPORT (2026-11-10):
+-- FIXED = was a problem (supervisor-decided, bAuto = 0) and ours is now
+-- equal to or within 5c below the PO; TOLERANCE = was charged ours
+-- automatically at import. Re-labels lines archived under the first rule
+-- (exact match only). Idempotent.
+UPDATE [SOAssistant].dbo._tb_SOImportPriceDecision
+SET cArchiveStatus = CASE WHEN bAuto = 1 THEN 'TOLERANCE' ELSE 'FIXED' END
+WHERE cArchiveStatus IN ('TOLERANCE', 'FIXED')
+  AND cArchiveStatus <> CASE WHEN bAuto = 1 THEN 'TOLERANCE' ELSE 'FIXED' END;
+GO
+
+-- cArchiveNote: the reason a supervisor gave for DISMISSING a difference
+-- (choosing not to fix it). Required by the app for every dismissal.
+IF NOT EXISTS (
+    SELECT 1 FROM sys.columns
+    WHERE name = 'cArchiveNote'
+      AND object_id = OBJECT_ID('[SOAssistant].dbo._tb_SOImportPriceDecision')
+)
+BEGIN
+    ALTER TABLE [SOAssistant].dbo._tb_SOImportPriceDecision
+        ADD cArchiveNote NVARCHAR(200) NULL;
+END;
+GO
+
+-- Lines archived by hand during testing, before a reason was required:
+-- re-open them so they are fixed or dismissed properly. Idempotent (every
+-- real dismissal has a reason).
+UPDATE [SOAssistant].dbo._tb_SOImportPriceDecision
+SET dtArchivedAt = NULL, cArchiveStatus = NULL, cArchivedBy = NULL,
+    fOursAtArchive = NULL, cSourceAtArchive = NULL
+WHERE cArchiveStatus = 'DISMISSED' AND cArchiveNote IS NULL;
+GO
+
+-- Open lines (dtArchivedAt NULL) + the per-PO tree.
+IF NOT EXISTS (
+    SELECT 1 FROM sys.indexes
+    WHERE name = 'IX_SOImportPriceDecision_PO'
+      AND object_id = OBJECT_ID('[SOAssistant].dbo._tb_SOImportPriceDecision')
+)
+    CREATE INDEX IX_SOImportPriceDecision_PO
+        ON [SOAssistant].dbo._tb_SOImportPriceDecision
+           (dtArchivedAt, cCustomerAccount, cPONumber, cOrderNum)
+        INCLUDE (cArchiveStatus);
+GO
+
+-- "Newer PO" (SUPERSEDED) was removed the same day: a line now leaves
+-- "to fix" only when fixed, within 5c, or dismissed with a reason. Re-open
+-- any line archived that way and drop its index. Idempotent.
+UPDATE [SOAssistant].dbo._tb_SOImportPriceDecision
+SET dtArchivedAt = NULL, cArchiveStatus = NULL, cArchivedBy = NULL,
+    fOursAtArchive = NULL, cSourceAtArchive = NULL
+WHERE cArchiveStatus = 'SUPERSEDED';
+GO
+
+IF EXISTS (
+    SELECT 1 FROM sys.indexes
+    WHERE name = 'IX_SOImportPriceDecision_CustItem'
+      AND object_id = OBJECT_ID('[SOAssistant].dbo._tb_SOImportPriceDecision')
+)
+    DROP INDEX IX_SOImportPriceDecision_CustItem
+        ON [SOAssistant].dbo._tb_SOImportPriceDecision;
+GO
+
+-- -----------------------------------------------------------------------------
+-- _tb_SOImportDocument  (Order Import: the original purchase-order PDF).
+--
+-- Stored when the PDF is read, once per distinct file (cSha256 — the same
+-- PDF uploaded again reuses its row). cCustomerAccount / cOrderNum are filled
+-- in when the import is submitted for review / created. Opened from the
+-- import screen and the Price Review screen ("View PO"). Up to 10 MB each;
+-- a typical PO is 100-300 KB.
+-- -----------------------------------------------------------------------------
+IF OBJECT_ID('[SOAssistant].dbo._tb_SOImportDocument', 'U') IS NULL
+BEGIN
+    CREATE TABLE [SOAssistant].dbo._tb_SOImportDocument (
+        idDocument        INT IDENTITY(1,1) NOT NULL,
+        cCustomerAccount  VARCHAR(20)    NULL,
+        cPONumber         VARCHAR(50)    NULL,
+        cOrderNum         VARCHAR(50)    NULL,   -- last sales order created from it
+        cFileName         NVARCHAR(260)  NOT NULL,
+        iSizeBytes        INT            NOT NULL,
+        cSha256           CHAR(64)       NOT NULL,
+        bData             VARBINARY(MAX) NOT NULL,
+        cUploadedBy       VARCHAR(50)    NOT NULL,
+        dtUploadedAt      DATETIME2(7)   NOT NULL
+            CONSTRAINT DF_SOImportDocument_dt DEFAULT (sysdatetime()),
+        CONSTRAINT PK_SOImportDocument PRIMARY KEY CLUSTERED (idDocument),
+        CONSTRAINT UX_SOImportDocument_Sha UNIQUE (cSha256)
+    );
+END;
+GO
+
+-- Opening a sales order looks up its source document by our order number
+-- (sales_orders._load_sales_order -> store.document_for_order).
+IF NOT EXISTS (
+    SELECT 1 FROM sys.indexes
+    WHERE name = 'IX_SOImportDocument_Order'
+      AND object_id = OBJECT_ID('[SOAssistant].dbo._tb_SOImportDocument')
+)
+    CREATE INDEX IX_SOImportDocument_Order
+        ON [SOAssistant].dbo._tb_SOImportDocument (cOrderNum);
+GO
+
+-- -----------------------------------------------------------------------------
+-- _tb_SOImportReview  (Order Import: orders handed to a supervisor).
+--
+-- An agent submits an import whose only problem is a PO price too far from
+-- ours (PO more than 5c above, or ours above the PO). A supervisor opens it
+-- on the Price Review screen, sets the prices and creates the order
+-- (cStatus CREATED, cOrderNum) or rejects it with a reason (REJECTED).
+-- cDocumentJson: the lines read from the PDF (ParsedOrder), so the import
+-- is re-checked against Evolution as it is when the supervisor opens it.
+-- -----------------------------------------------------------------------------
+IF OBJECT_ID('[SOAssistant].dbo._tb_SOImportReview', 'U') IS NULL
+BEGIN
+    CREATE TABLE [SOAssistant].dbo._tb_SOImportReview (
+        idReview          INT IDENTITY(1,1) NOT NULL,
+        cStatus           VARCHAR(10)    NOT NULL,
+        cCustomerAccount  VARCHAR(20)    NOT NULL,
+        cCustomerName     NVARCHAR(100)  NULL,
+        cPONumber         VARCHAR(50)    NOT NULL,
+        iDocumentID       INT            NULL,       -- _tb_SOImportDocument
+        dOrderDate        DATE           NULL,
+        dDeliveryDate     DATE           NULL,
+        cDescription      NVARCHAR(40)   NULL,
+        cDocumentJson     NVARCHAR(MAX)  NOT NULL,
+        fPOTotalIncl      FLOAT          NULL,
+        iReviewLines      INT            NOT NULL,   -- lines needing a price decision
+        cSubmittedBy      VARCHAR(50)    NOT NULL,
+        dtSubmittedAt     DATETIME2(7)   NOT NULL
+            CONSTRAINT DF_SOImportReview_dt DEFAULT (sysdatetime()),
+        cSubmitNote       NVARCHAR(500)  NULL,
+        cReviewedBy       VARCHAR(50)    NULL,
+        dtReviewedAt      DATETIME2(7)   NULL,
+        cReviewNote       NVARCHAR(500)  NULL,
+        cOrderNum         VARCHAR(50)    NULL,
+        CONSTRAINT PK_SOImportReview PRIMARY KEY CLUSTERED (idReview),
+        CONSTRAINT CK_SOImportReview_Status
+            CHECK (cStatus IN ('PENDING', 'CREATED', 'REJECTED'))
+    );
+    CREATE INDEX IX_SOImportReview_Status
+        ON [SOAssistant].dbo._tb_SOImportReview (cStatus, dtSubmittedAt);
+    CREATE INDEX IX_SOImportReview_PO
+        ON [SOAssistant].dbo._tb_SOImportReview (cCustomerAccount, cPONumber, cStatus);
+END;
+GO
+
+IF NOT EXISTS (
+    SELECT 1 FROM sys.indexes
+    WHERE name = 'IX_SOImportReview_Order'
+      AND object_id = OBJECT_ID('[SOAssistant].dbo._tb_SOImportReview')
+)
+    CREATE INDEX IX_SOImportReview_Order
+        ON [SOAssistant].dbo._tb_SOImportReview (cOrderNum)
+        INCLUDE (iDocumentID);
+GO
+
 -- Supporting index for _fn_SOOrderIntake: one CREATE row per order,
 -- looked up by InvNum.AutoIndex.
 IF NOT EXISTS (
@@ -1116,6 +1410,17 @@ GO
 --   So: Ordered = Invoiced + Lost + still open (unprocessed).
 --   Litres = qty x StkItem.ulIISize. Cancelled orders are not included.
 --
+-- DC lines only: a line counts only when its warehouse is one of the two
+-- distribution centres (incl. their damaged-goods warehouses):
+--   48 01.HOF_POL + 62 DG_01.HOF_POL -> 'Polokwane'
+--   49 01.HOF_MAK + 61 DG_01.HOF_MAK -> 'Makhado'
+-- (the @dcs list below — add a new DC there). Lines on any other
+-- warehouse (01.HOF_MAN1 bulk / factory, 01.HOF, FFACT, FBULK, ...) are
+-- ignored, and an order with no DC line at all drops out of the report.
+-- DistCentre = the DC carrying most of the order's ordered excl amount, so
+-- an order is still one row (orders with lines on both DCs are rare: 10
+-- from Aug–Nov 2026; their smaller DC's lines count under the bigger one).
+--
 -- OrderSource: 'SO Assistant' when the app wrote a CREATE audit row for the
 -- order, else 'Evolution'. AppScreen keeps the finer split
 -- (ORDER_ASSISTANT / SALES_ORDER_ENTRY) for later use.
@@ -1125,7 +1430,10 @@ GO
 -- old orders too. App orders: the audit row's iAgentID (falls back to a
 -- case-insensitive name match if it was never resolved). Evolution orders:
 -- InvNum_iCreatedAgentID. No agent found -> the audit username, else
--- 'Evolution'.
+-- 'SDK' (an order created through the Evolution SDK with no agent on it).
+--
+-- CorpGroup / Route: from the customer card (Client ulARCorpGroup /
+-- ulARRoute) as it is NOW; blanks become 'Non Corporate' / 'No route'.
 --
 -- Shape: MULTI-STATEMENT on purpose (2026-11-08 measurement). The inline
 -- version used a per-order OUTER APPLY over _btblInvoiceLines; SQL Server
@@ -1169,6 +1477,8 @@ RETURNS @out TABLE (
     AgentID           INT            NULL,
     UserName          VARCHAR(100)   NOT NULL,
     CorpGroup         VARCHAR(100)   NOT NULL,
+    DistCentre        VARCHAR(100)   NOT NULL,
+    Route             VARCHAR(100)   NOT NULL,
     CustomerAccount   VARCHAR(50)    NULL,
     CustomerName      VARCHAR(200)   NULL,
     OrderedQty        FLOAT          NOT NULL,
@@ -1233,9 +1543,16 @@ BEGIN
       AND NUM.DocState IN (1, 4)
       AND (NUM.OrigDocID IS NULL OR NUM.OrigDocID = 0 OR NUM.OrigDocID = NUM.AutoIndex);
 
-    -- 2. Line totals for exactly those orders, in one set-based pass.
+    -- 2. Line totals for exactly those orders, DC warehouses only, per
+    -- (order, DC), in one set-based pass.
+    DECLARE @dcs TABLE (WhseLink INT NOT NULL PRIMARY KEY, DistCentre VARCHAR(100) NOT NULL);
+    INSERT INTO @dcs VALUES
+        (48, 'Polokwane'), (62, 'Polokwane'),   -- 01.HOF_POL, DG_01.HOF_POL
+        (49, 'Makhado'),   (61, 'Makhado');     -- 01.HOF_MAK, DG_01.HOF_MAK
+
     DECLARE @lines TABLE (
-        AutoIndex         INT   NOT NULL PRIMARY KEY,
+        AutoIndex         INT   NOT NULL,
+        DistCentre        VARCHAR(100) NOT NULL,
         OrderedQty        FLOAT NULL,
         InvoicedQty       FLOAT NULL,
         OrderedLitres     FLOAT NULL,
@@ -1244,11 +1561,13 @@ BEGIN
         InvoicedExclAmnt  FLOAT NULL,
         LostQty           FLOAT NULL,
         LostLitres        FLOAT NULL,
-        LostExclAmnt      FLOAT NULL
+        LostExclAmnt      FLOAT NULL,
+        PRIMARY KEY (AutoIndex, DistCentre)
     );
 
     INSERT INTO @lines
     SELECT O.AutoIndex,
+           D.DistCentre,
            SUM(LIN.fQuantity),
            SUM(LIN.fQtyProcessed),
            SUM(STK.ulIISize * LIN.fQuantity),
@@ -1266,7 +1585,8 @@ BEGIN
     FROM @orders O
     JOIN [BA_00_LPD_CON].dbo._btblInvoiceLines LIN ON LIN.iInvoiceID = O.AutoIndex
     JOIN [BA_00_LPD_CON].dbo.StkItem STK           ON STK.StockLink  = LIN.iStockCodeID
-    GROUP BY O.AutoIndex;
+    JOIN @dcs D                                     ON D.WhseLink     = LIN.iWarehouseID
+    GROUP BY O.AutoIndex, D.DistCentre;
 
     -- 3. Who / where, plus the totals.
     INSERT INTO @out
@@ -1289,8 +1609,12 @@ BEGIN
         -- them in one COALESCE needs an explicit COLLATE (Msg 457).
         COALESCE(AG.cAgentName COLLATE DATABASE_DEFAULT,
                  AA.cUsername  COLLATE DATABASE_DEFAULT,
-                 'Evolution'),
+                 'SDK'),
         ISNULL(NULLIF(LTRIM(RTRIM(CL.ulARCorpGroup)), ''), 'Non Corporate'),
+        -- DC from the order's lines (see header); route from the
+        -- customer's CURRENT card.
+        DC.DistCentre,
+        ISNULL(NULLIF(LTRIM(RTRIM(CL.ulARRoute)), ''), 'No route'),
         LTRIM(RTRIM(CL.Account)),
         CL.Name,
         ISNULL(L.OrderedQty, 0),
@@ -1304,7 +1628,23 @@ BEGIN
         ISNULL(L.LostExclAmnt, 0)
     FROM @orders O
     JOIN [BA_00_LPD_CON].dbo.Client CL ON CL.DCLink = O.AccountID
-    LEFT JOIN @lines L ON L.AutoIndex = O.AutoIndex
+    -- Inner join: an order without any DC line is not in the report.
+    JOIN (
+        SELECT AutoIndex,
+               SUM(OrderedQty) AS OrderedQty,           SUM(InvoicedQty) AS InvoicedQty,
+               SUM(OrderedLitres) AS OrderedLitres,     SUM(InvoicedLitres) AS InvoicedLitres,
+               SUM(OrderedExclAmnt) AS OrderedExclAmnt, SUM(InvoicedExclAmnt) AS InvoicedExclAmnt,
+               SUM(LostQty) AS LostQty, SUM(LostLitres) AS LostLitres, SUM(LostExclAmnt) AS LostExclAmnt
+        FROM @lines
+        GROUP BY AutoIndex
+    ) L ON L.AutoIndex = O.AutoIndex
+    -- The order's DC: the one carrying most of its value.
+    CROSS APPLY (
+        SELECT TOP 1 LD.DistCentre
+        FROM @lines LD
+        WHERE LD.AutoIndex = O.AutoIndex
+        ORDER BY LD.OrderedExclAmnt DESC, LD.OrderedLitres DESC, LD.DistCentre
+    ) DC
     OUTER APPLY (
         SELECT TOP 1 A.idSOAppAudit, A.cUsername, A.cSourceApp, A.dtActionAt, A.iAgentID
         FROM [SOAssistant].dbo._tb_SOOrderAssistantAudit A
@@ -1425,6 +1765,16 @@ EXEC sp_executesql @sql;
 -- AppUsers table — the admin Users & Roles screen does full CRUD
 -- (add, change role, deactivate) under the ADMIN role gate.
 SET @sql = N'GRANT INSERT, UPDATE, DELETE ON OBJECT :: dbo._tb_SOAppUsers TO ' + QUOTENAME(@login) + N';';
+EXEC sp_executesql @sql;
+-- Order Import item mappings — upserted / removed from the import screen.
+SET @sql = N'GRANT INSERT, UPDATE, DELETE ON OBJECT :: dbo._tb_SOCustomerItemMap TO ' + QUOTENAME(@login) + N';';
+EXEC sp_executesql @sql;
+-- UPDATE: the PO price differences tab archives lines (dtArchivedAt etc.).
+SET @sql = N'GRANT INSERT, UPDATE ON OBJECT :: dbo._tb_SOImportPriceDecision TO ' + QUOTENAME(@login) + N';';
+EXEC sp_executesql @sql;
+SET @sql = N'GRANT INSERT, UPDATE ON OBJECT :: dbo._tb_SOImportDocument TO ' + QUOTENAME(@login) + N';';
+EXEC sp_executesql @sql;
+SET @sql = N'GRANT INSERT, UPDATE ON OBJECT :: dbo._tb_SOImportReview TO ' + QUOTENAME(@login) + N';';
 EXEC sp_executesql @sql;
 
 PRINT 'Granted SELECT + INSERT on [SOAssistant] to login ' + @login + '.';
@@ -1621,7 +1971,7 @@ SELECT name FROM [SOAssistant].sys.objects WHERE name LIKE '_fn_SO%' AND type IN
 -- Expected 2 rows: _fn_SOCustomerPriceAsOf, _fn_SOOrderIntake.
 
 SELECT name FROM [SOAssistant].sys.tables WHERE name LIKE '_tb_SO%' ORDER BY name;
--- Expected 5 rows: _tb_SOAppUsers, _tb_SOCustomerAssignmentAudit, _tb_SOCustomerContactLog, _tb_SOOrderAssistantAudit, _tb_SOTargets.
+-- Expected 9 rows: _tb_SOAppUsers, _tb_SOCustomerAssignmentAudit, _tb_SOCustomerContactLog, _tb_SOCustomerItemMap, _tb_SOImportDocument, _tb_SOImportPriceDecision, _tb_SOImportReview, _tb_SOOrderAssistantAudit, _tb_SOTargets.
 
 -- Row-count sanity check — should match the Evolution-side table.
 SELECT 'SOAssistant audit rows' AS label, COUNT(*) AS n

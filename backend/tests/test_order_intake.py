@@ -36,7 +36,7 @@ class FakeDB:
 SUMMARY_ROW = {
     "CreatedDate": date(2026, 11, 5), "CreatedHour": 8,
     "OrderSource": "SO Assistant", "AppScreen": "ORDER_ASSISTANT",
-    "UserName": "BrendaS", "CorpGroup": "Spar",
+    "UserName": "BrendaS", "CorpGroup": "Spar", "DistCentre": "Makhado", "Route": "R101",
     "orders": 3, "ordered_qty": 120, "ordered_litres": 450.5, "ordered_excl": 9000.25,
     "invoiced_qty": 100, "invoiced_litres": 400, "invoiced_excl": 8000,
     "lost_qty": 15, "lost_litres": 30.5, "lost_excl": 750.5,
@@ -46,7 +46,8 @@ SUMMARY_ROW = {
 ORDER_ROW = {
     "OrderNum": "01.HOFSO1", "CreatedAt": datetime(2026, 11, 5, 8, 12), "CreatedHour": 8,
     "OrderSource": "Evolution", "AppScreen": None, "UserName": None,
-    "CorpGroup": "Non Corporate", "CustomerAccount": "C1", "CustomerName": "Cust ",
+    "CorpGroup": "Non Corporate", "DistCentre": "No DC", "Route": "No route",
+    "CustomerAccount": "C1", "CustomerName": "Cust ",
     "DocState": 1, "OrderedQty": 10, "OrderedLitres": 20, "OrderedExclAmnt": 300,
     "InvoicedQty": 0, "InvoicedLitres": 0, "InvoicedExclAmnt": None,
     "LostQty": 0, "LostLitres": 0, "LostExclAmnt": None,
@@ -97,6 +98,7 @@ def test_summary_maps_rows(make_client):
     assert row["orders"] == 3 and row["ordered_litres"] == 450.5
     assert row["lost_qty"] == 15 and row["lost_excl"] == 750.5
     assert row["pending_litres"] == 20 and row["pending_excl"] == 249.75
+    assert row["dist_centre"] == "Makhado" and row["route"] == "R101"
     assert db.calls[0][1] == {"from_date": date(2026, 11, 5), "to_date": date(2026, 11, 5)}
 
 
@@ -135,14 +137,17 @@ def test_orders_drill_passes_filters_and_defaults_user(make_client):
     r = client.get(
         "/api/analytics/order-intake/orders",
         params={"from": "2026-11-05", "to": "2026-11-05", "hour": 8,
-                "source": "Evolution", "user": "", "corp_group": "Non Corporate"},
+                "source": "Evolution", "user": "", "corp_group": "Non Corporate",
+                "dist_centre": "Makhado", "route": ""},
     )
     assert r.status_code == 200
     params = db.calls[0][1]
     assert params["hour"] == 8 and params["source"] == "Evolution"
     assert params["user_name"] is None and params["corp_group"] == "Non Corporate"
+    assert params["dist_centre"] == "Makhado" and params["route"] is None
     o = r.json()[0]
-    assert o["user"] == "Evolution" and o["customer_name"] == "Cust"
+    assert o["user"] == "SDK" and o["customer_name"] == "Cust"
+    assert o["dist_centre"] == "No DC" and o["route"] == "No route"
     assert o["invoiced_excl"] == 0.0
     assert o["lost_excl"] == 0.0
     # DocState 1 = unprocessed: the whole order is pending.

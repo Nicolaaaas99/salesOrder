@@ -376,7 +376,7 @@ def list_orders(customer_id: str = Query(...), db: Session = Depends(get_db)):
     sql = """
         SELECT
             Route, CustomerAccName, CustomerAccount, Category,
-            StockCode, StockCodeDesc,
+            StockCode, StockCodeDesc, Size,
             TxDate, Order_No, Quantity, ExclAmount, VAT, InclAmount, OnOrder
         FROM [SOAssistant].dbo._vw_SOCustomerInvoiceHistory
         WHERE CustomerAccount = :account
@@ -427,6 +427,7 @@ def list_orders(customer_id: str = Query(...), db: Session = Depends(get_db)):
                 "stockCode": stock_code,
                 "description": description,
                 "category": (row["Category"] or "Uncategorized").strip() or "Uncategorized",
+                "size": float(row["Size"]) if row["Size"] is not None else None,
                 "quantity": 0.0,
                 "exclAmount": 0.0,
                 "vat": 0.0,
@@ -736,6 +737,7 @@ def order_suggestions(
             if p:
                 s.unit_price = p.excl_price
                 s.unit_price_incl = p.incl_price
+                s.price_list_broken = p.price_list_broken
                 s.price_source = p.source
             else:
                 s.price_source = "None"

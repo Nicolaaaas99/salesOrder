@@ -224,6 +224,13 @@ def _apply_lines(so, payload: schemas.SalesOrderCreate, SDK):
         if line.warehouse_code:
             _try_set_warehouse(od, line.warehouse_code, SDK)
 
+        # Tax type BEFORE the price: in inclusive mode a later tax-type change
+        # could make Evolution re-derive the price. The price is written last
+        # so the stored price is exactly the one we send (incl in inclusive
+        # mode, excl in exclusive mode — it follows the document's TaxMode).
+        if line.tax_type_id is not None:
+            _try_set_tax_type(od, int(line.tax_type_id), SDK)
+
         od.Quantity         = float(line.quantity)
         od.UnitSellingPrice = float(line.unit_price)
 
@@ -241,9 +248,6 @@ def _apply_lines(so, payload: schemas.SalesOrderCreate, SDK):
                 ("DiscountPercent", "DiscountPercentage", "LineDiscount",
                  "LineDiscountPercent", "Discount"),
                 float(line.discount_percent), "line discount")
-
-        if line.tax_type_id is not None:
-            _try_set_tax_type(od, int(line.tax_type_id), SDK)
 
         if line.project_code:
             _try_set_project(od, line.project_code, SDK)

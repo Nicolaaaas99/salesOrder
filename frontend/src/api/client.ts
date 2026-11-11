@@ -23,6 +23,12 @@ import type {
   CustomerOrderCount,
   HistoricalOrder,
   CustomerDealItem,
+  BrokenPriceRow,
+  ImportReviewDetail,
+  ImportReviewStatus,
+  ImportReviewSummary,
+  PoDiffLine,
+  PoDiffReport,
   CustomerAssignment,
   CustomerAssignmentUpdate,
   CustomerBulkAssignmentUpdate,
@@ -42,6 +48,11 @@ import type {
   OrderIntakeSummary,
   OrderIntakeOrder,
   OrderIntakeDrillFilter,
+  ParsedOrder,
+  ImportValidation,
+  ImportCreateRequest,
+  ImportStoreCheck,
+  ItemMapping,
 } from "./types";
 
 // Serialize array params as repeated keys (`states=1&states=3`) rather than
@@ -271,6 +282,96 @@ export const api = {
       })
       .then((r) => r.data),
 
+  // --- Order Import (emailed purchase-order PDFs) ---
+  parseImportPdf: (file: File) => {
+    const form = new FormData();
+    form.append("file", file);
+    return http.post<ParsedOrder>("/order-import/parse", form).then((r) => r.data);
+  },
+  checkImportStore: (customerAccount: string, storeCode: string) =>
+    http
+      .get<ImportStoreCheck>("/order-import/store-check", {
+        params: { account: customerAccount, store_code: storeCode },
+      })
+      .then((r) => r.data),
+  validateImport: (
+    customerAccount: string,
+    document: ParsedOrder,
+    deliveryDate: string,
+    priceOverrides: Record<number, number> = {},
+    reviewId: number | null = null,
+  ) =>
+    http
+      .post<ImportValidation>("/order-import/validate", {
+        customer_account: customerAccount,
+        document,
+        delivery_date: deliveryDate,
+        price_overrides: priceOverrides,
+        review_id: reviewId,
+      })
+      .then((r) => r.data),
+  saveImportMapping: (payload: {
+    customer_account: string;
+    supplier_code: string;
+    item_code: string;
+    description: string;
+    stock_code: string;
+  }) => http.post<ItemMapping>("/order-import/mappings", payload).then((r) => r.data),
+  deleteImportMapping: (id: number) =>
+    http.delete(`/order-import/mappings/${id}`).then(() => undefined),
+  createImportedOrder: (payload: ImportCreateRequest) =>
+    http.post<SalesOrderCreateResponse>("/order-import/create", payload).then((r) => r.data),
+  submitImportReview: (payload: ImportCreateRequest & { note?: string | null }) =>
+    http.post<ImportReviewSummary>("/order-import/reviews", payload).then((r) => r.data),
+  listImportReviews: (status: ImportReviewStatus | "" = "PENDING") =>
+    http
+      .get<ImportReviewSummary[]>("/order-import/reviews", { params: { status } })
+      .then((r) => r.data),
+  /** Orders waiting for a supervisor (badge). Always 0 for agents. */
+  getPendingReviewCount: () =>
+    http
+      .get<{ pending: number }>("/order-import/reviews/pending-count")
+      .then((r) => r.data.pending),
+  getImportReview: (id: number) =>
+    http.get<ImportReviewDetail>(`/order-import/reviews/${id}`).then((r) => r.data),
+  rejectImportReview: (id: number, note: string) =>
+    http
+      .post<ImportReviewSummary>(`/order-import/reviews/${id}/reject`, { note })
+      .then((r) => r.data),
+  /** Open the original PO PDF in a new tab. Fetched as a blob so the auth
+   *  header is sent; the tab is opened first so popup blockers allow it. */
+  openImportDocument: async (id: number) => {
+    const tab = window.open("", "_blank");
+    try {
+      const resp = await http.get(`/order-import/documents/${id}`, { responseType: "blob" });
+      const url = URL.createObjectURL(resp.data);
+      if (tab) tab.location.href = url;
+      else window.open(url, "_blank");
+      setTimeout(() => URL.revokeObjectURL(url), 60_000);
+    } catch (e) {
+      tab?.close();
+      throw e;
+    }
+  },
+  getBrokenPriceRows: () =>
+    http.get<BrokenPriceRow[]>("/price-review/broken-rows").then((r) => r.data),
+  /** Re-prices the open lines and archives the settled ones (on demand). */
+  getPoPriceDifferences: (allPos = false) =>
+    http
+      .get<PoDiffReport>("/price-review/po-differences", { params: { all_pos: allPos } })
+      .then((r) => r.data),
+  /** A supervisor chooses not to fix a difference; a reason is required. */
+  dismissPoDiffLine: (id: number, reason: string) =>
+    http
+      .post<PoDiffLine>(`/price-review/po-differences/${id}/dismiss`, { reason })
+      .then((r) => r.data),
+  getArchivedPoDiffLines: (account: string, po: string, orderNum: string) =>
+    http
+      .get<PoDiffLine[]>("/price-review/po-differences/lines", {
+        params: { account, po, order_num: orderNum },
+      })
+      .then((r) => r.data),
+
   placeOrder: (payload: SalesOrderCreate) =>
     http.post<SalesOrderCreateResponse>("/sales-orders", payload).then((r) => r.data),
 
@@ -417,6 +518,8 @@ export const api = {
           source: filter.source || undefined,
           user: filter.user || undefined,
           corp_group: filter.corp_group || undefined,
+          dist_centre: filter.dist_centre || undefined,
+          route: filter.route || undefined,
         },
       })
       .then((r) => r.data),

@@ -114,6 +114,7 @@ function draftFromSuggestion(
     is_whse_item: s.is_whse_item,
     unit_price: s.unit_price,
     unit_price_incl: s.unit_price_incl,
+    price_list_broken: s.price_list_broken ?? false,
     price_source: resolvedPriceSource(s.stock_code, s.unit_price, s.price_source),
     price_locked: priced,
     tax_type_id: s.default_tax_type_id ?? defaultTaxTypeId,
@@ -739,6 +740,7 @@ export function OrderAssistantScreen({ onOpenOrder }: OrderAssistantProps = {}) 
                       price_source: source,
                       price_locked: excl > 0,
                       is_fallback_warehouse: p?.is_fallback_warehouse ?? false,
+                      price_list_broken: p?.price_list_broken ?? false,
                     }
                   : l
               )

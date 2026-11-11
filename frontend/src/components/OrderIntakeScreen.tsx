@@ -1,5 +1,6 @@
 import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { ArrowLeft, Calendar, ChevronDown, ChevronRight, Download, RefreshCw, X, XCircle } from "lucide-react";
+import Select, { type StylesConfig } from "react-select";
 import { api } from "../api/client";
 import type {
   OrderIntakeDrillFilter,
@@ -15,14 +16,14 @@ import { extractErrorMsg } from "../utils/format";
 
 /** Order Intake dashboard — orders captured per hour, SO Assistant app vs
  *  Evolution. Data loads on open, on date change and on Refresh only (no
- *  timers — see PERFORMANCE.md). Filters (source / corp group / user) are
+ *  timers — see PERFORMANCE.md). Filters (source / DC / route / corp group / agent) are
  *  applied client-side to the already-loaded hourly buckets. */
 
 // ---------- series identity (fixed per entity — never by rank) ----------
 // Evolution = WhatsApp green (#25D366), SO Assistant = blue. Validated with
 // the dataviz palette checker: CVD ΔE 32.9, normal-vision ΔE 34.5. The green
 // is under 3:1 contrast on white, so it always ships with the legend,
-// tooltip and the user x hour table (never colour alone).
+// tooltip and the agent x hour table (never colour alone).
 const SOURCES: OrderIntakeSource[] = ["SO Assistant", "Evolution"];
 const SOURCE_COLOR: Record<OrderIntakeSource, string> = {
   "SO Assistant": "#2a78d6",
@@ -31,14 +32,15 @@ const SOURCE_COLOR: Record<OrderIntakeSource, string> = {
 
 type MetricKey = "orders" | "qty" | "litres" | "excl";
 // Lost = ordered - invoiced on ARCHIVED orders only (an unprocessed order
-// isn't lost, it just isn't invoiced yet). Pending = ordered on orders still
-// unprocessed in Evolution. Ordered = Invoiced + Lost + Pending.
+// isn't lost, it just isn't invoiced yet). Unprocessed (internally "pending")
+// = ordered on orders still unprocessed in Evolution (DocState 1).
+// Ordered = Invoiced + Lost + Unprocessed.
 type Basis = "ordered" | "invoiced" | "lost" | "pending";
 const BASES: { value: Basis; label: string }[] = [
   { value: "ordered", label: "Ordered" },
   { value: "invoiced", label: "Invoiced" },
   { value: "lost", label: "Lost" },
-  { value: "pending", label: "Pending" },
+  { value: "pending", label: "Unprocessed" },
 ];
 
 const METRICS: { key: MetricKey; label: string }[] = [
@@ -96,6 +98,8 @@ export function OrderIntakeScreen({ onBack, onOpenOrder }: Props) {
   const [metric, setMetric] = useState<MetricKey>("litres");
   const [basis, setBasis] = useState<Basis>("ordered");
   const [sourceFilter, setSourceFilter] = useState<OrderIntakeSource | "ALL">("ALL");
+  const [dcFilter, setDcFilter] = useState("");
+  const [routeFilter, setRouteFilter] = useState("");
   const [corpFilter, setCorpFilter] = useState("");
   const [userFilter, setUserFilter] = useState("");
 
@@ -131,10 +135,13 @@ export function OrderIntakeScreen({ onBack, onOpenOrder }: Props) {
   }
 
   // ---------- filter options + filtered rows ----------
-  const corpGroups = useMemo(
-    () => Array.from(new Set(rows.map((r) => r.corp_group))).sort(),
-    [rows],
+  const dcs = useMemo(() => distinct(rows.map((r) => r.dist_centre)), [rows]);
+  // Routes narrow to the picked DC.
+  const routes = useMemo(
+    () => distinct(rows.filter((r) => !dcFilter || r.dist_centre === dcFilter).map((r) => r.route)),
+    [rows, dcFilter],
   );
+  const corpGroups = useMemo(() => distinct(rows.map((r) => r.corp_group)), [rows]);
   const users = useMemo(
     () => Array.from(new Set(rows.map((r) => r.user))).sort((a, b) => a.localeCompare(b)),
     [rows],
@@ -144,10 +151,12 @@ export function OrderIntakeScreen({ onBack, onOpenOrder }: Props) {
       rows.filter(
         (r) =>
           (sourceFilter === "ALL" || r.source === sourceFilter) &&
+          (!dcFilter || r.dist_centre === dcFilter) &&
+          (!routeFilter || r.route === routeFilter) &&
           (!corpFilter || r.corp_group === corpFilter) &&
           (!userFilter || r.user === userFilter),
       ),
-    [rows, sourceFilter, corpFilter, userFilter],
+    [rows, sourceFilter, dcFilter, routeFilter, corpFilter, userFilter],
   );
   const visibleSources = sourceFilter === "ALL" ? SOURCES : [sourceFilter];
 
@@ -256,36 +265,40 @@ export function OrderIntakeScreen({ onBack, onOpenOrder }: Props) {
             value={sourceFilter}
             onChange={(v) => setSourceFilter(v as OrderIntakeSource | "ALL")}
           />
-          <select
-            className={`border rounded px-2 py-1 ${corpFilter ? "border-blue-500 bg-blue-50 text-blue-800 font-semibold" : "bg-white"}`}
+          <FilterSelect
+            allLabel="All DCs"
+            value={dcFilter}
+            options={dcs}
+            onChange={(v) => {
+              setDcFilter(v);
+              // Keep the route only if it belongs to the new DC.
+              if (v && routeFilter && !rows.some((r) => r.dist_centre === v && r.route === routeFilter)) {
+                setRouteFilter("");
+              }
+            }}
+            width="10rem"
+          />
+          <FilterSelect allLabel="All routes" value={routeFilter} options={routes} onChange={setRouteFilter} width="11rem" />
+          <FilterSelect
+            allLabel="All corporate groups"
             value={corpFilter}
-            onChange={(e) => setCorpFilter(e.target.value)}
-          >
-            <option value="">All corporate groups</option>
-            {corpGroups.map((c) => (
-              <option key={c} value={c}>{c}</option>
-            ))}
-          </select>
-          <select
-            className={`border rounded px-2 py-1 max-w-[14rem] ${userFilter ? "border-blue-500 bg-blue-50 text-blue-800 font-semibold" : "bg-white"}`}
-            value={userFilter}
-            onChange={(e) => setUserFilter(e.target.value)}
-          >
-            <option value="">All users</option>
-            {users.map((u) => (
-              <option key={u} value={u}>{u}</option>
-            ))}
-          </select>
-          {(sourceFilter !== "ALL" || corpFilter || userFilter) && (
+            options={corpGroups}
+            onChange={setCorpFilter}
+            width="13rem"
+          />
+          <FilterSelect allLabel="All agents" value={userFilter} options={users} onChange={setUserFilter} width="12rem" />
+          {(sourceFilter !== "ALL" || dcFilter || routeFilter || corpFilter || userFilter) && (
             <button
               type="button"
               onClick={() => {
                 setSourceFilter("ALL");
+                setDcFilter("");
+                setRouteFilter("");
                 setCorpFilter("");
                 setUserFilter("");
               }}
               className="inline-flex items-center gap-1 text-blue-700 hover:text-blue-900 hover:underline"
-              title="Show all sources, corporate groups and users"
+              title="Show all sources, DCs, routes, corporate groups and agents"
             >
               <X className="w-3.5 h-3.5" />
               Clear filters
@@ -338,7 +351,7 @@ export function OrderIntakeScreen({ onBack, onOpenOrder }: Props) {
           <div className="flex items-center justify-between mb-1">
             <h2 className="text-sm font-semibold text-gray-900">
               {METRICS.find((m) => m.key === metric)!.label}
-              {metric !== "orders" && ` ${basis}`} per hour
+              {metric !== "orders" && ` ${BASES.find((b) => b.value === basis)!.label.toLowerCase()}`} per hour
               {isRange && <span className="font-normal text-gray-500"> · all days in range combined</span>}
             </h2>
             <Legend sources={visibleSources} />
@@ -361,7 +374,7 @@ export function OrderIntakeScreen({ onBack, onOpenOrder }: Props) {
           )}
         </section>
 
-        {/* User x hour table — also the accessible table view of the chart */}
+        {/* Agent x hour table — also the accessible table view of the chart */}
         {filtered.length > 0 && (
           <UserHourTable
             rows={filtered}
@@ -381,6 +394,8 @@ export function OrderIntakeScreen({ onBack, onOpenOrder }: Props) {
             ...drill,
             source: drill.source ?? (sourceFilter === "ALL" ? null : sourceFilter),
             corp_group: corpFilter || null,
+            dist_centre: dcFilter || null,
+            route: routeFilter || null,
             user: drill.user ?? (userFilter || null),
           }}
           pendingOnlyAtStart={basis === "pending"}
@@ -432,6 +447,67 @@ function Segmented({
           {o.label}
         </button>
       ))}
+    </div>
+  );
+}
+
+const distinct = (vals: string[]) => Array.from(new Set(vals)).sort((a, b) => a.localeCompare(b));
+
+type FilterOpt = { value: string; label: string };
+
+/** Compact react-select, 26px tall to sit in the filter row. Turns blue
+ *  while a value is picked, like the active filter style elsewhere. */
+function filterStyles(active: boolean): StylesConfig<FilterOpt, false> {
+  return {
+    control: (b, st) => ({
+      ...b,
+      minHeight: 26,
+      height: 26,
+      fontSize: 12,
+      borderRadius: 4,
+      borderColor: active || st.isFocused ? "#3b82f6" : "#e5e7eb",
+      backgroundColor: active ? "#eff6ff" : "#ffffff",
+      boxShadow: "none",
+      "&:hover": { borderColor: "#3b82f6" },
+    }),
+    valueContainer: (b) => ({ ...b, padding: "0 6px" }),
+    input: (b) => ({ ...b, margin: 0, padding: 0 }),
+    placeholder: (b) => ({ ...b, color: "#374151" }),
+    singleValue: (b) => ({ ...b, color: active ? "#1e40af" : b.color, fontWeight: active ? 600 : 400 }),
+    indicatorsContainer: (b) => ({ ...b, height: 24 }),
+    indicatorSeparator: () => ({ display: "none" }),
+    dropdownIndicator: (b) => ({ ...b, padding: 3 }),
+    clearIndicator: (b) => ({ ...b, padding: 3 }),
+    menu: (b) => ({ ...b, fontSize: 12, minWidth: "100%", width: "max-content", maxWidth: "24rem" }),
+    menuPortal: (b) => ({ ...b, zIndex: 60 }),
+    option: (b) => ({ ...b, padding: "4px 8px" }),
+  };
+}
+
+/** Searchable single-pick filter; "" = all. */
+function FilterSelect({
+  value, options, onChange, allLabel, width,
+}: {
+  value: string;
+  options: string[];
+  onChange: (v: string) => void;
+  allLabel: string;
+  width: string;
+}) {
+  const opts = useMemo(() => options.map((o) => ({ value: o, label: o })), [options]);
+  return (
+    <div style={{ width }}>
+      <Select<FilterOpt, false>
+        options={opts}
+        value={value ? { value, label: value } : null}
+        onChange={(o) => onChange(o?.value ?? "")}
+        placeholder={allLabel}
+        aria-label={allLabel}
+        isClearable
+        isSearchable
+        menuPortalTarget={document.body}
+        styles={filterStyles(!!value)}
+      />
     </div>
   );
 }
@@ -491,27 +567,27 @@ function Stat({
   // The figure picked on the Ordered / Invoiced / Lost toggle is the big
   // bold one; the others sit underneath as small labelled lines.
   const lines: { key: Basis; tag: string; v: number; title: string }[] = [
-    { key: "ordered", tag: "ord", v: ordered, title: "Ordered" },
-    { key: "invoiced", tag: "inv", v: invoiced, title: "Invoiced" },
-    { key: "lost", tag: "lost", v: lost, title: "Lost: ordered but not invoiced on processed (archived) orders" },
-    { key: "pending", tag: "pending", v: pending,
-      title: "Pending: on orders still unprocessed in Evolution, not invoiced yet (ordered = inv + lost + pending)" },
+    { key: "ordered", tag: "Ord", v: ordered, title: "Ordered" },
+    { key: "invoiced", tag: "Inv", v: invoiced, title: "Invoiced" },
+    { key: "lost", tag: "Lost", v: lost, title: "Lost: ordered but not invoiced on processed (archived) orders" },
+    { key: "pending", tag: "Unpr", v: pending,
+      title: "Unprocessed: on orders not yet processed in Evolution, so not invoiced yet (ordered = inv + lost + unprocessed)" },
   ];
   return (
     <div>
       <dt className="text-xs text-gray-500">{label}</dt>
       {lines.map((l) =>
         l.key === basis ? (
-          <dd key={l.key} className="text-xl font-semibold text-gray-900 leading-tight" title={l.title}>
-            {fmtMetric(l.v, k, true)}
-            {basis !== "ordered" && <span className="ml-1 text-xs font-normal text-gray-500">{l.tag}</span>}
+          <dd key={l.key} className="text-xl font-semibold text-gray-900 leading-tight whitespace-nowrap" title={l.title}>
+            <span className="mr-1 text-xs font-semibold text-gray-600">{l.tag}</span>
+            {fmtMetric(l.v, k)}
           </dd>
         ) : null,
       )}
       {lines.map((l) =>
         l.key !== basis ? (
-          <dd key={l.key} className="text-gray-600" title={l.title}>
-            {l.tag} {fmtMetric(l.v, k, true)}
+          <dd key={l.key} className="text-gray-600 whitespace-nowrap" title={l.title}>
+            <span className="font-medium text-gray-700">{l.tag}</span> {fmtMetric(l.v, k)}
           </dd>
         ) : null,
       )}
@@ -678,7 +754,7 @@ function HourlyChart({
 }
 
 // ---------------------------------------------------------------------------
-// User x hour table
+// Agent x hour table
 // ---------------------------------------------------------------------------
 
 function UserHourTable({
@@ -711,13 +787,13 @@ function UserHourTable({
   return (
     <section className="bg-white border rounded shadow-sm">
       <h2 className="text-sm font-semibold text-gray-900 px-3 pt-3 pb-2">
-        By user and hour <span className="font-normal text-gray-500">· click a number to see the orders</span>
+        By agent and hour <span className="font-normal text-gray-500">· click a number to see the orders</span>
       </h2>
       <div className="overflow-x-auto">
         <table className="w-full text-xs tabular-nums">
           <thead>
             <tr className="text-gray-500 border-b">
-              <th className="text-left font-medium px-3 py-1.5 sticky left-0 bg-white">User</th>
+              <th className="text-left font-medium px-3 py-1.5 sticky left-0 bg-white">Agent</th>
               {hours.map((h) => (
                 <th key={h} className="text-right font-medium px-2 py-1.5 whitespace-nowrap">{hh(h)}</th>
               ))}
@@ -781,6 +857,39 @@ function UserHourTable({
 // Drill-down: the orders behind a bar / cell
 // ---------------------------------------------------------------------------
 
+/** Drill-modal tree levels, outermost first. The last level (customer)
+ *  opens onto the orders themselves. */
+const LEVELS: { tag: string; key: (o: OrderIntakeOrder) => string; label: (o: OrderIntakeOrder) => string }[] = [
+  { tag: "DC", key: (o) => o.dist_centre, label: (o) => o.dist_centre },
+  { tag: "Route", key: (o) => o.route, label: (o) => o.route },
+  { tag: "Group", key: (o) => o.corp_group, label: (o) => o.corp_group },
+  { tag: "Customer", key: (o) => o.customer_account, label: (o) => `${o.customer_account} · ${o.customer_name}` },
+];
+/** Row look per level: darker = higher up the tree. */
+const LEVEL_ROW = [
+  "bg-slate-200 hover:bg-slate-300 font-semibold text-slate-900 border-slate-300",
+  "bg-slate-100 hover:bg-slate-200 font-semibold text-slate-800 border-slate-200",
+  "bg-slate-50 hover:bg-slate-100 font-medium text-slate-800",
+  "bg-white hover:bg-gray-50 font-medium text-gray-800",
+];
+
+type TreeNode = { id: string; label: string; depth: number; orders: OrderIntakeOrder[]; children: TreeNode[] };
+
+function buildTree(list: OrderIntakeOrder[], depth: number, parent: string): TreeNode[] {
+  if (depth >= LEVELS.length) return [];
+  const groups = new Map<string, OrderIntakeOrder[]>();
+  for (const o of list) {
+    const k = LEVELS[depth].key(o);
+    if (!groups.has(k)) groups.set(k, []);
+    groups.get(k)!.push(o);
+  }
+  const litres = (l: OrderIntakeOrder[]) => l.reduce((a, o) => a + o.ordered_litres, 0);
+  return Array.from(groups, ([k, orders]) => {
+    const id = `${parent}/${k}`;
+    return { id, label: LEVELS[depth].label(orders[0]), depth, orders, children: buildTree(orders, depth + 1, id) };
+  }).sort((x, y) => litres(y.orders) - litres(x.orders));
+}
+
 type TotalKey =
   | "ordered_qty" | "ordered_litres" | "ordered_excl"
   | "invoiced_litres" | "invoiced_excl" | "lost_litres" | "lost_excl";
@@ -808,7 +917,7 @@ function DrillModal({
   from: string;
   to: string;
   filter: OrderIntakeDrillFilter;
-  /** Opened while the Pending toggle is on: start on pending orders only. */
+  /** Opened while the Unprocessed toggle is on: start on unprocessed orders only. */
   pendingOnlyAtStart?: boolean;
   onClose: () => void;
   onOpenOrder?: (orderNo: string) => void;
@@ -828,12 +937,14 @@ function DrillModal({
     };
     // filter is rebuilt each render by the parent; key on its fields.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [from, to, filter.hour, filter.source, filter.user, filter.corp_group]);
+  }, [from, to, filter.hour, filter.source, filter.user, filter.corp_group, filter.dist_centre, filter.route]);
 
   const title = [
     filter.hour != null ? hh(filter.hour) : null,
     filter.user,
     filter.source,
+    filter.dist_centre,
+    filter.route,
     filter.corp_group,
   ].filter(Boolean).join(" · ") || "All orders";
 
@@ -843,7 +954,7 @@ function DrillModal({
   // Day chips (only when the orders span more than one day) narrow the list
   // to one capture date; the source cards then show that day's split.
   const [dayPick, setDayPick] = useState<string | null>(null);
-  // Pending only = orders still unprocessed in Evolution (not invoiced yet).
+  // Unprocessed only = orders still unprocessed in Evolution (not invoiced yet).
   const [pendingOnly, setPendingOnly] = useState(!!pendingOnlyAtStart);
   const pendingCount = (orders ?? []).filter((o) => o.doc_state === 1).length;
   const dayOf = (o: OrderIntakeOrder) => o.created_at.slice(0, 10);
@@ -866,26 +977,9 @@ function DrillModal({
     [orders, dayPick, sourcePick, pendingOnly],
   );
 
-  // Hierarchy: corporate group -> customer -> orders. Groups and customers
-  // are ordered by litres ordered (biggest first), orders by capture time.
-  const tree = useMemo(() => {
-    const groups = new Map<string, Map<string, OrderIntakeOrder[]>>();
-    for (const o of shown) {
-      if (!groups.has(o.corp_group)) groups.set(o.corp_group, new Map());
-      const cm = groups.get(o.corp_group)!;
-      if (!cm.has(o.customer_account)) cm.set(o.customer_account, []);
-      cm.get(o.customer_account)!.push(o);
-    }
-    const litres = (l: OrderIntakeOrder[]) => l.reduce((a, o) => a + o.ordered_litres, 0);
-    return Array.from(groups, ([name, cm]) => {
-      const customers = Array.from(cm, ([account, list]) => ({
-        account,
-        name: list[0].customer_name,
-        orders: list,
-      })).sort((x, y) => litres(y.orders) - litres(x.orders));
-      return { name, customers, orders: customers.flatMap((c) => c.orders) };
-    }).sort((x, y) => litres(y.orders) - litres(x.orders));
-  }, [shown]);
+  // Hierarchy: DC -> route -> corporate group -> customer -> orders. Every
+  // level is ordered by litres ordered (biggest first), orders by capture time.
+  const tree = useMemo(() => buildTree(shown, 0, ""), [shown]);
 
   const [open, setOpen] = useState<Set<string>>(new Set());
   const toggle = (k: string) =>
@@ -895,13 +989,94 @@ function DrillModal({
       else next.add(k);
       return next;
     });
-  const expandAll = () =>
-    setOpen(new Set(tree.flatMap((g) => [`g:${g.name}`, ...g.customers.map((c) => `c:${g.name}|${c.account}`)])));
-  // A single group has nothing to choose between, so open it straight away.
-  const singleGroup = tree.length === 1 ? tree[0].name : null;
-  useEffect(() => {
-    if (singleGroup) setOpen((prev) => new Set(prev).add(`g:${singleGroup}`));
-  }, [singleGroup]);
+  const expandAll = () => {
+    const ids: string[] = [];
+    const walk = (ns: TreeNode[]) =>
+      ns.forEach((n) => {
+        ids.push(n.id);
+        walk(n.children);
+      });
+    walk(tree);
+    setOpen(new Set(ids));
+  };
+  // Every level starts collapsed — the user opens what they want to see.
+
+  const renderNode = (n: TreeNode): React.ReactNode => {
+    const isOpen = open.has(n.id);
+    const customers = new Set(n.orders.map((o) => o.customer_account)).size;
+    const isCustomer = n.depth === LEVELS.length - 1;
+    return (
+      <Fragment key={n.id}>
+        <tr className={`border-b cursor-pointer ${LEVEL_ROW[n.depth]}`} onClick={() => toggle(n.id)}>
+          <td
+            className="py-1.5 pr-2 truncate max-w-[26rem]"
+            style={{ paddingLeft: 12 + n.depth * 18 }}
+            title={n.label}
+          >
+            <span className="inline-flex items-center gap-1">
+              {isOpen ? (
+                <ChevronDown className="w-3.5 h-3.5 flex-shrink-0" />
+              ) : (
+                <ChevronRight className="w-3.5 h-3.5 flex-shrink-0" />
+              )}
+              {!isCustomer && (
+                <span className="text-[10px] uppercase tracking-wide font-normal text-slate-500 mr-0.5">
+                  {LEVELS[n.depth].tag}
+                </span>
+              )}
+              {n.label}
+            </span>
+          </td>
+          <td className="px-2 py-1.5 text-slate-600 font-normal" colSpan={3}>
+            {n.orders.length} {n.orders.length === 1 ? "order" : "orders"}
+            {!isCustomer && ` · ${customers} ${customers === 1 ? "customer" : "customers"}`}
+          </td>
+          <Totals list={n.orders} bold={n.depth < 2} />
+        </tr>
+        {isOpen &&
+          (isCustomer
+            ? n.orders.map((o) => (
+                <tr key={o.order_no} className="border-b bg-white hover:bg-blue-50/40">
+                  <td className="py-1.5 pr-2" style={{ paddingLeft: 12 + LEVELS.length * 18 + 4 }}>
+                    <button className="text-blue-700 hover:underline" onClick={() => setViewing(o.order_no)}>
+                      {o.order_no}
+                    </button>
+                  </td>
+                  <td className="px-2 py-1.5 whitespace-nowrap">
+                    {multiDay ? o.created_at.replace("T", " ").slice(0, 16) : o.created_at.slice(11, 16)}
+                  </td>
+                  <td className="px-2 py-1.5">{o.user}</td>
+                  <td className="px-2 py-1.5">
+                    <span className="inline-flex items-center gap-1.5">
+                      <Swatch color={SOURCE_COLOR[o.source]} />
+                      {o.source}
+                    </span>
+                  </td>
+                  <td className="text-right px-2 py-1.5">{int.format(o.ordered_qty)}</td>
+                  <td className="text-right px-2 py-1.5">{int.format(o.ordered_litres)}</td>
+                  <td className="text-right px-2 py-1.5">{fmtMetric(o.ordered_excl, "excl")}</td>
+                  <td className="text-right px-2 py-1.5">{int.format(o.invoiced_litres)}</td>
+                  <td className="text-right px-2 py-1.5">{fmtMetric(o.invoiced_excl, "excl")}</td>
+                  {o.doc_state === 1 ? (
+                    <td
+                      colSpan={2}
+                      className="text-right px-3 py-1.5 text-gray-400"
+                      title="Unprocessed in Evolution, so nothing is lost yet"
+                    >
+                      not invoiced yet
+                    </td>
+                  ) : (
+                    <>
+                      <td className="text-right px-2 py-1.5">{int.format(o.lost_litres)}</td>
+                      <td className="text-right px-3 py-1.5">{fmtMetric(o.lost_excl, "excl")}</td>
+                    </>
+                  )}
+                </tr>
+              ))
+            : n.children.map(renderNode))}
+      </Fragment>
+    );
+  };
 
   // Same SO Assistant / Evolution split the bar's hover tooltip shows.
   const bySource = SOURCES.map((s) => {
@@ -1004,12 +1179,11 @@ function DrillModal({
               small
               options={[
                 { value: "all", label: "All orders" },
-                { value: "pending", label: `Pending only (${pendingCount})` },
+                { value: "pending", label: `Unprocessed only (${pendingCount})` },
               ]}
               value={pendingOnly ? "pending" : "all"}
               onChange={(v) => setPendingOnly(v === "pending")}
             />
-            <span className="text-gray-500">Corporate group → customer → order</span>
             <button type="button" className="text-blue-700 hover:underline" onClick={expandAll}>
               Expand all
             </button>
@@ -1025,9 +1199,9 @@ function DrillModal({
             <table className="w-full text-xs tabular-nums">
               <thead className="sticky top-0 bg-white z-10">
                 <tr className="text-gray-500 border-b">
-                  <th className="text-left font-medium px-3 py-1.5">Group / customer / order</th>
+                  <th className="text-left font-medium px-3 py-1.5">DC / route / group / customer / order</th>
                   <th className="text-left font-medium px-2 py-1.5">Captured</th>
-                  <th className="text-left font-medium px-2 py-1.5">User</th>
+                  <th className="text-left font-medium px-2 py-1.5">Agent</th>
                   <th className="text-left font-medium px-2 py-1.5">Source</th>
                   <th className="text-right font-medium px-2 py-1.5">Qty</th>
                   <th className="text-right font-medium px-2 py-1.5">Litres</th>
@@ -1039,100 +1213,13 @@ function DrillModal({
                 </tr>
               </thead>
               <tbody>
-                {tree.map((g) => {
-                  const gKey = `g:${g.name}`;
-                  const gOpen = open.has(gKey);
-                  return (
-                    <Fragment key={gKey}>
-                      <tr
-                        className="bg-slate-100 border-b border-slate-200 cursor-pointer hover:bg-slate-200"
-                        onClick={() => toggle(gKey)}
-                      >
-                        <td className="px-3 py-1.5 font-semibold text-slate-800">
-                          <span className="inline-flex items-center gap-1">
-                            {gOpen ? <ChevronDown className="w-3.5 h-3.5" /> : <ChevronRight className="w-3.5 h-3.5" />}
-                            {g.name}
-                          </span>
-                        </td>
-                        <td className="px-2 py-1.5 text-slate-600" colSpan={3}>
-                          {g.orders.length} orders · {g.customers.length} customers
-                        </td>
-                        <Totals list={g.orders} bold />
-                      </tr>
-                      {gOpen &&
-                        g.customers.map((c) => {
-                          const cKey = `c:${g.name}|${c.account}`;
-                          const cOpen = open.has(cKey);
-                          return (
-                            <Fragment key={cKey}>
-                              <tr className="border-b cursor-pointer hover:bg-gray-50" onClick={() => toggle(cKey)}>
-                                <td className="py-1.5 pl-8 pr-2 truncate max-w-[22rem]" title={c.name}>
-                                  <span className="inline-flex items-center gap-1 font-medium text-gray-800">
-                                    {cOpen ? <ChevronDown className="w-3.5 h-3.5" /> : <ChevronRight className="w-3.5 h-3.5" />}
-                                    {c.account} · {c.name}
-                                  </span>
-                                </td>
-                                <td className="px-2 py-1.5 text-gray-500" colSpan={3}>
-                                  {c.orders.length} {c.orders.length === 1 ? "order" : "orders"}
-                                </td>
-                                <Totals list={c.orders} />
-                              </tr>
-                              {cOpen &&
-                                c.orders.map((o) => (
-                                  <tr key={o.order_no} className="border-b bg-white hover:bg-blue-50/40">
-                                    <td className="py-1.5 pl-14 pr-2">
-                                      <button
-                                        className="text-blue-700 hover:underline"
-                                        onClick={() => setViewing(o.order_no)}
-                                      >
-                                        {o.order_no}
-                                      </button>
-                                    </td>
-                                    <td className="px-2 py-1.5 whitespace-nowrap">
-                                      {multiDay
-                                        ? o.created_at.replace("T", " ").slice(0, 16)
-                                        : o.created_at.slice(11, 16)}
-                                    </td>
-                                    <td className="px-2 py-1.5">{o.user}</td>
-                                    <td className="px-2 py-1.5">
-                                      <span className="inline-flex items-center gap-1.5">
-                                        <Swatch color={SOURCE_COLOR[o.source]} />
-                                        {o.source}
-                                      </span>
-                                    </td>
-                                    <td className="text-right px-2 py-1.5">{int.format(o.ordered_qty)}</td>
-                                    <td className="text-right px-2 py-1.5">{int.format(o.ordered_litres)}</td>
-                                    <td className="text-right px-2 py-1.5">{fmtMetric(o.ordered_excl, "excl")}</td>
-                                    <td className="text-right px-2 py-1.5">{int.format(o.invoiced_litres)}</td>
-                                    <td className="text-right px-2 py-1.5">{fmtMetric(o.invoiced_excl, "excl")}</td>
-                                    {o.doc_state === 1 ? (
-                                      <td
-                                        colSpan={2}
-                                        className="text-right px-3 py-1.5 text-gray-400"
-                                        title="Unprocessed in Evolution, so nothing is lost yet"
-                                      >
-                                        not invoiced yet
-                                      </td>
-                                    ) : (
-                                      <>
-                                        <td className="text-right px-2 py-1.5">{int.format(o.lost_litres)}</td>
-                                        <td className="text-right px-3 py-1.5">{fmtMetric(o.lost_excl, "excl")}</td>
-                                      </>
-                                    )}
-                                  </tr>
-                                ))}
-                            </Fragment>
-                          );
-                        })}
-                    </Fragment>
-                  );
-                })}
+                {tree.map(renderNode)}
                 {shown.length === 0 && (
                   <tr><td colSpan={11} className="p-6 text-center text-gray-400">
                     {orders.length === 0
                       ? "No orders."
                       : pendingOnly
-                      ? "No pending orders here: everything has been invoiced."
+                      ? "No unprocessed orders here."
                       : "No orders for this day / source."}
                   </td></tr>
                 )}
@@ -1143,7 +1230,7 @@ function DrillModal({
                     <td className="px-3 py-1.5" colSpan={4}>
                       {shown.length} orders{sourcePick && ` · ${sourcePick} only`}
                       {dayPick && ` · ${fmtDay(dayPick)}`}
-                      {pendingOnly && " · pending only"}
+                      {pendingOnly && " · unprocessed only"}
                     </td>
                     <Totals list={shown} bold />
                   </tr>

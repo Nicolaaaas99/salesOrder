@@ -52,6 +52,8 @@ export type CustomerPrice = {
    *  and we fell back to the lowest price from any other warehouse. UI shows
    *  a small badge so the rep knows it isn't from their DC's price list. */
   is_fallback_warehouse: boolean;
+  /** Price-list row whose stored incl doesn't match excl + VAT — warning only. */
+  price_list_broken?: boolean;
 };
 
 export type Warehouse = { code: string; description: string };
@@ -93,7 +95,7 @@ export type SalesOrderCreate = {
 
 /** Screen an order was saved from — lets reports tell Order Assistant
  *  orders apart from ones keyed manually in Sales Order Entry. */
-export type OrderSource = "ORDER_ASSISTANT" | "SALES_ORDER_ENTRY";
+export type OrderSource = "ORDER_ASSISTANT" | "SALES_ORDER_ENTRY" | "ORDER_IMPORT";
 
 export type SalesOrderCreateResponse = {
   order_no: string;
@@ -164,6 +166,8 @@ export type SalesOrderDetail = {
   doc_state: number;
   doc_state_label: string;
   is_archived: boolean;
+  /** The PDF the order was imported from (Order Import), if any. */
+  source_document_id?: number | null;
   lines: SalesOrderLineDetail[];
 };
 
@@ -184,6 +188,8 @@ export type HistoricalOrderLine = {
   stockCode: string;
   description: string;
   category: string;
+  /** StkItem.ulIISize (litres/kg per unit); null/absent when not captured. */
+  size?: number | null;
   quantity: number;
   exclAmount: number;
   vat: number;
@@ -321,6 +327,7 @@ export type OrderSuggestion = {
   suggested_quantity: number;    // already-adjusted (base_median − pending), pack-snapped
   unit_price: number;            // always excl
   unit_price_incl: number;       // actual incl from Price List / Evolution
+  price_list_broken?: boolean;   // see CustomerPrice.price_list_broken
   non_zero_weeks: number;
   total_weeks: number;
   on_order_qty: number;              // pending (not-yet-invoiced) qty
@@ -530,7 +537,7 @@ export type OrderIntakeMetrics = {
   pending_excl: number;
 };
 
-/** One (date, hour, source, app screen, user, corp group) bucket. */
+/** One (date, hour, source, app screen, user, corp group, DC, route) bucket. */
 export type OrderIntakeRow = OrderIntakeMetrics & {
   date: string;
   hour: number;
@@ -539,6 +546,9 @@ export type OrderIntakeRow = OrderIntakeMetrics & {
   app_screen: string | null;
   user: string;
   corp_group: string;
+  /** Customer card's DC / route ("No DC" / "No route" when blank). */
+  dist_centre: string;
+  route: string;
 };
 
 export type OrderIntakeSummary = {
@@ -555,6 +565,8 @@ export type OrderIntakeOrder = Omit<OrderIntakeMetrics, "orders"> & {
   app_screen: string | null;
   user: string;
   corp_group: string;
+  dist_centre: string;
+  route: string;
   customer_account: string;
   customer_name: string;
   doc_state: number;
@@ -565,4 +577,305 @@ export type OrderIntakeDrillFilter = {
   source?: string | null;
   user?: string | null;
   corp_group?: string | null;
+  dist_centre?: string | null;
+  route?: string | null;
+};
+
+// ---------------------------------------------------------------------------
+// Order Import (emailed purchase-order PDFs). Mirrors
+// backend/services/order_import/models.py + parsers.py.
+// ---------------------------------------------------------------------------
+
+export type ParsedOrderLine = {
+  line_no: number;
+  supplier_code: string;
+  item_code: string;
+  /** Barcode, when the layout prints it (Pick n Pay). */
+  barcode?: string;
+  description: string;
+  /** Units: what goes on our order line (packs x pack size for Pick n Pay). */
+  qty: number;
+  pack_size?: number | null;
+  pack_qty?: number | null;
+  unit_excl: number;
+  /** Can be a fraction of a cent when the layout prints only line totals. */
+  unit_incl: number;
+  vat_rate: number;
+  /** False when the layout prints no VAT (Pick n Pay). */
+  vat_known?: boolean;
+  /** Excl prices only on the PO (OK Foods): incl comes from the item's VAT. */
+  prices_excl?: boolean;
+  line_excl: number;
+  line_vat: number;
+  line_incl: number;
+  parse_warning: string | null;
+};
+
+export type ParsedOrder = {
+  format_name: string;
+  retailer: string;
+  order_no: string;
+  /** The user typed the PO number (it wasn't on the document). */
+  order_no_typed?: boolean;
+  order_date: string | null;
+  delivery_from: string | null;
+  delivery_to: string | null;
+  store_code: string;
+  store_name: string;
+  lines: ParsedOrderLine[];
+  total_qty: number | null;
+  total_excl: number | null;
+  total_vat: number | null;
+  total_incl: number | null;
+  warnings: string[];
+  /** The uploaded PDF as stored on the server ("Source document"). */
+  document_id?: number | null;
+};
+
+export type ImportLineStatus =
+  | "OK"
+  | "UNMATCHED"
+  | "ITEM_ISSUE"
+  | "NO_PRICE"
+  | "PRICE_MISMATCH"
+  | "VAT_MISMATCH"
+  | "PARSE_ERROR"
+  | "EXCLUDED";       // crates: not charged, left off the order and the PO total
+
+/** What a line whose PO price differs from ours is charged at:
+ *  EVOLUTION = our price (automatic when the PO is up to 5c above ours),
+ *  PO = the PO price, OVERRIDE = a price a supervisor typed. */
+export type ImportPriceChoice = "PO" | "EVOLUTION" | "OVERRIDE";
+
+export type ImportLineResult = {
+  line_no: number;
+  supplier_code: string;
+  item_code: string;
+  description: string;
+  qty: number;
+  doc_unit_excl: number;
+  doc_unit_incl: number;
+  doc_vat_rate: number;
+  doc_line_excl: number;
+  doc_line_incl: number;
+  /** Packs x pack size, when the PO orders in packs (Pick n Pay). */
+  doc_pack_size?: number | null;
+  doc_pack_qty?: number | null;
+  barcode?: string;
+  match_source: "MAPPING" | "DIRECT" | "NONE";
+  mapping_id: number | null;
+  stock_code: string | null;
+  stock_description: string;
+  warehouse_code: string | null;
+  tax_type_id: number | null;
+  tax_rate: number | null;
+  price_source: string | null;
+  evo_unit_excl: number | null;
+  /** What the inclusive order charges per unit incl. */
+  evo_unit_incl: number | null;
+  /** Incl stored on the price list / deal. */
+  evo_list_incl: number | null;
+  /** Price-list row whose stored incl doesn't match excl + VAT — warning only. */
+  price_list_broken?: boolean;
+  /** PO incl differs from evo_unit_incl (stays flagged). */
+  price_differs: boolean;
+  /** PO more than 5c above ours, or ours above the PO: a supervisor must
+   *  set the price (agent: submit for review). */
+  needs_review: boolean;
+  price_choice: ImportPriceChoice | null;
+  /** Our price charged automatically (PO at most 5c above ours). */
+  price_auto: boolean;
+  /** Supervisor's price, when one was set. */
+  price_override: number | null;
+  /** What the order line charges per unit incl. */
+  unit_incl: number | null;
+  excluded: boolean;
+  notes: string[];
+  line_excl: number;
+  line_tax: number;
+  line_incl: number;
+  status: ImportLineStatus;
+  issues: string[];
+};
+
+export type ImportIssue = { code: string; message: string; blocking: boolean };
+
+export type ImportTotals = {
+  doc_qty: number | null;
+  doc_excl: number | null;
+  doc_vat: number | null;
+  doc_incl: number | null;
+  parsed_qty: number;
+  parsed_incl: number;
+  order_qty: number;
+  order_excl: number;
+  order_tax: number;
+  order_incl: number;
+  excluded_qty: number;
+  excluded_incl: number;
+  /** Lines charged at a price other than the PO's move the PO total by this. */
+  price_adjust_incl: number;
+  /** PO prices rounded down to the cent per unit (never overcharge). */
+  rounding_incl: number;
+  /** PO total after crates and price choices — what the order must match. */
+  expected_incl: number | null;
+  difference_incl: number | null;
+  tolerance: number;
+  agrees: boolean;
+};
+
+export type ImportValidation = {
+  document: ParsedOrder;
+  customer_account: string;
+  customer_name: string;
+  customer_store_code: string;
+  store_check: "MATCH" | "MISMATCH" | "UNVERIFIED";
+  store_code_customers: { account: string; name: string }[];
+  warehouse_code: string | null;
+  price_date: string;
+  duplicate_orders: string[];
+  lines: ImportLineResult[];
+  totals: ImportTotals;
+  issues: ImportIssue[];
+  can_create: boolean;
+  /** Only price lines stand in the way: the agent may submit for review. */
+  can_submit_review: boolean;
+  /** The user may set prices (SUPERVISOR / ADMIN). */
+  can_override_prices: boolean;
+  /** Reviews already waiting for this PO number. */
+  pending_reviews: number[];
+};
+
+export type ImportCreateRequest = {
+  customer_account: string;
+  document: ParsedOrder;
+  delivery_date: string;
+  order_date: string;
+  due_date?: string | null;
+  invoice_date?: string | null;
+  description?: string | null;
+  dates_confirmed: boolean;
+  /** Supervisor prices (incl) per line_no; ignored for agents. */
+  price_overrides?: Record<number, number>;
+  review_id?: number | null;
+};
+
+export type ImportReviewStatus = "PENDING" | "CREATED" | "REJECTED";
+
+export type ImportReviewSummary = {
+  id: number;
+  status: ImportReviewStatus;
+  customer_account: string;
+  customer_name: string;
+  po_number: string;
+  delivery_date: string | null;
+  po_total_incl: number | null;
+  review_lines: number;
+  document_id: number | null;
+  submitted_by: string;
+  submitted_at: string | null;
+  submit_note: string;
+  reviewed_by: string;
+  reviewed_at: string | null;
+  review_note: string;
+  order_num: string;
+};
+
+export type ImportReviewDetail = ImportReviewSummary & {
+  document: ParsedOrder;
+  order_date: string | null;
+  description: string;
+};
+
+export type BrokenPriceRow = {
+  effect: string;
+  price_list: string;
+  whse: string;
+  stock_code: string;
+  description: string;
+  stored_excl: number;
+  stored_incl: number;
+  vat_pct: number;
+  correct_incl: number;
+  diff: number;
+  customers: number;
+};
+
+/** PROBLEM: needs fixing. TOLERANCE: PO up to 5c above ours (charged ours
+ *  automatically). FIXED: ours matches the PO. Every
+ *  status except PROBLEM is archived. */
+export type PoDifferenceStatus = "PROBLEM" | "TOLERANCE" | "FIXED" | "DISMISSED";
+
+/** One imported PO line whose PO price differed from ours. */
+export type PoDiffLine = {
+  id: number;
+  status: PoDifferenceStatus;
+  archived: boolean;
+  archived_at: string | null;
+  archived_by: string;
+  /** Why a supervisor dismissed it (DISMISSED only). */
+  archive_note: string;
+  customer_account: string;
+  po_number: string;
+  order_num: string;
+  stock_code: string;
+  description: string;
+  whse: string;
+  qty: number;
+  price_list: string;
+  source_then: string;
+  our_price_then: number;
+  po_price: number;
+  charged: "PO" | "OURS" | "SET" | string;
+  charged_price: number;
+  charged_auto: boolean;
+  /** Ours today (open lines) or when archived, priced as an import would. */
+  our_price_now: number | null;
+  source_now: string;          // Price List / Customer Deal / Group Deal / None / "" (unknown)
+  diff_now: number | null;     // PO - ours now
+  deal_for: string;            // customer account (customer deal) / customer group (group deal)
+  deal_from: string | null;
+  deal_to: string | null;
+};
+
+/** One imported PO (= one sales order) with differing lines. */
+export type PoDiffPo = {
+  customer_group: string;
+  customer_account: string;
+  customer_name: string;
+  po_number: string;
+  order_num: string;
+  imported_on: string | null;
+  document_id: number | null;
+  to_fix: number;
+  tolerance: number;
+  fixed: number;
+  dismissed: number;
+};
+
+export type PoDiffReport = {
+  pos: PoDiffPo[];
+  /** The open (not archived) lines. */
+  lines: PoDiffLine[];
+};
+
+export type ImportStoreCheck = {
+  customer_account: string;
+  customer_name: string;
+  customer_store_code: string;
+  store_code: string;
+  store_check: "MATCH" | "MISMATCH" | "UNVERIFIED";
+  store_code_customers: { account: string; name: string }[];
+  message: string | null;
+};
+
+export type ItemMapping = {
+  id: number;
+  scope: string;
+  /** Customer the mapping was captured for (applies to the whole group). */
+  customer_account: string;
+  supplier_code: string;
+  item_code: string;
+  description: string;
+  stock_code: string;
 };

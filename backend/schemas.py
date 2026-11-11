@@ -152,6 +152,10 @@ class CustomerPrice(BaseModel):
     # we fell back to the lowest price from any warehouse. UI shows a badge
     # so the rep sees the price didn't come from their DC's price list.
     is_fallback_warehouse: bool = False
+    # Price-list row whose stored incl doesn't match excl + the item's VAT
+    # (see services.pricing.price_list_row_broken). Warning only — the app
+    # charges excl + VAT; the order is never blocked.
+    price_list_broken: bool = False
 
 
 class CustomerPricesRequest(BaseModel):
@@ -233,7 +237,7 @@ class SalesOrderCreate(BaseModel):
     # Which screen saved the order — stamped onto cSourceApp in the audit
     # and contact-log tables. Optional only so a stale cached SPA build
     # doesn't 422; such rows land as UNKNOWN.
-    source: Optional[Literal["ORDER_ASSISTANT", "SALES_ORDER_ENTRY"]] = None
+    source: Optional[Literal["ORDER_ASSISTANT", "SALES_ORDER_ENTRY", "ORDER_IMPORT"]] = None
 
 
 class SalesOrderCreateResponse(BaseModel):
@@ -311,6 +315,9 @@ class SalesOrderDetail(BaseModel):
     doc_state: int = 0
     doc_state_label: str = ""
     is_archived: bool = False
+    # The PDF this order was imported from (Order Import), if any:
+    # GET /order-import/documents/{id}.
+    source_document_id: Optional[int] = None
     lines: List[SalesOrderLineDetail] = []
 
 
@@ -345,6 +352,9 @@ class HistoricalOrderLine(BaseModel):
     stockCode: str
     description: str
     category: str = "Uncategorized"
+    # StkItem.ulIISize (litres/kg per unit). None when not captured on the
+    # stock item — the history grid sorts those after sized items.
+    size: Optional[float] = None
     quantity: float = 0.0
     exclAmount: float = 0.0
     vat: float = 0.0
@@ -452,7 +462,7 @@ class OrderIntakeMetrics(BaseModel):
 
 
 class OrderIntakeRow(OrderIntakeMetrics):
-    """One (date, hour, source, app screen, user, corp group) bucket."""
+    """One (date, hour, source, app screen, user, corp group, DC, route) bucket."""
     date: date
     hour: int
     # 'SO Assistant' | 'Evolution'
@@ -461,6 +471,9 @@ class OrderIntakeRow(OrderIntakeMetrics):
     app_screen: Optional[str] = None
     user: str
     corp_group: str
+    # Customer card's DC / route ('No DC' / 'No route' when blank).
+    dist_centre: str = ""
+    route: str = ""
 
 
 class OrderIntakeSummary(BaseModel):
@@ -477,6 +490,8 @@ class OrderIntakeOrder(BaseModel):
     app_screen: Optional[str] = None
     user: str
     corp_group: str
+    dist_centre: str = ""
+    route: str = ""
     customer_account: str
     customer_name: str
     doc_state: int
@@ -631,6 +646,7 @@ class OrderSuggestion(BaseModel):
     # (may differ from excl × (1+rate) if the price list has an override).
     unit_price: float
     unit_price_incl: float = 0.0
+    price_list_broken: bool = False   # see CustomerPrice.price_list_broken
     non_zero_weeks: int
     total_weeks: int
     # Pending (open-SO) qty for this stock + customer — shown next to the

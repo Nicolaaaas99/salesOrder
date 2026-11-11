@@ -76,6 +76,10 @@ ALLOWED_INTERVAL_FILES = {
     "frontend/src/utils/useCustomerAutoRefresh.ts",
     # Performance strip safety-net poll, every 10 min + single in-flight.
     "frontend/src/components/PerformanceStrip.tsx",
+    # Pending import-review badge, supervisors / admins only: COUNT on the
+    # indexed status column of the tiny _tb_SOImportReview table, every 2 min
+    # while visible + single in-flight — reviewed 2026-11-10.
+    "frontend/src/utils/usePendingReviewCount.ts",
 }
 
 # Raw window "focus" listeners. New code must use useFocusRefresh (throttled).

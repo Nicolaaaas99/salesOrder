@@ -8,6 +8,8 @@ import { SessionDateModal } from "./components/SessionDateModal";
 import { DefaultWarehouseModal } from "./components/DefaultWarehouseModal";
 import { AuthProvider, useAuth } from "./context/AuthContext";
 import { useAutoReloadOnNewVersion } from "./utils/autoReload";
+import { usePendingReviewCount } from "./utils/usePendingReviewCount";
+import { CountBadge } from "./components/CountBadge";
 
 type View = "assistant" | "order" | "overview";
 
@@ -40,6 +42,8 @@ function AppShell() {
 function AuthenticatedApp() {
   const { username, role, logout } = useAuth();
   const [view, setView] = useState<View>("assistant");
+  // Imported orders waiting for a supervisor: badge on the tab + card.
+  const pendingReviews = usePendingReviewCount(role === "SUPERVISOR" || role === "ADMIN");
   // When another tab (e.g. Route Overview) wants to open an existing order
   // for editing, it drops the order number here and switches us to the
   // Sales Order Entry tab. SalesOrderTab's effect picks it up and loads it.
@@ -84,6 +88,7 @@ function AuthenticatedApp() {
               onClick={() => setView("order")}
             >
               Sales Order Entry
+              <CountBadge count={pendingReviews} title="orders waiting for price review" />
             </button>
           )}
           <button
@@ -141,6 +146,7 @@ function AuthenticatedApp() {
             pendingOrderNo={pendingOrderNo}
             clearPendingOrder={clearPendingOrder}
             onEditDone={originAfterEdit ? handleEditDone : undefined}
+            pendingReviews={pendingReviews}
           />
         </div>
         <div

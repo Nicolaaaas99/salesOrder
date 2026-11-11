@@ -5,12 +5,14 @@ import { fmtCurrency } from "../utils/format";
 type Props = {
   lines: LineRow[];
   taxTypes: TaxType[];
-  taxMode: TaxMode;
+  /** The order's SAVE basis (not the display toggle) — totals follow how
+   *  Evolution will charge the order. */
+  basis: TaxMode;
   documentDiscount: number;
 };
 
-export function TotalsPanel({ lines, taxTypes, taxMode, documentDiscount }: Props) {
-  const { excl, tax, incl } = orderTotals(lines, taxTypes, taxMode, documentDiscount);
+export function TotalsPanel({ lines, taxTypes, basis, documentDiscount }: Props) {
+  const { excl, tax, incl } = orderTotals(lines, taxTypes, basis, documentDiscount);
   const fmt = fmtCurrency;
 
   return (

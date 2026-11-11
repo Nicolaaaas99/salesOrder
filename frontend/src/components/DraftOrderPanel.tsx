@@ -10,6 +10,8 @@ import { fmtCurrency, fmtNumber } from "../utils/format";
 import {
   type LineRow,
   type TaxMode,
+  BrokenPriceFlag,
+  displayPrice,
   lineAmounts,
   orderTotals,
   priceEditFromDisplay,
@@ -64,7 +66,9 @@ type Props = {
   weekTargets?: WeekTarget[];
 };
 
-const taxMode: TaxMode = "Exclusive";
+// The draft becomes a new order, which is saved tax-INCLUSIVE: show the incl
+// price and incl line totals — exactly what Evolution will charge.
+const taxMode: TaxMode = "Inclusive";
 
 const STRIP_COLLAPSED_ROWS = 3;
 
@@ -318,7 +322,7 @@ export function DraftOrderPanel({
                 </th>
                 <th className="text-center py-0.5 px-1 font-medium w-[40px] leading-tight">
                   <div>Price</div>
-                  <div className="text-[9px] font-normal text-gray-500">(excl)</div>
+                  <div className="text-[9px] font-normal text-gray-500">(incl)</div>
                 </th>
                 <th className="text-right py-1 px-1 font-medium w-16">Total</th>
                 <th className="w-6"></th>
@@ -365,7 +369,7 @@ export function DraftOrderPanel({
               }}
             >
               {lines.map((line, i) => {
-                const { excl } = lineAmounts(line, taxTypes, taxMode);
+                const { incl } = lineAmounts(line, taxTypes, taxMode);
                 const itemTitle = `${line.stock_code} — ${line.item_description || line.description}`;
                 const isFlashing = flashRowCode === line.stock_code;
                 return (
@@ -477,7 +481,7 @@ export function DraftOrderPanel({
                     </td>
                     <td className="py-1 px-1">
                       <NumberCell
-                        value={line.unit_price}
+                        value={displayPrice(line, taxTypes, taxMode)}
                         onChange={(v) =>
                           onUpdateLine(i, priceEditFromDisplay(v, line, taxTypes, taxMode))
                         }
@@ -501,9 +505,10 @@ export function DraftOrderPanel({
                           price not found
                         </div>
                       )}
+                      <BrokenPriceFlag line={line} taxTypes={taxTypes} />
                     </td>
                     <td className="py-1 px-1 text-right font-mono">
-                      {fmtNumber(excl)}
+                      {fmtNumber(incl)}
                     </td>
                     <td className="py-1 px-1 text-center">
                       <button

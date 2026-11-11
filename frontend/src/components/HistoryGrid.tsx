@@ -13,6 +13,7 @@ import type { HistoricalOrder, OrderSuggestion } from "../api/types";
 
 import {
   aggregateOrders,
+  compareProductsBySize,
   detectProblemItems,
   formatQty,
   formatWeekLabel,
@@ -158,9 +159,9 @@ export function HistoryGrid({
       }
     });
 
-    return Object.entries(filtered).sort(
-      ([, a], [, b]) => b.totalQuantity - a.totalQuantity
-    );
+    // `categories` is already in alphabetical order (aggregateOrders) and
+    // insertion order is preserved, so no re-sort needed.
+    return Object.entries(filtered);
   }, [categories, searchTerm]);
 
   const toggleCategory = (category: string) => {
@@ -418,25 +419,13 @@ function CategoryRow({
   pickedCode,
   isPickedCategory,
 }: CategoryRowProps) {
-  const sortedProducts = useMemo(() => {
-    return [...categoryData.products].sort((a, b) => {
-      // Suggested items float to the top when suggestions present
-      if (suggestions) {
-        const asug = suggestions.get(productKey(a.stockCode, a.description));
-        const bsug = suggestions.get(productKey(b.stockCode, b.description));
-        if (asug && !bsug) return -1;
-        if (!asug && bsug) return 1;
-      }
-
-      const ap = problemItems.get(productKey(a.stockCode, a.description));
-      const bp = problemItems.get(productKey(b.stockCode, b.description));
-      if (ap && bp) return bp.weeksSinceLastPurchase - ap.weeksSinceLastPurchase;
-      if (ap && !bp) return -1;
-      if (!ap && bp) return 1;
-
-      return b.totalQuantity - a.totalQuantity;
-    });
-  }, [categoryData.products, problemItems, suggestions]);
+  // Fixed smallest-to-largest size order (see compareProductsBySize) so
+  // each item sits in a predictable spot. Suggested / problem items are
+  // still highlighted by their row styling, they just don't jump the queue.
+  const sortedProducts = useMemo(
+    () => [...categoryData.products].sort(compareProductsBySize),
+    [categoryData.products],
+  );
 
   const suggestedCount = suggestions
     ? categoryData.products.filter((p) =>

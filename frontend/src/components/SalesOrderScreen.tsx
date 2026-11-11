@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { FileText } from "lucide-react";
 import { api } from "../api/client";
 import type {
   CustomerDetail,
@@ -13,7 +14,7 @@ import { CustomerPicker } from "./CustomerPicker";
 import { AddressPanel } from "./AddressPanel";
 import { OrderInfoPanel } from "./OrderInfoPanel";
 import { DocumentInfoPanel } from "./DocumentInfoPanel";
-import { LineItemsGrid, makeEmptyLine, orderTotals, type LineRow, type TaxMode } from "./LineItemsGrid";
+import { LineItemsGrid, inclUnitPrice, makeEmptyLine, orderTotals, type LineRow, type TaxMode } from "./LineItemsGrid";
 import { TotalsPanel } from "./TotalsPanel";
 import { NumberCell } from "./NumberCell";
 import { SalesOrderSearchModal } from "./SalesOrderSearchModal";
@@ -26,6 +27,8 @@ import { useCustomerAutoRefresh } from "../utils/useCustomerAutoRefresh";
 type EditingState = {
   order_no: string;
   mode: "edit" | "template";
+  /** The imported PDF the order came from (Order Import), if any. */
+  source_document_id?: number | null;
 };
 
 type LoadedOrder = {
@@ -155,7 +158,17 @@ export function SalesOrderScreen({
   const [externalOrder, setExternalOrder] = useState(seed?.external_order ?? "");
   const [documentDiscount, setDocumentDiscount] = useState(seed?.discount_percent ?? 0);
   const [description, setDescription] = useState(seed?.description || "Sales Order");
-  const [taxMode, setTaxMode] = useState<TaxMode>(seed?.tax_mode ?? "Exclusive");
+  // SAVE basis: every new order (including one copied from an archived
+  // template) is saved tax-INCLUSIVE, like Evolution's own users — the incl
+  // unit price is what Evolution charges (qty x incl). Editing an existing
+  // order keeps that order's own mode, so its totals don't shift by cents.
+  const [saveMode, setSaveMode] = useState<TaxMode>(
+    seed && !seed.is_archived ? seed.tax_mode : "Inclusive",
+  );
+  // DISPLAY toggle only (which price / line total the grid shows).
+  const [taxMode, setTaxMode] = useState<TaxMode>(
+    seed && !seed.is_archived ? seed.tax_mode : "Inclusive",
+  );
 
   const defaultTaxTypeId = customer?.default_tax_type_id ?? null;
 
@@ -198,7 +211,11 @@ export function SalesOrderScreen({
 
   const [editing, setEditing] = useState<EditingState | null>(
     seed
-      ? { order_no: seed.order_no, mode: seed.is_archived ? "template" : "edit" }
+      ? {
+          order_no: seed.order_no,
+          mode: seed.is_archived ? "template" : "edit",
+          source_document_id: seed.source_document_id,
+        }
       : null
   );
   // Set when a loaded order (edit or template) came back with no lines —
@@ -277,7 +294,8 @@ export function SalesOrderScreen({
     setExternalOrder("");
     setDocumentDiscount(0);
     setDescription("Sales Order");
-    setTaxMode("Exclusive");
+    setSaveMode("Inclusive");
+    setTaxMode("Inclusive");
     setLines(initialLinesFor());
     setErrorMsg(null);
     setEditing(null);
@@ -313,10 +331,16 @@ export function SalesOrderScreen({
     setExternalOrder(detail.external_order || "");
     setDocumentDiscount(detail.discount_percent || 0);
     setDescription(detail.description || "Sales Order");
-    setTaxMode(detail.tax_mode);
+    const loadedMode: TaxMode = mode === "edit" ? detail.tax_mode : "Inclusive";
+    setSaveMode(loadedMode);
+    setTaxMode(loadedMode);
     setLines(detailToLines(detail, cust));
     setLoadedOrderEmpty(detail.lines.length === 0 ? detail.order_no : null);
-    setEditing({ order_no: detail.order_no, mode });
+    setEditing({
+      order_no: detail.order_no,
+      mode,
+      source_document_id: detail.source_document_id,
+    });
   }
 
   async function onPlaceOrder() {
@@ -385,7 +409,7 @@ export function SalesOrderScreen({
     }
 
     if (current.check_terms && current.credit_limit > 0) {
-      const { incl: orderIncl } = orderTotals(filledLines, taxTypes, taxMode, documentDiscount);
+      const { incl: orderIncl } = orderTotals(filledLines, taxTypes, saveMode, documentDiscount);
       if (orderIncl > current.available_credit) {
         setErrorMsg(
           `This order (${fmtCurrency(orderIncl)}) would push ${current.name} ` +
@@ -404,16 +428,18 @@ export function SalesOrderScreen({
       external_order: externalOrder || null,
       default_project_code: null,
       discount_percent: documentDiscount,
-      // Always save Exclusive — `unit_price` on every line is excl by invariant.
-      // The UI `taxMode` is a pure display toggle; it must NOT leak to the save.
-      tax_mode: "Exclusive",
+      // The SAVE basis, never the display toggle. Inclusive: each line's
+      // unit_price is the incl Evolution charges (inclUnitPrice — the same
+      // figure the grid and totals show). Exclusive (editing an older
+      // exclusive order): the excl, as before.
+      tax_mode: saveMode,
       description: description || null,
       lines: filledLines.map((l) => ({
         stock_code: l.stock_code,
         description: l.description || null,
         warehouse_code: l.warehouse_code || null,
         quantity: l.quantity,
-        unit_price: l.unit_price,
+        unit_price: saveMode === "Inclusive" ? inclUnitPrice(l, taxTypes) : l.unit_price,
         tax_type_id: l.tax_type_id,
         discount_percent: l.discount_percent || 0,
         project_code: null,
@@ -462,7 +488,7 @@ export function SalesOrderScreen({
 
   const currentOrderIncl = orderTotals(
     lines.filter((l) => l.stock_code),
-    taxTypes, taxMode, documentDiscount,
+    taxTypes, saveMode, documentDiscount,
   ).incl;
 
   const headerTitle = editing
@@ -492,6 +518,20 @@ export function SalesOrderScreen({
           <h1>{headerTitle}</h1>
         </div>
         <div className="screen-header-actions">
+          {editing?.source_document_id && (
+            <button
+              className="btn btn-secondary"
+              onClick={() =>
+                api
+                  .openImportDocument(editing.source_document_id!)
+                  .catch((e) => setErrorMsg(extractErrorMsg(e, "Could not open the source document")))
+              }
+              title="Open the document this order was imported from"
+            >
+              <FileText className="w-4 h-4" />
+              Source document
+            </button>
+          )}
           {editing && !lockedCustomer && (
             <button className="btn btn-secondary" onClick={resetForm} title="Discard current order">
               Cancel
@@ -587,6 +627,7 @@ export function SalesOrderScreen({
         taxTypes={taxTypes}
         defaultTaxTypeId={defaultTaxTypeId}
         taxMode={taxMode}
+        basis={saveMode}
         customerAccount={customer?.account ?? null}
         onChange={setLines}
       />
@@ -605,8 +646,8 @@ export function SalesOrderScreen({
 
           {/* Tax Mode toggle is DISPLAY-ONLY — it changes how the Price column
               and Line-total column are shown, but doesn't touch stored values.
-              Line totals/tax/order totals all come from the invariant
-              `unit_price` (always excl) so the Totals Panel is stable. */}
+              Totals follow the SAVE basis (`saveMode`: Inclusive for new
+              orders), never this toggle. */}
           <label>Tax Mode</label>
           <div className="segmented">
             <button
@@ -628,7 +669,7 @@ export function SalesOrderScreen({
         <TotalsPanel
           lines={lines}
           taxTypes={taxTypes}
-          taxMode={taxMode}
+          basis={saveMode}
           documentDiscount={documentDiscount}
         />
       </section>

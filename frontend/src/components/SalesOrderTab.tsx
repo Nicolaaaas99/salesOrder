@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { FilePlus, FolderOpen } from "lucide-react";
+import { FilePlus, FileUp, FolderOpen, Scale } from "lucide-react";
 import { api } from "../api/client";
 import type {
   CustomerDetail,
@@ -8,6 +8,9 @@ import type {
 } from "../api/types";
 import { SalesOrderScreen } from "./SalesOrderScreen";
 import { SalesOrderSearchModal } from "./SalesOrderSearchModal";
+import { OrderImportScreen } from "./OrderImportScreen";
+import { PriceReviewScreen } from "./PriceReviewScreen";
+import { CountBadge } from "./CountBadge";
 
 // Flip to re-enable the "Create a new order" card. Keeping the code in place
 // so flipping back is a one-line change if telesales needs manual entry again.
@@ -17,6 +20,9 @@ type Mode =
   | { kind: "landing" }
   | { kind: "searching" }
   | { kind: "new" }
+  | { kind: "import" }
+  | { kind: "priceReview" }
+  | { kind: "review"; id: number }
   | {
       kind: "loaded";
       detail: SalesOrderDetail;
@@ -32,12 +38,15 @@ type Props = {
    *  from another tab — App.tsx uses this to route the user back to where
    *  they came from instead of leaving them on the Sales Order Entry landing. */
   onEditDone?: () => void;
+  /** Imported orders waiting for a supervisor (0 for agents). */
+  pendingReviews?: number;
 };
 
 export function SalesOrderTab({
   pendingOrderNo,
   clearPendingOrder,
   onEditDone,
+  pendingReviews = 0,
 }: Props = {}) {
   const [mode, setMode] = useState<Mode>({ kind: "landing" });
   const [loading, setLoading] = useState(false);
@@ -113,6 +122,32 @@ export function SalesOrderTab({
     );
   }
 
+  if (mode.kind === "import") {
+    return <OrderImportScreen key={`import-${formSessionKey}`} onBack={backToLanding} />;
+  }
+
+  if (mode.kind === "priceReview") {
+    return (
+      <PriceReviewScreen
+        onBack={backToLanding}
+        onOpenReview={(id) => {
+          setFormSessionKey((k) => k + 1);
+          setMode({ kind: "review", id });
+        }}
+      />
+    );
+  }
+
+  if (mode.kind === "review") {
+    return (
+      <OrderImportScreen
+        key={`review-${mode.id}-${formSessionKey}`}
+        reviewId={mode.id}
+        onBack={() => setMode({ kind: "priceReview" })}
+      />
+    );
+  }
+
   if (mode.kind === "loaded") {
     const routeBack =
       externallyLaunched && onEditDone ? onEditDone : backToLanding;
@@ -151,6 +186,26 @@ export function SalesOrderTab({
               }}
             />
           )}
+
+          <HubCard
+            icon={<FileUp className="w-6 h-6" />}
+            iconClass="bg-amber-100 text-amber-700"
+            title="Import an emailed order"
+            description="Upload a customer's purchase order (PDF) and check it against Evolution."
+            onClick={() => {
+              setFormSessionKey((k) => k + 1);
+              setMode({ kind: "import" });
+            }}
+          />
+
+          <HubCard
+            icon={<Scale className="w-6 h-6" />}
+            iconClass="bg-violet-100 text-violet-700"
+            title="Price review"
+            badge={pendingReviews}
+            description="Imported orders waiting for a supervisor, PO price differences and broken price-list rows."
+            onClick={() => setMode({ kind: "priceReview" })}
+          />
 
           <HubCard
             icon={<FolderOpen className="w-6 h-6" />}
@@ -193,10 +248,13 @@ function HubCard({
   description,
   onClick,
   disabled,
+  badge = 0,
 }: {
   icon: React.ReactNode;
   iconClass: string;
   title: string;
+  /** Count bubble next to the title (hidden at 0). */
+  badge?: number;
   description: string;
   onClick: () => void;
   disabled?: boolean;
@@ -211,7 +269,10 @@ function HubCard({
         {icon}
       </div>
       <div className="flex-1 min-w-0">
-        <h2 className="text-sm font-semibold text-gray-900">{title}</h2>
+        <h2 className="text-sm font-semibold text-gray-900">
+          {title}
+          <CountBadge count={badge} title="waiting for review" />
+        </h2>
         <p className="text-xs text-gray-600 mt-1 leading-snug">{description}</p>
       </div>
     </button>

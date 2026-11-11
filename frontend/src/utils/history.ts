@@ -40,6 +40,8 @@ export type WeekRange = {
 export type CategoryProduct = {
   stockCode: string;
   description: string;
+  /** StkItem.ulIISize; null when not captured. Drives in-category order. */
+  size: number | null;
   totalQuantity: number;
   /** Total qty per week (invoiced + pending). */
   weeks: Record<string, number>;
@@ -165,6 +167,7 @@ export function aggregateOrders(orders: HistoricalOrder[]): {
         productBuckets[category][productKey] = {
           stockCode: item.stockCode,
           description: item.description,
+          size: item.size ?? null,
           totalQuantity: 0,
           weeks: {},
           pendingQty: {},
@@ -186,13 +189,40 @@ export function aggregateOrders(orders: HistoricalOrder[]): {
     });
   });
 
-  Object.keys(categoriesData).forEach((category) => {
-    categoriesData[category].products = Object.values(
-      productBuckets[category]
-    ).sort((a, b) => b.totalQuantity - a.totalQuantity);
-  });
+  // Rebuild in alphabetical category order so every consumer (the grid AND
+  // the Order Assistant's Continue gate, which focuses the "first" unopened
+  // category) sees the same order. Products within a category go smallest
+  // size first.
+  const ordered: Record<string, CategoryData> = {};
+  Object.keys(categoriesData)
+    .sort(compareCategoryNames)
+    .forEach((category) => {
+      ordered[category] = {
+        ...categoriesData[category],
+        products: Object.values(productBuckets[category]).sort(compareProductsBySize),
+      };
+    });
 
-  return { categories: categoriesData, weeks };
+  return { categories: ordered, weeks };
+}
+
+/** Alphabetical, case-insensitive; "Uncategorized" always last. */
+export function compareCategoryNames(a: string, b: string): number {
+  if (a === b) return 0;
+  if (a === "Uncategorized") return 1;
+  if (b === "Uncategorized") return -1;
+  return a.localeCompare(b, undefined, { sensitivity: "base" });
+}
+
+/** Smallest size first; items without a size go last. Ties fall back to
+ *  description so the order is stable week to week. */
+export function compareProductsBySize(a: CategoryProduct, b: CategoryProduct): number {
+  const as = a.size != null && a.size > 0 ? a.size : null;
+  const bs = b.size != null && b.size > 0 ? b.size : null;
+  if (as !== null && bs === null) return -1;
+  if (as === null && bs !== null) return 1;
+  if (as !== null && bs !== null && as !== bs) return as - bs;
+  return a.description.localeCompare(b.description, undefined, { sensitivity: "base" });
 }
 
 export function detectProblemItems(

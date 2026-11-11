@@ -24,6 +24,12 @@ DB_SLOW_QUERY_SECONDS    = float(os.getenv("DB_SLOW_QUERY_SECONDS", "1.0"))
 # Whole API requests slower than this are logged as "SLOW REQUEST".
 SLOW_REQUEST_SECONDS     = float(os.getenv("SLOW_REQUEST_SECONDS", "2.0"))
 
+# Order Import: how far (in rand, incl VAT) our order total may differ from
+# the purchase order's total before the import is blocked. Prices are
+# checked per line to the cent; this only absorbs cent-rounding on VAT
+# lines (e.g. 50 x R12.26 excl = R613.00 vs the PO's R613.04).
+ORDER_IMPORT_TOTAL_TOLERANCE = float(os.getenv("ORDER_IMPORT_TOTAL_TOLERANCE", "1.00"))
+
 DLL_PATH     = os.getenv("DLL_PATH")
 LICENSE_KEY  = os.getenv("LICENSE_KEY")
 LICENSE_CODE = os.getenv("LICENSE_CODE")

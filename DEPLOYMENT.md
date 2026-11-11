@@ -18,6 +18,40 @@ and "the app is live".
 
 Order matters where noted. Everything else can be done in any order.
 
+### Release — Order Import, Price Review, inclusive-tax saves (same deploy as below)
+**Before deploy.ps1** — the new backend imports these, so it won't start without them:
+- [ ] Install the two new Python packages into the server's backend Python
+      (the one `backend\start_backend.bat` runs):
+      `<python.exe> -m pip install "pdfplumber>=0.11,<0.12" "python-multipart>=0.0.9"`
+- [ ] `create_views.sql` (the re-run below) creates `_tb_SOCustomerItemMap`,
+      `_tb_SOImportPriceDecision`, `_tb_SOImportDocument`, `_tb_SOImportReview`.
+      Grant the app login (`DB_USERNAME` in `backend\.env`) write access, in SSMS:
+      ```sql
+      USE [SOAssistant];
+      GRANT INSERT, UPDATE, DELETE ON dbo._tb_SOCustomerItemMap      TO [<app_login>];
+      GRANT INSERT, UPDATE         ON dbo._tb_SOImportPriceDecision TO [<app_login>];
+      GRANT INSERT, UPDATE         ON dbo._tb_SOImportDocument      TO [<app_login>];
+      GRANT INSERT, UPDATE         ON dbo._tb_SOImportReview        TO [<app_login>];
+      ```
+- `sql/rollout/*` and `sql/diagnostics/*` are manual tools — NOT part of this deploy.
+- [ ] Smoke test: Order Import screen opens and reads a PO PDF; Price Review screen opens.
+
+### Release — Order Intake: DC + Route filters and drill levels
+**SQL first, then the app.** The new backend reads `DistCentre` / `Route`
+from the function; the old app ignores them, so SQL first costs no downtime.
+- [ ] Re-run `backend/sql/create_views.sql` end-to-end on the server (safe to re-run).
+      `_fn_SOOrderIntake` now counts **DC warehouse lines only** (48 + 62 →
+      Polokwane, 49 + 61 → Makhado, incl. the damaged-goods warehouses);
+      orders with no DC line (01.HOF_MAN1 bulk/factory, 01.HOF, FFACT, …)
+      drop out. Adds `DistCentre` (from the lines) and `Route` (customer
+      card, blank → 'No route'); agent not found → 'SDK'.
+- [ ] Verify: `SELECT CASE WHEN OBJECT_DEFINITION(OBJECT_ID('[SOAssistant].dbo._fn_SOOrderIntake')) LIKE '%DG_01.HOF_MAK%' THEN 'current' ELSE 'OLD' END;` returns `current`.
+- [ ] Deploy the app with `deploy.ps1`.
+- [ ] Smoke test: Analytics → Order Intake. The DC, Route, Corporate group and
+      User filters are searchable; picking a DC narrows the Route list. Click a
+      bar: the modal opens as DC → Route → Corporate group → Customer → Orders,
+      and the export has DistCentre + Route columns.
+
 ### Release — Order Intake: Lost toggle, unprocessed + archived only
 **SQL first, then the app.** The new backend reads the `Lost*` columns, so
 the new app on the old function would error. The old app on the new

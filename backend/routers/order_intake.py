@@ -62,15 +62,17 @@ _METRICS_SQL = """
 
 SUMMARY_SQL = f"""
     SELECT CreatedDate, CreatedHour, OrderSource, AppScreen, UserName, CorpGroup,
+           DistCentre, Route,
            {_METRICS_SQL}
     FROM {_FN}
-    GROUP BY CreatedDate, CreatedHour, OrderSource, AppScreen, UserName, CorpGroup
+    GROUP BY CreatedDate, CreatedHour, OrderSource, AppScreen, UserName, CorpGroup,
+             DistCentre, Route
     ORDER BY CreatedDate, CreatedHour
 """
 
 ORDERS_SQL = f"""
     SELECT OrderNum, CreatedAt, CreatedHour, OrderSource, AppScreen, UserName,
-           CorpGroup, CustomerAccount, CustomerName, DocState,
+           CorpGroup, DistCentre, Route, CustomerAccount, CustomerName, DocState,
            OrderedQty, OrderedLitres, OrderedExclAmnt,
            InvoicedQty, InvoicedLitres, InvoicedExclAmnt,
            LostQty, LostLitres, LostExclAmnt
@@ -79,6 +81,8 @@ ORDERS_SQL = f"""
       AND (:source IS NULL OR OrderSource = :source)
       AND (:user_name IS NULL OR UserName = :user_name)
       AND (:corp_group IS NULL OR CorpGroup = :corp_group)
+      AND (:dist_centre IS NULL OR DistCentre = :dist_centre)
+      AND (:route IS NULL OR Route = :route)
     ORDER BY CreatedAt
 """
 
@@ -136,8 +140,10 @@ def _fetch_summary(db: Session, frm: date, to: date) -> List[schemas.OrderIntake
             hour=int(r["CreatedHour"]),
             source=r["OrderSource"],
             app_screen=r["AppScreen"],
-            user=(r["UserName"] or "Evolution").strip(),
+            user=(r["UserName"] or "SDK").strip(),
             corp_group=r["CorpGroup"],
+            dist_centre=r["DistCentre"],
+            route=r["Route"],
             **_metrics(r),
         )
         for r in rows
@@ -150,7 +156,8 @@ def order_intake_summary(
     to_date: Optional[date] = Query(None, alias="to"),
     db: Session = Depends(get_db),
 ):
-    """Rows grouped by (date, hour, source, app screen, user, corp group).
+    """Rows grouped by (date, hour, source, app screen, user, corp group, DC,
+    route).
     A few hundred rows at most — the frontend pivots and filters them."""
     frm, to = resolve_range(from_date, to_date)
     rows = short_cache.get_or_compute(
@@ -164,6 +171,7 @@ def _fetch_orders(
     db: Session, frm: date, to: date,
     hour: Optional[int], source: Optional[str],
     user_name: Optional[str], corp_group: Optional[str],
+    dist_centre: Optional[str] = None, route: Optional[str] = None,
 ):
     return db.execute(
         text(ORDERS_SQL),
@@ -171,6 +179,7 @@ def _fetch_orders(
             "from_date": frm, "to_date": to, "hour": hour,
             "source": source or None, "user_name": user_name or None,
             "corp_group": corp_group or None,
+            "dist_centre": dist_centre or None, "route": route or None,
         },
     ).mappings().all()
 
@@ -183,11 +192,13 @@ def order_intake_orders(
     source: Optional[str] = Query(None),
     user: Optional[str] = Query(None),
     corp_group: Optional[str] = Query(None),
+    dist_centre: Optional[str] = Query(None),
+    route: Optional[str] = Query(None),
     db: Session = Depends(get_db),
 ):
     """The individual orders behind one chart bar / table cell."""
     frm, to = resolve_range(from_date, to_date)
-    rows = _fetch_orders(db, frm, to, hour, source, user, corp_group)
+    rows = _fetch_orders(db, frm, to, hour, source, user, corp_group, dist_centre, route)
     return [
         schemas.OrderIntakeOrder(
             order_no=r["OrderNum"] or "",
@@ -195,8 +206,10 @@ def order_intake_orders(
             hour=int(r["CreatedHour"]),
             source=r["OrderSource"],
             app_screen=r["AppScreen"],
-            user=(r["UserName"] or "Evolution").strip(),
+            user=(r["UserName"] or "SDK").strip(),
             corp_group=r["CorpGroup"],
+            dist_centre=r["DistCentre"],
+            route=r["Route"],
             customer_account=r["CustomerAccount"] or "",
             customer_name=(r["CustomerName"] or "").strip(),
             doc_state=int(r["DocState"] or 0),
@@ -216,12 +229,12 @@ def order_intake_orders(
 
 
 EXPORT_HEADERS = [
-    "CreatedAt", "Hour", "OrderNum", "OrderSource", "AppScreen", "UserName",
-    "CorpGroup", "CustomerAccount", "CustomerName",
+    "CreatedAt", "Hour", "OrderNum", "OrderSource", "AppScreen", "Agent",
+    "DistCentre", "Route", "CorpGroup", "CustomerAccount", "CustomerName",
     "OrderedQty", "OrderedLitres", "OrderedExclAmnt",
     "InvoicedQty", "InvoicedLitres", "InvoicedExclAmnt",
     "LostQty", "LostLitres", "LostExclAmnt",
-    "PendingQty", "PendingLitres", "PendingExclAmnt", "Status",
+    "UnprocessedQty", "UnprocessedLitres", "UnprocessedExclAmnt", "Status",
 ]
 
 
@@ -249,15 +262,16 @@ def order_intake_export(
         pend = _pending(r)
         ws.append([
             r["CreatedAt"], int(r["CreatedHour"]), r["OrderNum"], r["OrderSource"],
-            r["AppScreen"] or "", (r["UserName"] or "").strip(), r["CorpGroup"],
+            r["AppScreen"] or "", (r["UserName"] or "SDK").strip(),
+            r["DistCentre"], r["Route"], r["CorpGroup"],
             r["CustomerAccount"], (r["CustomerName"] or "").strip(),
             _f(r["OrderedQty"]), _f(r["OrderedLitres"]), _f(r["OrderedExclAmnt"]),
             _f(r["InvoicedQty"]), _f(r["InvoicedLitres"]), _f(r["InvoicedExclAmnt"]),
             _f(r["LostQty"]), _f(r["LostLitres"]), _f(r["LostExclAmnt"]),
             pend["pending_qty"], pend["pending_litres"], pend["pending_excl"],
-            "Pending" if int(r["DocState"] or 0) == 1 else "Processed",
+            "Unprocessed" if int(r["DocState"] or 0) == 1 else "Processed",
         ])
-    for i, width in enumerate((19, 6, 16, 13, 18, 16, 14, 16, 40, 11, 13, 15, 11, 13, 15, 11, 13, 15, 11, 13, 15, 11)):
+    for i, width in enumerate((19, 6, 16, 13, 18, 16, 14, 14, 14, 16, 40, 11, 13, 15, 11, 13, 15, 11, 13, 15, 11, 13, 15, 11)):
         ws.column_dimensions[chr(ord("A") + i)].width = width
     ws.freeze_panes = "A2"
 

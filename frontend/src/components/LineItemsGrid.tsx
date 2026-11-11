@@ -23,7 +23,8 @@ export type LineRow = {
   is_uom_item: boolean;
   is_whse_item: boolean;
   unit_price: number;         // INVARIANT: always the EXCL unit price
-  unit_price_incl: number;    // Actual INCL from view (0 if unknown — fallback to computed)
+  unit_price_incl: number;    // Actual INCL from view (0 if unknown — fallback to computed).
+                              // What an INCLUSIVE save charges — see inclUnitPrice().
   price_source: string;   // 'Customer Deal' | 'Group Deal' | 'Price List' | 'None' | ''
   price_locked: boolean;  // true when a price was resolved — rep can't override
   tax_type_id: number | null;
@@ -38,6 +39,11 @@ export type LineRow = {
    *  logged-in agent's default (i.e. the agent's DC didn't have a price list
    *  entry for this stock). Shown as a small badge next to the price input. */
   is_fallback_warehouse: boolean;
+  /** Price-list row whose stored incl doesn't match excl + the item's VAT
+   *  (backend services/pricing.price_list_row_broken, e.g. MOO099 R25.90
+   *  excl / R25.90 incl at 15%). WARNING ONLY — the app charges excl + VAT
+   *  via inclUnitPrice(), and the order can still be saved. */
+  price_list_broken?: boolean;
   /** When true, the rep auto-added this line via the history grid's suggested
    *  qty and hasn't yet acknowledged it. Rendered with an amber left border +
    *  dot on the draft row, and gates the Continue button until confirmed.
@@ -117,7 +123,8 @@ type Props = {
   warehouses: Warehouse[];
   taxTypes: TaxType[];
   defaultTaxTypeId: number | null;
-  taxMode: TaxMode;
+  taxMode: TaxMode;                 // DISPLAY toggle: which price/line total to show
+  basis?: TaxMode;                  // SAVE basis the totals follow (default Inclusive)
   customerAccount: string | null;   // needed to resolve prices when items are picked
   onChange: (lines: LinesUpdater) => void;
 };
@@ -126,17 +133,48 @@ function rateFor(line: LineRow, taxTypes: TaxType[]): number {
   return taxTypes.find((t) => t.id === line.tax_type_id)?.rate ?? 0;
 }
 
+function round2(n: number): number {
+  // Half-up to the cent; the epsilon absorbs float noise (1.005 -> 1.01).
+  return Math.round((n + Math.sign(n) * 1e-9) * 100) / 100;
+}
+
 /**
- * Invariant: `line.unit_price` is ALWAYS the exclusive price. The Tax Mode
- * toggle is now display-only — it never changes stored values, so order totals
- * are stable regardless of which mode is active. See displayPrice() /
- * displayPriceToStored() for the UI-side conversion.
- *
- * `mode` is accepted for backwards compatibility with callers but ignored.
+ * Stored incl may differ from excl + VAT by up to this much and still be
+ * trusted (Evolution's own inclusive price, e.g. R10.07 excl / R11.59 incl).
+ * A bigger gap means the stored incl doesn't belong to this line's tax rate —
+ * e.g. a 0%-VAT customer whose price list incl includes 15% — so the incl is
+ * recomputed from the excl instead (no overcharge).
+ * Mirrors backend services/pricing.py inclusive_unit_price().
  */
-export function lineAmounts(line: LineRow, taxTypes: TaxType[], _mode?: TaxMode) {
+const INCL_TRUST_TOLERANCE = 0.02;
+
+/** The incl unit price an INCLUSIVE save charges for this line. */
+export function inclUnitPrice(line: LineRow, taxTypes: TaxType[]): number {
+  const rate = rateFor(line, taxTypes);
+  const computed = rate > 0 ? round2(line.unit_price * (1 + rate / 100)) : round2(line.unit_price);
+  const stored = line.unit_price_incl;
+  if (stored > 0 && Math.abs(stored - computed) <= INCL_TRUST_TOLERANCE + 1e-6) {
+    return round2(stored);
+  }
+  return computed;
+}
+
+/**
+ * Line amounts on the order's save BASIS (not the display toggle):
+ *  - "Inclusive" (all new orders): Evolution charges qty x incl unit price,
+ *    rounded to the cent; excl and VAT are derived from that.
+ *  - "Exclusive" (editing an older order that was saved exclusive):
+ *    qty x excl, VAT added on top — how those orders were always charged.
+ * `line.unit_price` stays the excl and `unit_price_incl` the incl in both.
+ */
+export function lineAmounts(line: LineRow, taxTypes: TaxType[], basis: TaxMode = "Inclusive") {
   const rate = rateFor(line, taxTypes);
   const discFactor = 1 - (line.discount_percent || 0) / 100;
+  if (basis === "Inclusive") {
+    const incl = round2(line.quantity * inclUnitPrice(line, taxTypes) * discFactor);
+    const excl = rate > 0 ? round2(incl / (1 + rate / 100)) : incl;
+    return { excl, tax: incl - excl, incl, rate };
+  }
   const excl = line.quantity * line.unit_price * discFactor;
   const tax = excl * (rate / 100);
   return { excl, tax, incl: excl + tax, rate };
@@ -145,12 +183,12 @@ export function lineAmounts(line: LineRow, taxTypes: TaxType[], _mode?: TaxMode)
 export function orderTotals(
   lines: LineRow[],
   taxTypes: TaxType[],
-  _mode: TaxMode,
+  basis: TaxMode,
   documentDiscount: number,
 ) {
   const raw = lines.reduce(
     (acc, l) => {
-      const a = lineAmounts(l, taxTypes);
+      const a = lineAmounts(l, taxTypes, basis);
       return { excl: acc.excl + a.excl, tax: acc.tax + a.tax };
     },
     { excl: 0, tax: 0 },
@@ -161,22 +199,37 @@ export function orderTotals(
   return { excl, tax, incl: excl + tax };
 }
 
-function round2(n: number): number {
-  return Math.round(n * 100) / 100;
-}
-
 /**
  * What to show in the Price input/column for the current display mode.
  * Prefers the exact stored incl (from Price List / Evolution) in Inclusive
  * mode; falls back to computing from excl when it's missing (e.g. draft lines
  * added before a price was resolved).
  */
+/**
+ * Amber "check price list" note under a line's price. Warning only — never
+ * blocks Continue / Save: the line already charges the correct excl + VAT.
+ */
+export function BrokenPriceFlag({ line, taxTypes }: { line: LineRow; taxTypes: TaxType[] }) {
+  if (!line.price_list_broken) return null;
+  const stored = line.unit_price_incl ? `R${line.unit_price_incl.toFixed(2)}` : "no incl";
+  const charged = inclUnitPrice(line, taxTypes).toFixed(2);
+  return (
+    <div
+      className="text-[9px] text-amber-700 font-semibold leading-tight mt-0.5 cursor-help"
+      title={
+        `Price list error: stored incl ${stored} doesn't match excl ` +
+        `R${line.unit_price.toFixed(2)} + VAT. Evolution would charge the stored ` +
+        `incl; this order charges the correct R${charged}. You can carry on — ` +
+        `please ask for the price list to be fixed.`
+      }
+    >
+      check price list
+    </div>
+  );
+}
+
 export function displayPrice(line: LineRow, taxTypes: TaxType[], mode: TaxMode): number {
-  if (mode === "Inclusive") {
-    if (line.unit_price_incl > 0) return line.unit_price_incl;
-    const rate = rateFor(line, taxTypes);
-    return rate > 0 ? round2(line.unit_price * (1 + rate / 100)) : line.unit_price;
-  }
+  if (mode === "Inclusive") return inclUnitPrice(line, taxTypes);
   return line.unit_price;
 }
 
@@ -205,7 +258,7 @@ export function priceEditFromDisplay(
 type FocusTarget = { row: number; col?: number };
 
 export function LineItemsGrid({
-  lines, warehouses, taxTypes, defaultTaxTypeId, taxMode, customerAccount, onChange,
+  lines, warehouses, taxTypes, defaultTaxTypeId, taxMode, basis = "Inclusive", customerAccount, onChange,
 }: Props) {
   const { defaultWarehouseCode, sessionDate } = useAuth();
   const tbodyRef = useRef<HTMLTableSectionElement>(null);
@@ -434,7 +487,7 @@ export function LineItemsGrid({
             onInput={onGridInput}
           >
             {lines.map((line, i) => {
-              const { excl: lineExcl, tax: lineTax, incl: lineIncl, rate } = lineAmounts(line, taxTypes);
+              const { excl: lineExcl, tax: lineTax, incl: lineIncl, rate } = lineAmounts(line, taxTypes, basis);
               const lineDisplayed = taxMode === "Inclusive" ? lineIncl : lineExcl;
               const hasItem = !!line.stock_code;
               const cellsDisabled = !hasItem;
@@ -494,6 +547,7 @@ export function LineItemsGrid({
                           unit_price: 0,
                           price_source: "",
                           price_locked: false,
+                          price_list_broken: false,
                         });
 
                         if (customerAccount) {
@@ -521,6 +575,7 @@ export function LineItemsGrid({
                                         price_source: source,
                                         price_locked: excl > 0,
                                         is_fallback_warehouse: p?.is_fallback_warehouse ?? false,
+                                        price_list_broken: p?.price_list_broken ?? false,
                                       }
                                     : l,
                                 ),
@@ -663,6 +718,7 @@ export function LineItemsGrid({
                         price not found
                       </div>
                     )}
+                    <BrokenPriceFlag line={line} taxTypes={taxTypes} />
                   </td>
                   <td>
                     <SelectCell
