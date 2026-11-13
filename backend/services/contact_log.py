@@ -170,6 +170,58 @@ def write_contact_log(
         raise ContactLogError(str(e)) from e
 
 
+# How far a PLACED row's logged delivery date may sit from its order's real
+# one and still be found (the order was moved in Evolution after capture).
+PLACED_DATE_SLACK_DAYS = 14
+
+
+def delivery_outcomes_sql(per_day: bool) -> str:
+    """Latest contact-log outcome per customer (per_day: per customer AND
+    delivery date) for deliveries in [from_date, to_date].
+
+    A PLACED row follows its ORDER, not the date logged when it was placed:
+    its delivery date is the order's current InvNum.DeliveryDate (moved in
+    Evolution, or captured for another day than the call list's -- seen
+    2026-11-13: logged 13 Nov, delivered + invoiced 12 Nov, so 13 Nov showed
+    "Placed" with no order). A PLACED row whose order was cancelled no longer
+    counts. Other outcomes keep their logged date. The logged-date window is
+    widened by PLACED_DATE_SLACK_DAYS so moved orders are still found; the
+    InvNum join is a key lookup (AutoIndex) for PLACED rows only."""
+    partition = "cCustomerAccount, dEffectiveDelivery" if per_day else "cCustomerAccount"
+    return f"""
+        SELECT cCustomerAccount   AS account,
+               iCustomerDCLink    AS dclink,
+               cOutcome           AS outcome,
+               cNote              AS note,
+               dFollowUpDate      AS follow_up_date,
+               cOrderNum          AS order_no,
+               iAgentID           AS agent_id,
+               cUsername          AS username,
+               dtCreatedAt        AS created_at,
+               dEffectiveDelivery AS delivery_date
+        FROM (
+            SELECT e.*,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY {partition}
+                       ORDER BY dtCreatedAt DESC, idContactLog DESC
+                   ) AS rn
+            FROM (
+                SELECT L.*,
+                       COALESCE(CAST(I.DeliveryDate AS date), L.dDeliveryDate) AS dEffectiveDelivery
+                FROM {CONTACT_LOG_TABLE} L
+                LEFT JOIN dbo.InvNum I
+                       ON L.cOutcome = 'PLACED'
+                      AND I.AutoIndex = L.iInvNumAutoIndex
+                WHERE L.dDeliveryDate BETWEEN DATEADD(DAY, -{PLACED_DATE_SLACK_DAYS}, :from_date)
+                                          AND DATEADD(DAY, {PLACED_DATE_SLACK_DAYS}, :to_date)
+                  AND ISNULL(I.DocState, 0) <> 7
+            ) e
+            WHERE e.dEffectiveDelivery BETWEEN :from_date AND :to_date
+        ) t
+        WHERE t.rn = 1
+    """
+
+
 def fetch_latest_in_delivery_range(
     db: Session,
     *,
@@ -182,29 +234,10 @@ def fetch_latest_in_delivery_range(
     is so a NO_ORDER logged on the 27th for a 28th call list shows up when
     the report is scoped to the 28th. Rows with NULL dDeliveryDate (pre-
     migration data) are intentionally excluded; the user can backfill via
-    the template in create_views.sql."""
+    the template in create_views.sql. PLACED rows follow their order's
+    current delivery date (see delivery_outcomes_sql)."""
     rows = db.execute(
-        text(f"""
-            SELECT cCustomerAccount AS account,
-                   iCustomerDCLink  AS dclink,
-                   cOutcome         AS outcome,
-                   cNote            AS note,
-                   dFollowUpDate    AS follow_up_date,
-                   cOrderNum        AS order_no,
-                   iAgentID         AS agent_id,
-                   cUsername        AS username,
-                   dtCreatedAt      AS created_at
-            FROM (
-                SELECT *,
-                       ROW_NUMBER() OVER (
-                           PARTITION BY cCustomerAccount
-                           ORDER BY dtCreatedAt DESC, idContactLog DESC
-                       ) AS rn
-                FROM {CONTACT_LOG_TABLE}
-                WHERE dDeliveryDate BETWEEN :from_date AND :to_date
-            ) t
-            WHERE t.rn = 1
-        """),
+        text(delivery_outcomes_sql(per_day=False)),
         {"from_date": from_date, "to_date": to_date},
     ).mappings().all()
     return [dict(r) for r in rows]

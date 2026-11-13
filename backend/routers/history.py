@@ -14,6 +14,7 @@ from database import get_db
 import schemas
 from services.pricing import resolve_customer_prices
 from services import short_cache
+from services.contact_log import delivery_outcomes_sql
 from services.forecasting import suggestions as sugg
 
 log = logging.getLogger(__name__)
@@ -241,22 +242,10 @@ def export_orders_per_day(
     # (customer, delivery-date) — not just customer — so each daily row
     # carries that day's reason, not a bleed-through from a later day.
     # Rows with NULL dDeliveryDate (pre-migration data) are excluded.
+    # PLACED rows follow their order's current delivery date, and a
+    # cancelled order's PLACED no longer counts (delivery_outcomes_sql).
     outcome_rows = db.execute(
-        text("""
-            SELECT cCustomerAccount AS account,
-                   dDeliveryDate    AS delivery_date,
-                   cOutcome         AS outcome
-            FROM (
-                SELECT *,
-                       ROW_NUMBER() OVER (
-                           PARTITION BY cCustomerAccount, dDeliveryDate
-                           ORDER BY dtCreatedAt DESC, idContactLog DESC
-                       ) AS rn
-                FROM [SOAssistant].dbo._tb_SOCustomerContactLog
-                WHERE dDeliveryDate BETWEEN :from_date AND :to_date
-            ) t
-            WHERE t.rn = 1
-        """),
+        text(delivery_outcomes_sql(per_day=True)),
         {"from_date": frm, "to_date": to},
     ).mappings().all()
     outcomes_by_key: dict[tuple[str, date], str] = {

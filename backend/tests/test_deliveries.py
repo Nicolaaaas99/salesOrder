@@ -109,3 +109,19 @@ def test_export_has_litres_column(client):
     assert by_acc["C1"][4:] == (1, 120.5, "PLACED")
     assert by_acc["C2"][4:] == (0, 0, "NOT_CONTACTED")
     assert by_acc["C9"][1] == "No route" and by_acc["C9"][4] == 2
+
+
+def test_placed_reason_follows_the_orders_delivery_date():
+    """2026-11-13: a PLACED row logged for 13 Nov whose order was delivered
+    and invoiced on 12 Nov showed "Placed" with no order on 13 Nov. PLACED
+    rows must take the order's current InvNum.DeliveryDate, and a cancelled
+    order's PLACED must not count."""
+    from services.contact_log import delivery_outcomes_sql
+
+    for per_day in (False, True):
+        sql = delivery_outcomes_sql(per_day)
+        assert "COALESCE(CAST(I.DeliveryDate AS date), L.dDeliveryDate)" in sql
+        assert "L.cOutcome = 'PLACED'" in sql and "I.AutoIndex = L.iInvNumAutoIndex" in sql
+        assert "ISNULL(I.DocState, 0) <> 7" in sql
+        assert "e.dEffectiveDelivery BETWEEN :from_date AND :to_date" in sql
+    assert "PARTITION BY cCustomerAccount, dEffectiveDelivery" in delivery_outcomes_sql(True)
