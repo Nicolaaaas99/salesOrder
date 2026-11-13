@@ -1,4 +1,6 @@
 import { useEffect, useRef, useState } from "react";
+import { WarehouseMismatchBanner } from "./WarehouseMismatchBanner";
+import { dcMismatchMessage, useMoveLinesOnWarehouseSwitch } from "../utils/warehouse";
 import { FileText } from "lucide-react";
 import { api } from "../api/client";
 import type {
@@ -9,6 +11,7 @@ import type {
   SalesOrderDetail,
   SalesOrderSearchResult,
   OrderSource,
+  DraftSummary,
 } from "../api/types";
 import { CustomerPicker } from "./CustomerPicker";
 import { AddressPanel } from "./AddressPanel";
@@ -23,6 +26,13 @@ import { useAuth } from "../context/AuthContext";
 import { nextBusinessDay, today } from "../utils/date";
 import { fmtCurrency, extractErrorMsg } from "../utils/format";
 import { useCustomerAutoRefresh } from "../utils/useCustomerAutoRefresh";
+import {
+  notifyDraftsChanged,
+  restoreDate,
+  saveDraftWithConfirm,
+  type DraftHeader,
+  type DraftPayload,
+} from "../utils/drafts";
 
 type EditingState = {
   order_no: string;
@@ -58,6 +68,18 @@ type Props = {
    *  + contact-log rows record where the order came from. SALES_ORDER_ENTRY
    *  also restricts the customer picker to corporate groups. */
   source: OrderSource;
+  /** Reopened draft: its header (dates in the past fall back to the defaults). */
+  initialHeader?: DraftHeader | null;
+  /** The draft this form continues: re-saved in place, and deleted once the
+   *  order is placed. */
+  draftId?: number | null;
+  onDraftSaved?: (draft: DraftSummary) => void;
+  /** Reports the header as it changes (the Order Assistant saves drafts
+   *  from its own panel too). */
+  onHeaderChange?: (header: DraftHeader) => void;
+  /** Extra state the host stores with a draft (Order Assistant: reviewed
+   *  categories). */
+  draftExtra?: () => Partial<DraftPayload>;
 };
 
 
@@ -117,6 +139,11 @@ export function SalesOrderScreen({
   onPlaced,
   suggestionIds,
   source,
+  initialHeader = null,
+  draftId = null,
+  onDraftSaved,
+  onHeaderChange,
+  draftExtra,
 }: Props) {
   const isControlled =
     controlledLines !== undefined && onControlledLinesChange !== undefined;
@@ -129,7 +156,7 @@ export function SalesOrderScreen({
   // Order Date and Due Date default to today — those are "when was this placed"
   // fields, not "when does it ship". Falls back to next-business-day for safety
   // if SalesOrderScreen is somehow mounted outside the AuthProvider gate.
-  const { sessionDate, forceExtOrderNum } = useAuth();
+  const { sessionDate, forceExtOrderNum, defaultWarehouseCode, role } = useAuth();
   const sessionDateDefault = sessionDate ?? nextBusinessDay();
   const todayDefault = today();
 
@@ -153,11 +180,30 @@ export function SalesOrderScreen({
   // they want the exact saved values of a loaded order.
   const [orderDate, setOrderDate] = useState(todayDefault);
   const [dueDate, setDueDate] = useState(todayDefault);
-  const [invoiceDate, setInvoiceDate] = useState(sessionDateDefault);
-  const [deliveryDate, setDeliveryDate] = useState(sessionDateDefault);
-  const [externalOrder, setExternalOrder] = useState(seed?.external_order ?? "");
-  const [documentDiscount, setDocumentDiscount] = useState(seed?.discount_percent ?? 0);
-  const [description, setDescription] = useState(seed?.description || "Sales Order");
+  const [invoiceDate, setInvoiceDate] = useState(
+    restoreDate(initialHeader?.invoiceDate, sessionDateDefault),
+  );
+  const [deliveryDate, setDeliveryDate] = useState(
+    restoreDate(initialHeader?.deliveryDate, sessionDateDefault),
+  );
+  const [externalOrder, setExternalOrder] = useState(
+    seed?.external_order ?? initialHeader?.externalOrder ?? "",
+  );
+  const [documentDiscount, setDocumentDiscount] = useState(
+    seed?.discount_percent ?? initialHeader?.documentDiscount ?? 0,
+  );
+  const [description, setDescription] = useState(
+    seed?.description || initialHeader?.description || "Sales Order",
+  );
+  // The draft this form continues (null: not saved as a draft yet).
+  const [currentDraftId, setCurrentDraftId] = useState<number | null>(draftId);
+  useEffect(() => setCurrentDraftId(draftId), [draftId]);
+  const [savingDraft, setSavingDraft] = useState(false);
+  const [draftNotice, setDraftNotice] = useState<string | null>(null);
+  useEffect(() => {
+    onHeaderChange?.({ externalOrder, description, documentDiscount, invoiceDate, deliveryDate });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [externalOrder, description, documentDiscount, invoiceDate, deliveryDate]);
   // SAVE basis: every new order (including one copied from an archived
   // template) is saved tax-INCLUSIVE, like Evolution's own users — the incl
   // unit price is what Evolution charges (qty x incl). Editing an existing
@@ -218,6 +264,11 @@ export function SalesOrderScreen({
         }
       : null
   );
+  // Supervisor switched warehouse while capturing a NEW order: move the
+  // lines to the new warehouse and re-price them. A loaded order keeps its
+  // saved lines; inside the Order Assistant's finalize sheet (controlled
+  // lines) the Order Assistant does it.
+  useMoveLinesOnWarehouseSwitch(lines, setLines, customer?.account, !isControlled && editing?.mode !== "edit");
   // Set when a loaded order (edit or template) came back with no lines —
   // shown as a warning instead of a silently empty grid.
   const [loadedOrderEmpty, setLoadedOrderEmpty] = useState<string | null>(
@@ -300,6 +351,8 @@ export function SalesOrderScreen({
     setErrorMsg(null);
     setEditing(null);
     setLoadedOrderEmpty(null);
+    setCurrentDraftId(null);
+    setDraftNotice(null);
   }
 
   async function loadOrder(result: SalesOrderSearchResult) {
@@ -336,6 +389,8 @@ export function SalesOrderScreen({
     setTaxMode(loadedMode);
     setLines(detailToLines(detail, cust));
     setLoadedOrderEmpty(detail.lines.length === 0 ? detail.order_no : null);
+    setCurrentDraftId(null);
+    setDraftNotice(null);
     setEditing({
       order_no: detail.order_no,
       mode,
@@ -362,6 +417,16 @@ export function SalesOrderScreen({
       `Credit limit: ${fmtCurrency(current.credit_limit)}.`;
 
     const isUpdate = editing?.mode === "edit" && !!editing?.order_no;
+
+    // A new order must come from the customer's own DC (customer card).
+    // `current` is the just-fetched customer, so a DC fixed a moment ago counts.
+    if (!isUpdate) {
+      const dcBlock = dcMismatchMessage(current, defaultWarehouseCode, role);
+      if (dcBlock) {
+        setErrorMsg(dcBlock);
+        return;
+      }
+    }
 
     // Only hard-block when the customer is flagged CheckTerms = 1. CheckTerms = 0
     // customers can place orders even if over credit/terms — the OVER LIMIT and
@@ -446,6 +511,8 @@ export function SalesOrderScreen({
       })),
       ...(!isUpdate && suggestionIds !== undefined ? { suggestion_ids: suggestionIds } : {}),
       source,
+      // Placing the order finishes its draft (deleted server-side).
+      ...(!isUpdate && currentDraftId != null ? { draft_id: currentDraftId } : {}),
     };
 
     setSubmitting(true);
@@ -453,6 +520,10 @@ export function SalesOrderScreen({
       const res = isUpdate
         ? await api.updateOrder(editing!.order_no, payload)
         : await api.placeOrder(payload);
+      if (payload.draft_id != null) {
+        setCurrentDraftId(null);
+        notifyDraftsChanged();
+      }
       // orders:mutated dispatch moved to dismissModal so the strip
       // numbers only start animating once the success modal is gone
       // — otherwise the modal covers the strip and the user misses
@@ -467,6 +538,55 @@ export function SalesOrderScreen({
       setErrorMsg(extractErrorMsg(e, "Failed to save sales order"));
     } finally {
       setSubmitting(false);
+    }
+  }
+
+  // Drafts: new orders only (an edit of a saved order is already in Evolution).
+  const canSaveDraft = editing?.mode !== "edit" && source !== "ORDER_IMPORT";
+
+  async function onSaveDraft() {
+    setErrorMsg(null);
+    if (!customer) { setErrorMsg("Select a customer first."); return; }
+    const filled = lines.filter((l) => l.stock_code);
+    if (filled.length === 0) {
+      setErrorMsg("Add at least one item before saving a draft.");
+      return;
+    }
+    // Same gate as placing the order: no draft while the DC doesn't match.
+    const dcBlock = dcMismatchMessage(customer, defaultWarehouseCode, role);
+    if (dcBlock) {
+      setErrorMsg(dcBlock.replace("before placing the order", "before saving a draft"));
+      return;
+    }
+    const payload: DraftPayload = {
+      version: 1,
+      header: { externalOrder, description, documentDiscount, invoiceDate, deliveryDate },
+      lines: filled,
+      ...(draftExtra?.() ?? {}),
+    };
+    setSavingDraft(true);
+    try {
+      const saved = await saveDraftWithConfirm({
+        id: currentDraftId,
+        source: source === "ORDER_ASSISTANT" ? "ORDER_ASSISTANT" : "SALES_ORDER_ENTRY",
+        customer_account: customer.account,
+        customer_name: customer.name,
+        line_count: filled.length,
+        total_incl: orderTotals(filled, taxTypes, saveMode, documentDiscount).incl,
+        payload,
+      });
+      if (saved) {
+        setCurrentDraftId(saved.id);
+        onDraftSaved?.(saved);
+        setDraftNotice(
+          `Draft saved at ${new Date().toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" })}. `
+          + "Carry on, or open it later from Drafts at the top.",
+        );
+      }
+    } catch (e) {
+      setErrorMsg(extractErrorMsg(e, "Could not save the draft"));
+    } finally {
+      setSavingDraft(false);
     }
   }
 
@@ -568,6 +688,10 @@ export function SalesOrderScreen({
         </div>
       )}
 
+      {draftNotice && (
+        <div className="banner banner-info">{draftNotice}</div>
+      )}
+
       {loadedOrderEmpty && (
         <div className="banner banner-err">
           Order <strong>{loadedOrderEmpty}</strong> has no lines in the
@@ -596,6 +720,13 @@ export function SalesOrderScreen({
             </div>
             {customer && <CreditStatus customer={customer} currentOrderIncl={currentOrderIncl} />}
           </section>
+          {!isControlled && editing?.mode !== "edit" && (
+            <WarehouseMismatchBanner
+              customer={customer}
+              onCustomerUpdated={setCustomer}
+              onPickAnother={lockedCustomer ? onClose : () => setCustomer(null)}
+            />
+          )}
           <AddressPanel customer={customer} />
         </div>
         <div className="two-col-stack">
@@ -675,6 +806,16 @@ export function SalesOrderScreen({
       </section>
 
       <div className="action-bar">
+        {canSaveDraft && (
+          <button
+            className="btn btn-secondary btn-large"
+            onClick={onSaveDraft}
+            disabled={submitting || savingDraft || !customer}
+            title="Save this order to finish later (deleted automatically after 3 days)"
+          >
+            {savingDraft ? "Saving draft…" : currentDraftId != null ? "Update draft" : "Save draft"}
+          </button>
+        )}
         <button
           className="btn btn-primary btn-large"
           onClick={onPlaceOrder}

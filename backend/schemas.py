@@ -55,6 +55,17 @@ class AdminUserRow(BaseModel):
     is_active: Optional[bool] = None
     registered_at: Optional[datetime] = None
     registered_by: Optional[str] = None
+    # _rtblAgents.iDefWhseId as a code (e.g. 01.HOF_MAK); None = not set.
+    default_warehouse_code: Optional[str] = None
+
+
+class UserPresence(BaseModel):
+    """One signed-in user (Users & Roles "who is logged in")."""
+    username: str
+    online: bool            # active in the last ~2.5 minutes
+    since: datetime         # signed in at (earliest session)
+    last_seen: datetime
+    sessions: int = 1
 
 
 class AdminUserCreate(BaseModel):
@@ -68,6 +79,8 @@ class AdminUserUpdate(BaseModel):
     the role."""
     role: Optional[str] = None
     is_active: Optional[bool] = None
+    # One of the DC warehouse codes. Writes the agent's Evolution record.
+    default_warehouse_code: Optional[str] = None
 
 
 class PerformanceWindow(BaseModel):
@@ -106,6 +119,11 @@ class CustomerDetail(BaseModel):
     account: str
     name: str
     route: str = ""
+    # Customer card's Dist Centre (Client.ulARDistCentre) and the DC
+    # warehouse it maps to (None when blank / not a DC). The order screens
+    # warn when it differs from the warehouse the order is captured from.
+    dist_centre: str = ""
+    dc_warehouse_code: Optional[str] = None
     delivery_address: str = ""
     postal_address: str = ""
     contact_name: str = ""
@@ -238,6 +256,9 @@ class SalesOrderCreate(BaseModel):
     # and contact-log tables. Optional only so a stale cached SPA build
     # doesn't 422; such rows land as UNKNOWN.
     source: Optional[Literal["ORDER_ASSISTANT", "SALES_ORDER_ENTRY", "ORDER_IMPORT"]] = None
+    # The draft this order finishes (services/drafts.py): deleted once the
+    # order is created.
+    draft_id: Optional[int] = None
 
 
 class SalesOrderCreateResponse(BaseModel):
@@ -336,6 +357,17 @@ class HistoryCustomer(BaseModel):
 class CustomerOrderCount(BaseModel):
     account: str
     order_count: int
+
+
+class DeliveryCustomer(BaseModel):
+    """Deliveries report: one row per customer — every active, routed
+    customer plus any other customer with an order in the range."""
+    route: str
+    account: str
+    customer_name: str
+    order_count: int = 0
+    # Ordered litres (qty x StkItem.ulIISize) on those orders.
+    litres: float = 0.0
 
 
 class CustomerOrderCountRow(BaseModel):
@@ -585,6 +617,12 @@ class AgentOption(BaseModel):
     cUsername mirror on the target row."""
     id: int
     name: str
+
+
+class CustomerDistCentreUpdate(BaseModel):
+    """Set a customer card's Dist Centre to the DC of this warehouse
+    (01.HOF_POL -> Polokwane, 01.HOF_MAK -> Makhado)."""
+    warehouse_code: str
 
 
 class CustomerAssignment(BaseModel):

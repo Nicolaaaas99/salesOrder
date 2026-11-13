@@ -1,15 +1,34 @@
-import { useCallback, useState } from "react";
-import { LogOut, UserCircle } from "lucide-react";
+import { useCallback, useMemo, useState } from "react";
+import { FileClock, LogOut, UserCircle } from "lucide-react";
 import { SalesOrderTab } from "./components/SalesOrderTab";
 import { OrderAssistantScreen } from "./components/OrderAssistantScreen";
 import { AnalyticsScreen } from "./components/AnalyticsScreen";
 import { LoginScreen } from "./components/LoginScreen";
 import { SessionDateModal } from "./components/SessionDateModal";
 import { DefaultWarehouseModal } from "./components/DefaultWarehouseModal";
+import { WarehouseSwitcher } from "./components/WarehouseSwitcher";
 import { AuthProvider, useAuth } from "./context/AuthContext";
 import { useAutoReloadOnNewVersion } from "./utils/autoReload";
+import { useHeartbeat } from "./utils/useHeartbeat";
 import { usePendingReviewCount } from "./utils/usePendingReviewCount";
 import { CountBadge } from "./components/CountBadge";
+import { DraftsModal, StaleDraftsPrompt } from "./components/DraftsDialogs";
+import { ConfirmDialogHost } from "./components/ConfirmDialog";
+import { api } from "./api/client";
+import type { DraftDetail, DraftSummary } from "./api/types";
+import { notifyDraftsChanged, useDrafts } from "./utils/drafts";
+import { extractErrorMsg } from "./utils/format";
+
+// Stale drafts the agent chose to "Finish" this session: not asked again
+// until the next sign-in (they're still deleted after 3 days).
+const FINISH_LATER_KEY = "drafts:finishLater";
+function readFinishLater(): Set<number> {
+  try {
+    return new Set(JSON.parse(sessionStorage.getItem(FINISH_LATER_KEY) || "[]"));
+  } catch {
+    return new Set();
+  }
+}
 
 type View = "assistant" | "order" | "overview";
 
@@ -41,6 +60,8 @@ function AppShell() {
 
 function AuthenticatedApp() {
   const { username, role, logout } = useAuth();
+  // Keeps this user "online" on Users & Roles while the app is open.
+  useHeartbeat(true);
   const [view, setView] = useState<View>("assistant");
   // Imported orders waiting for a supervisor: badge on the tab + card.
   const pendingReviews = usePendingReviewCount(role === "SUPERVISOR" || role === "ADMIN");
@@ -65,6 +86,74 @@ function AuthenticatedApp() {
     [view],
   );
   const clearPendingOrder = useCallback(() => setPendingOrderNo(null), []);
+
+  // -- Drafts ----------------------------------------------------------------
+  const { drafts, error: draftsError } = useDrafts();
+  const [draftsOpen, setDraftsOpen] = useState(false);
+  const [draftBusy, setDraftBusy] = useState(false);
+  const [draftError, setDraftError] = useState<string | null>(null);
+  // A draft being reopened, handed to the screen it was saved from.
+  const [pendingAssistantDraft, setPendingAssistantDraft] = useState<DraftDetail | null>(null);
+  const [pendingEntryDraft, setPendingEntryDraft] = useState<DraftDetail | null>(null);
+  const [finishLater, setFinishLater] = useState<Set<number>>(readFinishLater);
+  const staleDrafts = useMemo(
+    () => drafts.filter((d) => d.stale && !finishLater.has(d.id)),
+    [drafts, finishLater],
+  );
+
+  const openDraft = useCallback(async (d: DraftSummary) => {
+    setDraftBusy(true);
+    setDraftError(null);
+    try {
+      const detail = await api.getDraft(d.id);
+      setDraftsOpen(false);
+      if (detail.source === "ORDER_ASSISTANT") {
+        setPendingAssistantDraft(detail);
+        setView("assistant");
+      } else {
+        setPendingEntryDraft(detail);
+        setView("order");
+      }
+    } catch (e) {
+      setDraftError(extractErrorMsg(e, "Could not open the draft"));
+      notifyDraftsChanged();
+    } finally {
+      setDraftBusy(false);
+    }
+  }, []);
+
+  const deleteDraft = useCallback(async (d: DraftSummary) => {
+    setDraftBusy(true);
+    setDraftError(null);
+    try {
+      await api.deleteDraft(d.id);
+    } catch (e) {
+      setDraftError(extractErrorMsg(e, "Could not delete the draft"));
+    } finally {
+      notifyDraftsChanged();
+      setDraftBusy(false);
+    }
+  }, []);
+
+  const resolveStale = useCallback(
+    async (finish: DraftSummary[], remove: DraftSummary[]) => {
+      const later = new Set(finishLater);
+      finish.forEach((d) => later.add(d.id));
+      sessionStorage.setItem(FINISH_LATER_KEY, JSON.stringify([...later]));
+      setFinishLater(later);
+      setDraftBusy(true);
+      try {
+        await Promise.all(remove.map((d) => api.deleteDraft(d.id)));
+      } catch (e) {
+        setDraftError(extractErrorMsg(e, "Could not delete a draft"));
+      } finally {
+        setDraftBusy(false);
+        notifyDraftsChanged();
+      }
+      if (finish.length > 0) await openDraft(finish[0]);
+    },
+    [finishLater, openDraft],
+  );
 
   const handleEditDone = useCallback(() => {
     if (!originAfterEdit) return;
@@ -100,6 +189,16 @@ function AuthenticatedApp() {
         </div>
 
         <div className="ml-auto flex items-center gap-3 pr-3">
+          <button
+            onClick={() => setDraftsOpen(true)}
+            className="flex items-center gap-1 text-xs text-gray-700 hover:text-blue-700"
+            title="Orders you saved as a draft"
+          >
+            <FileClock className="w-3.5 h-3.5" />
+            Drafts
+            <CountBadge count={drafts.length} title="draft orders" />
+          </button>
+          <WarehouseSwitcher />
           <span className="flex items-center gap-1 text-xs text-gray-600">
             <UserCircle className="w-4 h-4 text-gray-500" />
             {username}
@@ -136,7 +235,13 @@ function AuthenticatedApp() {
           className="h-full"
           style={{ display: view === "assistant" ? "block" : "none" }}
         >
-          <OrderAssistantScreen onOpenOrder={openOrderInEntryTab} />
+          <OrderAssistantScreen
+            onOpenOrder={openOrderInEntryTab}
+            drafts={drafts}
+            onOpenDraft={openDraft}
+            pendingDraft={pendingAssistantDraft}
+            clearPendingDraft={() => setPendingAssistantDraft(null)}
+          />
         </div>
         <div
           className="h-full overflow-y-auto"
@@ -147,6 +252,8 @@ function AuthenticatedApp() {
             clearPendingOrder={clearPendingOrder}
             onEditDone={originAfterEdit ? handleEditDone : undefined}
             pendingReviews={pendingReviews}
+            pendingDraft={pendingEntryDraft}
+            clearPendingDraft={() => setPendingEntryDraft(null)}
           />
         </div>
         <div
@@ -156,6 +263,38 @@ function AuthenticatedApp() {
           <AnalyticsScreen onOpenOrder={openOrderInEntryTab} />
         </div>
       </main>
+
+      {draftsOpen && (
+        <DraftsModal
+          drafts={drafts}
+          error={draftError ?? draftsError}
+          busy={draftBusy}
+          onOpen={openDraft}
+          onDelete={deleteDraft}
+          onClose={() => {
+            setDraftsOpen(false);
+            setDraftError(null);
+          }}
+        />
+      )}
+      {staleDrafts.length > 0 && (
+        <StaleDraftsPrompt
+          key={staleDrafts.map((d) => d.id).join(",")}
+          drafts={staleDrafts}
+          busy={draftBusy}
+          onDone={resolveStale}
+        />
+      )}
+      <ConfirmDialogHost />
+      {draftError && !draftsOpen && (
+        <div className="modal-backdrop" onClick={() => setDraftError(null)}>
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <h2 className="modal-title">Draft</h2>
+            <p className="modal-body">{draftError}</p>
+            <button className="btn btn-primary" onClick={() => setDraftError(null)}>OK</button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

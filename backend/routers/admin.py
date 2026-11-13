@@ -18,18 +18,38 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 import schemas
-from auth import get_current_user, require_min_role
+from auth import get_current_user, get_current_user_role, presence, require_min_role
 from database import get_db
+from services.dc_warehouse import dc_warehouses
 
 
 router = APIRouter(
     prefix="/admin",
     tags=["admin"],
-    # Every endpoint here requires ADMIN. The dep runs before any
-    # endpoint function, so unauthorised calls 401 (not authorised) or
-    # 403 (not ADMIN) before touching the DB.
-    dependencies=[Depends(require_min_role("ADMIN"))],
+    # SUPERVISOR+ to get in at all (agents 403 before touching the DB).
+    # SUPERVISORs get a limited view (2026-11-12): registered non-admin
+    # users only, and the only change they may make is an AGENT's
+    # warehouse. Adding users, roles and activation stay ADMIN-only.
+    dependencies=[Depends(require_min_role("SUPERVISOR"))],
 )
+
+
+def _is_admin(role: str) -> bool:
+    return (role or "").upper() == "ADMIN"
+
+
+def _admin_usernames(db: Session) -> set:
+    rows = db.execute(
+        text(
+            """
+            SELECT g.cAgentName
+            FROM [SOAssistant].dbo._tb_SOAppUsers u
+            JOIN [BA_00_LPD_CON].dbo._rtblAgents g ON g.idAgents = u.iAgentID
+            WHERE u.cRole = 'ADMIN'
+            """
+        )
+    ).mappings().all()
+    return {(r["cAgentName"] or "").strip().lower() for r in rows}
 
 
 _VALID_ROLES = {"AGENT", "SUPERVISOR", "ADMIN"}
@@ -45,8 +65,12 @@ _ADMIN_USER_SELECT = """
     u.cRole             AS role,
     u.bActive           AS is_active,
     u.dtCreatedAt       AS registered_at,
-    u.cCreatedBy        AS registered_by
+    u.cCreatedBy        AS registered_by,
+    w.Code              AS default_warehouse_code
 """
+
+# The agent's default warehouse (_rtblAgents.iDefWhseId -> WhseMst.Code).
+_WHSE_JOIN = "LEFT JOIN [BA_00_LPD_CON].dbo.WhseMst w ON w.WhseLink = g.iDefWhseId"
 
 
 def _row_to_user(r) -> schemas.AdminUserRow:
@@ -59,6 +83,7 @@ def _row_to_user(r) -> schemas.AdminUserRow:
         is_active=bool(r["is_active"]) if r["is_active"] is not None else None,
         registered_at=r["registered_at"],
         registered_by=(r["registered_by"] or "").strip() if r["registered_by"] else None,
+        default_warehouse_code=(r["default_warehouse_code"] or "").strip() or None,
     )
 
 
@@ -85,6 +110,7 @@ def _fetch_user_row(db: Session, *, app_user_id: int) -> Optional[schemas.AdminU
             SELECT {_ADMIN_USER_SELECT}
             FROM [SOAssistant].dbo._tb_SOAppUsers u
             JOIN [BA_00_LPD_CON].dbo._rtblAgents g ON g.idAgents = u.iAgentID
+            {_WHSE_JOIN}
             WHERE u.idAppUser = :id
             """
         ),
@@ -100,6 +126,7 @@ def _fetch_user_row_by_agent(db: Session, *, agent_id: int) -> Optional[schemas.
             SELECT {_ADMIN_USER_SELECT}
             FROM [BA_00_LPD_CON].dbo._rtblAgents g
             LEFT JOIN [SOAssistant].dbo._tb_SOAppUsers u ON u.iAgentID = g.idAgents
+            {_WHSE_JOIN}
             WHERE g.idAgents = :agent_id
             """
         ),
@@ -109,7 +136,7 @@ def _fetch_user_row_by_agent(db: Session, *, agent_id: int) -> Optional[schemas.
 
 
 @router.get("/users", response_model=List[schemas.AdminUserRow])
-def list_users(db: Session = Depends(get_db)):
+def list_users(db: Session = Depends(get_db), role: str = Depends(get_current_user_role)):
     """Every active Evolution agent, with registration status overlaid.
     Unregistered agents appear with `app_user_id = null` so the UI can
     offer an "Add as …" button inline."""
@@ -119,15 +146,37 @@ def list_users(db: Session = Depends(get_db)):
             SELECT {_ADMIN_USER_SELECT}
             FROM [BA_00_LPD_CON].dbo._rtblAgents g
             LEFT JOIN [SOAssistant].dbo._tb_SOAppUsers u ON u.iAgentID = g.idAgents
+            {_WHSE_JOIN}
             WHERE g.bAgentActive = 1
             ORDER BY g.cAgentName
             """
         )
     ).mappings().all()
-    return [_row_to_user(r) for r in rows]
+    users = [_row_to_user(r) for r in rows]
+    if not _is_admin(role):
+        # Supervisors: registered users only, and never the admins.
+        users = [u for u in users if u.app_user_id is not None and u.role != "ADMIN"]
+    return users
 
 
-@router.post("/users", response_model=schemas.AdminUserRow, status_code=201)
+@router.get("/presence", response_model=List[schemas.UserPresence])
+def list_presence(db: Session = Depends(get_db), role: str = Depends(get_current_user_role)):
+    """Who is signed in right now (memory only, see auth.presence). Polled
+    every 60 s while the Users & Roles screen is open. Supervisors don't
+    see admins."""
+    people = presence()
+    if not _is_admin(role) and people:
+        hidden = _admin_usernames(db)
+        people = {k: v for k, v in people.items() if k not in hidden}
+    return [schemas.UserPresence(**p) for p in people.values()]
+
+
+@router.post(
+    "/users",
+    response_model=schemas.AdminUserRow,
+    status_code=201,
+    dependencies=[Depends(require_min_role("ADMIN"))],
+)
 def create_user(
     payload: schemas.AdminUserCreate,
     db: Session = Depends(get_db),
@@ -186,6 +235,7 @@ def update_user(
     payload: schemas.AdminUserUpdate,
     db: Session = Depends(get_db),
     me_username: str = Depends(get_current_user),
+    me_role: str = Depends(get_current_user_role),
 ):
     """Change role and / or active flag on an existing app-user row.
     Self-lockout guard: can't demote yourself from ADMIN or deactivate
@@ -198,6 +248,13 @@ def update_user(
     existing = _fetch_user_row(db, app_user_id=app_user_id)
     if existing is None:
         raise HTTPException(404, f"App user id {app_user_id} not found")
+
+    # Supervisors may only change an AGENT's warehouse.
+    if not _is_admin(me_role):
+        if payload.role is not None or payload.is_active is not None:
+            raise HTTPException(403, "Only an admin can change roles or activate / deactivate users.")
+        if existing.role != "AGENT":
+            raise HTTPException(403, "Supervisors can only change an agent's warehouse.")
 
     me_agent_id = _lookup_agent_id(db, me_username)
     is_self = me_agent_id is not None and existing.agent_id == me_agent_id
@@ -222,6 +279,22 @@ def update_user(
     if payload.is_active is not None:
         set_parts.append("bActive = :active")
         params["active"] = 1 if payload.is_active else 0
+
+    # Default warehouse: lives on the Evolution agent record, not on
+    # _tb_SOAppUsers. The only way an AGENT's warehouse changes.
+    if payload.default_warehouse_code is not None:
+        code = payload.default_warehouse_code.strip().upper()
+        links = dc_warehouses(db)
+        if code not in links:
+            raise HTTPException(400, f"Warehouse must be one of {', '.join(sorted(links))}.")
+        db.execute(
+            text("UPDATE [BA_00_LPD_CON].dbo._rtblAgents SET iDefWhseId = :whse WHERE idAgents = :agent"),
+            {"whse": links[code], "agent": existing.agent_id},
+        )
+        db.commit()
+        if not set_parts:
+            return _fetch_user_row(db, app_user_id=app_user_id) or existing
+
     if not set_parts:
         # Nothing to do — return the row as-is rather than running an
         # empty UPDATE (SQL Server rejects SET with no assignments).

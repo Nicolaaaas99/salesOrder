@@ -10,6 +10,7 @@ prices and totals against Evolution happens in services.order_import.validate.
 """
 from __future__ import annotations
 
+import hashlib
 import io
 import re
 from datetime import date, datetime
@@ -290,10 +291,27 @@ class BoxerParser:
         # holds the VAT rate column when it's filled in), minus the
         # "<order pack> Case" columns that sit just before the numbers.
         desc = " ".join(tokens[:start] + tokens[end:])
+        # Columns "Order Pack | Size | Pack" print as "500.00ml 10 Case":
+        # Order Pack = the size of ONE unit, Size = the pack size (10),
+        # Pack = the unit it's ordered in (Case).
+        printed = re.findall(r"(?:^|\s)(\d+)\s+Case\b", desc)
         desc = re.sub(r"\s+\d+\s+Case\b", "", desc).strip()
 
         out.description = desc
         out.qty = qty_unit
+        # Pack size: the printed Size, cross-checked with Qty (Unit) /
+        # Qty (Pack) (50 / 5 = 10). If they disagree a column was misread.
+        by_qty = qty_unit / _qty_pack if _qty_pack > 0 else None
+        pack = float(printed[-1]) if printed else by_qty
+        pack_problem = None
+        if printed and by_qty is not None and abs(by_qty - pack) > 1e-6:
+            pack_problem = (
+                f"Size {pack:g} doesn't agree with Qty (Unit) {qty_unit:g} / "
+                f"Qty (Pack) {_qty_pack:g}"
+            )
+        if pack and abs(pack - 1) > 1e-9:
+            out.pack_size = round(pack, 4)
+            out.pack_qty = round(qty_unit / pack, 4)
         out.unit_excl = unit_excl
         out.unit_incl = unit_incl
         out.line_excl = line_excl
@@ -307,6 +325,8 @@ class BoxerParser:
             problems.append("Qty x UnitCost (Excl) does not equal the Exclusive amount")
         if abs(line_excl + line_vat - line_incl) > 0.02:
             problems.append("Exclusive + VAT does not equal the Inclusive amount")
+        if pack_problem:
+            problems.append(pack_problem)
         if problems:
             out.parse_warning = "; ".join(problems) + " on the document."
         return out
@@ -628,7 +648,204 @@ class OKParser:
                     return
 
 
-PARSERS = [BoxerParser(), PicknPayParser(), OKParser()]
+# ---------------------------------------------------------------------------
+# Spar
+# ---------------------------------------------------------------------------
+
+# Prefix of the item code given to lines that print no code of ours: the
+# mapping is keyed on their description + size instead (see description_key).
+DESCRIPTION_KEY_PREFIX = "D#"
+
+
+def description_key(description: str, size: str) -> str:
+    """Stable mapping key for a line with no product code: description +
+    size, ignoring case and spacing. An exact match only (never "similar"
+    text), so a reworded description shows as unmatched instead of quietly
+    picking the wrong item. Hashed so it always fits the 40-character
+    mapping column; the readable text is kept as the mapping's description."""
+    norm = " ".join((description or "").upper().split()) + "|" + "".join((size or "").upper().split())
+    return DESCRIPTION_KEY_PREFIX + hashlib.sha1(norm.encode("utf-8")).hexdigest()[:16].upper()
+
+
+# "1593.6000" / "14583.49" / "1,593.60": DOT decimals, optional comma thousands.
+_SPAR_AMOUNT = r"\d{1,3}(?:,\d{3})+\.\d+|\d+\.\d+"
+
+
+def _spar_num(tok: str) -> float:
+    return float(tok.replace(",", ""))
+
+
+def _dmy_any(s: Optional[str]) -> Optional[date]:
+    """11/11/26, 11/11/2026 or 11.11.2026."""
+    if not s:
+        return None
+    for fmt in ("%d/%m/%y", "%d/%m/%Y", "%d.%m.%Y"):
+        d = _dmy(s, fmt)
+        if d:
+            return d
+    return None
+
+
+class SparParser:
+    """Spar "Purchase Order - Supplier Copy" (columns: Supplier Product Code |
+    Product Description | Prom Ind | Size | Pack | Net Cost | Deal 1 |
+    Deal 2 | U/C | Order Qty | Order Value | Free Stock).
+
+    * Supplier Product Code = OUR stock code, with the leading zeros dropped
+      ("2" = 002, "59" = 059): 1-2 digit codes are padded to 3 digits.
+    * Many lines print NO code: those are matched on description + size
+      (description_key), mapped once per corporate group.
+    * Prices are EXCL VAT (they sit at our excl price, and the TOTALS is the
+      sum of the excl Order Values; there's no VAT on the PO). Net Cost is per
+      case; Order Value is the line amount, so unit excl = Order Value /
+      units, units = Pack x Order Qty (U/C "C"), or Order Qty ("U").
+      Validation adds the item's VAT (prices_excl).
+    * Store: "Store: 60130, Dwarsloop SUPERSPAR". Order Number / Order Date /
+      Delivery Date top right (dd/mm/yy).
+    * TOTALS: total Order Qty (cases) and total Order Value (excl).
+    """
+
+    name = "SPAR"
+    retailer = "Spar"
+
+    _ROW = re.compile(
+        r"^(?:(?P<code>\d{1,10})\s+)?(?P<desc>.+?)(?:\s+(?P<prom>[A-Z]))?\s+(?P<size>\S+)\s+"
+        r"(?P<pack>\d+(?:\.\d+)?)\s+(?P<cost>" + _SPAR_AMOUNT + r")\s+"
+        r"(?P<d1>-?\d+[.,]\d+)\s+(?P<d2>-?\d+[.,]\d+)\s+(?P<uc>[CU])\s+"
+        r"(?P<qty>\d+(?:\.\d+)?)\s+(?P<value>" + _SPAR_AMOUNT + r")\s+(?P<free>[YN])\s*$"
+    )
+
+    @staticmethod
+    def detect(text: str) -> bool:
+        return bool(re.search(r"Purchase\s*Order\s*-\s*Supplier\s*Copy", text)) and bool(
+            re.search(r"Store:\s*\d+", text)
+        )
+
+    def parse(self, pages: List[str]) -> ParsedOrder:
+        full = "\n".join(pages)
+        first = pages[0]
+
+        # Labels and values can come out side by side ("Order Number : 144843")
+        # or stacked ("Order Number / Delivery Date / : 144843 / 13/11/26").
+        stacked = re.search(
+            r"Order\s*Number\s*\n\s*Delivery\s*Date\s*\n\s*:\s*(\d+)\s*\n\s*(\d{2}/\d{2}/\d{2,4})",
+            first,
+        )
+        order_no = _search(r"Order\s*Number\s*:\s*(\d+)", first) or (
+            stacked.group(1) if stacked else ""
+        )
+        delivery = _dmy_any(
+            _search(r"Delivery\s*Date\s*:?\s*(\d{2}/\d{2}/\d{2,4})", first)
+            or (stacked.group(2) if stacked else None)
+        )
+        order_date = _dmy_any(
+            _search(r"Order\s*Date\s*:?\s*(\d{2}/\d{2}/\d{2,4})", first)
+            or _search(r"\bDate\s*:\s*(\d{2}\.\d{2}\.\d{4})", first)
+        )
+        store = re.search(r"Store:\s*(\d+)\s*,?\s*([^\n]*?)\s*(?:Date\s*:|\n|$)", first)
+        order = ParsedOrder(
+            format_name=self.name,
+            retailer=self.retailer,
+            order_no=order_no,
+            order_date=order_date,
+            delivery_from=delivery,
+            delivery_to=delivery,
+            store_code=store.group(1) if store else "",
+            store_name=store.group(2).strip() if store else "",
+        )
+        order.lines = self._parse_lines(full)
+        self._parse_totals(full, order)
+
+        if not order.store_code:
+            order.warnings.append("Store number (Store:) not found on the document.")
+        if not order.lines:
+            order.warnings.append("No order lines could be read from the document.")
+        if order.total_excl is None:
+            order.warnings.append("Order total (TOTALS) not found on the document.")
+        if order.delivery_from is None:
+            order.warnings.append("Delivery date not found on the document.")
+        return order
+
+    def _parse_lines(self, full: str) -> List[ParsedLine]:
+        out: List[ParsedLine] = []
+        for raw in full.splitlines():
+            m = self._ROW.match(raw.strip())
+            if m:
+                out.append(self._build_line(len(out) + 1, m))
+        return out
+
+    @staticmethod
+    def _build_line(line_no: int, m: "re.Match") -> ParsedLine:
+        code = m.group("code") or ""
+        if code and len(code) < 3:
+            code = code.zfill(3)            # "2" -> 002, "59" -> 059
+        desc = " ".join(m.group("desc").split())
+        size = m.group("size")
+        prom = m.group("prom")
+        # Show the size unless the description already ends with it.
+        shown = desc + (f" {prom}" if prom else "")
+        if not desc.upper().replace(" ", "").endswith(size.upper()):
+            shown += f" ({size})"
+        out = ParsedLine(
+            line_no=line_no,
+            supplier_code=code,
+            item_code="" if code else description_key(desc, size),
+            description=shown,
+            vat_known=False,
+            prices_excl=True,
+        )
+        pack, cost = float(m.group("pack")), _spar_num(m.group("cost"))
+        qty, value = float(m.group("qty")), _spar_num(m.group("value"))
+        d1 = float(m.group("d1").replace(",", "."))
+        d2 = float(m.group("d2").replace(",", "."))
+        cases = m.group("uc") == "C"
+        units = pack * qty if cases else qty
+        out.qty = units
+        if cases and pack != 1:
+            out.pack_size, out.pack_qty = pack, qty
+        out.line_excl = value
+        out.unit_excl = round(value / units, 4) if units else 0.0
+
+        # Order Value should be Order Qty x Net Cost (less any deals); if it
+        # isn't, a column was probably misread.
+        per = cost if cases else cost / pack if pack else cost
+        expect = [qty * per, qty * (per - d1 - d2),
+                  qty * per * (1 - d1 / 100) * (1 - d2 / 100)]
+        if units <= 0:
+            out.parse_warning = "Pack size or quantity is zero on the document."
+        elif m.group("free") == "Y":
+            out.parse_warning = (
+                "This line is marked as free stock on the order. Capture this order manually."
+            )
+        elif not any(abs(e - value) <= 0.011 for e in expect):
+            out.parse_warning = (
+                f"Order Value R{value:,.2f} doesn't agree with the quantity x Net Cost "
+                f"({qty:g} x R{cost:,.4f}): a column may have been misread."
+            )
+        return out
+
+    @staticmethod
+    def _parse_totals(full: str, order: ParsedOrder) -> None:
+        m = re.search(
+            r"T\s*O\s*T\s*A\s*L\s*S\s+(\d+(?:\.\d+)?)\s+(" + _SPAR_AMOUNT + r")", full
+        )
+        if not m:
+            return
+        order.total_excl = _spar_num(m.group(2))
+        # TOTALS counts cases (Order Qty); the import counts units. If the
+        # case counts agree, check the units instead; if not, say so (and the
+        # excl total still has to agree).
+        cases = sum((l.pack_qty if l.pack_qty is not None else l.qty) for l in order.lines)
+        if abs(cases - float(m.group(1))) < 0.001:
+            order.total_qty = round(sum(l.qty for l in order.lines), 4)
+        else:
+            order.warnings.append(
+                f"The lines read add up to {cases:g} cases, but the order's TOTALS "
+                f"shows {float(m.group(1)):g}. Some lines may not have been read."
+            )
+
+
+PARSERS = [BoxerParser(), PicknPayParser(), OKParser(), SparParser()]
 
 
 def parse_order_pdf(data: bytes) -> ParsedOrder:

@@ -125,6 +125,11 @@ button { font-family: inherit; }
   color: var(--text);
 }
 .btn-secondary:hover { background: var(--row-hover); }
+.btn-danger {
+  background: var(--danger);
+  color: white;
+}
+.btn-danger:hover:not(:disabled) { filter: brightness(0.92); }
 .btn-large {
   padding: 10px 22px;
   font-size: 14px;
@@ -681,6 +686,7 @@ button { font-family: inherit; }
 .action-bar {
   display: flex;
   justify-content: flex-end;
+  gap: 8px;
   padding: 4px 0;
 }
 
@@ -799,4 +805,11 @@ button { font-family: inherit; }
 .draft-row:focus-within {
   background-color: #eff6ff;
   box-shadow: inset 3px 0 0 0 #3b82f6;
+}
+
+/* Order Assistant draft panel: the credit block stays visible but tight so
+   the order lines keep their room (CreditStatus dense). */
+.draft-credit .credit-status--compact {
+  padding: 5px 10px 7px 10px;
+  gap: 4px;
 }

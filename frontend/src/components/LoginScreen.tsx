@@ -15,6 +15,7 @@ export function LoginScreen() {
     setSubmitting(true);
     try {
       await login(username, password);
+      offerToSavePassword(username, password);
     } catch (err: any) {
       const detail = err?.response?.data?.detail;
       setError(detail ?? err?.message ?? "Login failed");
@@ -26,6 +27,9 @@ export function LoginScreen() {
   return (
     <div className="h-screen flex items-center justify-center bg-gray-50 p-4">
       <form
+        method="post"
+        action="#"
+        name="login"
         onSubmit={onSubmit}
         className="bg-white rounded border shadow-sm p-6 w-full max-w-sm flex flex-col gap-3"
       >
@@ -43,12 +47,14 @@ export function LoginScreen() {
           Username
           <input
             type="text"
+            id="username"
+            name="username"
             autoComplete="username"
             autoFocus
             required
             value={username}
             onChange={(e) => setUsername(e.target.value)}
-            disabled={submitting}
+            readOnly={submitting}
             className="border border-gray-300 rounded px-2 py-1.5 text-sm focus:border-blue-500 focus:outline-none"
           />
         </label>
@@ -57,11 +63,13 @@ export function LoginScreen() {
           Password
           <input
             type="password"
+            id="password"
+            name="password"
             autoComplete="current-password"
             required
             value={password}
             onChange={(e) => setPassword(e.target.value)}
-            disabled={submitting}
+            readOnly={submitting}
             className="border border-gray-300 rounded px-2 py-1.5 text-sm focus:border-blue-500 focus:outline-none"
           />
         </label>
@@ -82,4 +90,27 @@ export function LoginScreen() {
       </form>
     </div>
   );
+}
+
+/** Let the browser's password manager offer "Save password?" after a
+ *  successful sign-in. The app signs in without a page load, so Chrome /
+ *  Edge can miss it; the Credential Management API tells them directly
+ *  (needs https:// or localhost). Browsers without it rely on the form's
+ *  name / autocomplete attributes. Only called after the server accepted
+ *  the password, so a wrong password is never offered for saving.
+ *  Logs one console line so "why no prompt?" can be answered (F12). */
+function offerToSavePassword(id: string, password: string) {
+  const Cred = (window as any).PasswordCredential;
+  if (!window.isSecureContext || !Cred || !navigator.credentials?.store) {
+    console.info("[login] password save: browser API unavailable (secureContext=%s)", window.isSecureContext);
+    return;
+  }
+  try {
+    navigator.credentials
+      .store(new Cred({ id: id.trim(), password, name: id.trim() }))
+      .then(() => console.info("[login] password save: offered to the browser"))
+      .catch((e: unknown) => console.info("[login] password save: refused by the browser", e));
+  } catch (e) {
+    console.info("[login] password save: failed", e);
+  }
 }

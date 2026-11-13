@@ -91,6 +91,109 @@ def _resolve_range(
 _CONTACT_LOG_START_DATE = date(2026, 10, 26)
 
 
+# Orders + ordered litres per (customer, date) for the Deliveries report and
+# its export. One InvNum row per OrderNum: Evolution's split-order copies
+# (DocState 3) carry the same full lines as the archived original, so the
+# original is preferred and the copy only counts when the original isn't in
+# the range. FORCESEEK on the lines: without it SQL Server scans every
+# invoice line ever (~75k reads on dev) instead of ~60 seeks per order —
+# measured 2026-11-11: one delivery day ~100-180 ms, a week ~350 ms.
+_DELIVERY_TOTALS_SQL = """
+    WITH picked AS (
+        SELECT NUM.AutoIndex, NUM.OrderNum, NUM.AccountID,
+               CAST(NUM.{date_col} AS date) AS tx_date,
+               ROW_NUMBER() OVER (
+                   PARTITION BY NUM.OrderNum
+                   ORDER BY CASE WHEN NUM.OrigDocID IS NULL OR NUM.OrigDocID = 0
+                                  OR NUM.OrigDocID = NUM.AutoIndex THEN 0 ELSE 1 END,
+                            NUM.AutoIndex) AS rn
+        FROM dbo.InvNum NUM
+        WHERE NUM.DocType = 4
+          AND NUM.DocState IN (1, 3, 4)
+          AND NUM.{date_col} >= :from_date
+          AND NUM.{date_col} <  :to_exclusive
+    )
+    SELECT CL.Account                       AS account,
+           CL.Name                          AS customer_name,
+           CL.ulARRoute                     AS route,
+           P.tx_date                        AS tx_date,
+           COUNT(DISTINCT P.OrderNum)       AS order_count,
+           SUM(STK.ulIISize * LIN.fQuantity) AS litres
+    FROM picked P
+    JOIN dbo.Client CL ON CL.DCLink = P.AccountID
+    LEFT JOIN dbo._btblInvoiceLines LIN WITH (FORCESEEK) ON LIN.iInvoiceID = P.AutoIndex
+    LEFT JOIN dbo.StkItem STK ON STK.StockLink = LIN.iStockCodeID
+    WHERE P.rn = 1
+    GROUP BY CL.Account, CL.Name, CL.ulARRoute, P.tx_date
+"""
+
+
+def _delivery_totals(db: Session, frm: date, to: date, date_col: str):
+    return db.execute(
+        text(_DELIVERY_TOTALS_SQL.format(date_col=date_col)),
+        {"from_date": frm, "to_exclusive": to + timedelta(days=1)},
+    ).mappings().all()
+
+
+def _routed_customers(db: Session):
+    """Every active (not on hold) customer that has a route."""
+    return db.execute(
+        text("""
+            SELECT ulARRoute AS route, Account AS account, Name AS customer_name
+            FROM dbo.Client
+            WHERE ISNULL(On_Hold, 0) = 0
+              AND ulARRoute IS NOT NULL
+              AND LTRIM(RTRIM(ulARRoute)) <> ''
+        """)
+    ).mappings().all()
+
+
+def _route_label(route) -> str:
+    return (route or "").strip() or "No route"
+
+
+@router.get("/deliveries", response_model=List[schemas.DeliveryCustomer])
+def list_deliveries(
+    from_date: Optional[date] = Query(None, alias="from"),
+    to_date: Optional[date] = Query(None, alias="to"),
+    db: Session = Depends(get_db),
+):
+    """Deliveries report: every active, routed customer with their order
+    count and ordered litres for orders DELIVERED in [from, to], plus any
+    customer with such an order who isn't in that list (on hold / no route,
+    shown under 'No route'). Runs on screen open, date change and
+    (throttled) window focus — cached 20 s per range in the orders_today
+    namespace, which every order write already invalidates."""
+    frm, to = _resolve_range(None, from_date, to_date)
+    return short_cache.get_or_compute(
+        ORDERS_TODAY_CACHE, ("deliveries", frm, to), 20,
+        lambda: _query_deliveries(db, frm, to),
+    )
+
+
+def _query_deliveries(db: Session, frm: date, to: date) -> List[schemas.DeliveryCustomer]:
+    out: dict[str, schemas.DeliveryCustomer] = {}
+    for c in _routed_customers(db):
+        acc = (c["account"] or "").strip()
+        if not acc:
+            continue
+        out[acc] = schemas.DeliveryCustomer(
+            route=_route_label(c["route"]), account=acc,
+            customer_name=(c["customer_name"] or "").strip(),
+        )
+    for r in _delivery_totals(db, frm, to, "DeliveryDate"):
+        acc = (r["account"] or "").strip()
+        row = out.get(acc)
+        if row is None:
+            row = out[acc] = schemas.DeliveryCustomer(
+                route=_route_label(r["route"]), account=acc,
+                customer_name=(r["customer_name"] or "").strip(),
+            )
+        row.order_count += int(r["order_count"] or 0)
+        row.litres += float(r["litres"] or 0)
+    return list(out.values())
+
+
 @router.get("/export-orders-per-day")
 def export_orders_per_day(
     on_date: Optional[date] = Query(None, alias="date"),
@@ -102,7 +205,7 @@ def export_orders_per_day(
     """Download an .xlsx of every active, routed customer × date in the
     range. One row per customer per date (so a 3-day range × 500 customers
     = 1500 rows). Columns: Date · Route · Account · Customer · NoOfOrders
-    · Reason. Zero-order rows kept so the Reason column tells the full
+    · Litres · Reason. Zero-order rows kept so the Reason column tells the full
     coverage story. Pass `from=&to=` or just `date=`."""
     # Deferred import so the module still loads if openpyxl isn't installed
     # (e.g. a stale venv) — only this endpoint would 500 until pip install.
@@ -113,38 +216,23 @@ def export_orders_per_day(
     date_col = _date_column(by)
 
     # 1. Customer master — one row per active, routed customer.
-    customers = db.execute(
-        text("""
-            SELECT ulARRoute AS route, Account AS account, Name AS customer_name
-            FROM dbo.Client
-            WHERE ISNULL(On_Hold, 0) = 0
-              AND ulARRoute IS NOT NULL
-              AND LTRIM(RTRIM(ulARRoute)) <> ''
-        """)
-    ).mappings().all()
+    customers = list(_routed_customers(db))
 
-    # 2. Per-(account, date) order counts across the range. COUNT DISTINCT
-    # OrderNum so a split order (Evolution creates multiple InvNum rows
-    # sharing the same OrderNum when partially processed) only counts once.
-    order_rows = db.execute(
-        text(f"""
-            SELECT CL.Account                        AS account,
-                   CAST(NUM.{date_col} AS DATE)       AS tx_date,
-                   COUNT(DISTINCT NUM.OrderNum)      AS order_count
-            FROM dbo.InvNum NUM
-            JOIN dbo.Client CL ON CL.DCLink = NUM.AccountID
-            WHERE NUM.DocType = 4
-              AND NUM.DocState IN (1, 3, 4)
-              AND NUM.{date_col} >= :from_date
-              AND NUM.{date_col} <  :to_exclusive
-            GROUP BY CL.Account, CAST(NUM.{date_col} AS DATE)
-        """),
-        {"from_date": frm, "to_exclusive": to + timedelta(days=1)},
-    ).mappings().all()
-    counts_by_key: dict[tuple[str, date], int] = {
-        ((r["account"] or "").strip(), r["tx_date"]): int(r["order_count"] or 0)
+    # 2. Per-(account, date) order counts + ordered litres across the range
+    # (one InvNum row per OrderNum — see _DELIVERY_TOTALS_SQL).
+    order_rows = _delivery_totals(db, frm, to, date_col)
+    counts_by_key: dict[tuple[str, date], tuple[int, float]] = {
+        ((r["account"] or "").strip(), r["tx_date"]): (int(r["order_count"] or 0), float(r["litres"] or 0))
         for r in order_rows
     }
+    # Customers with an order who aren't in the master list (on hold / no
+    # route) still belong in the export.
+    known = {(c["account"] or "").strip() for c in customers}
+    for r in order_rows:
+        acc = (r["account"] or "").strip()
+        if acc not in known:
+            known.add(acc)
+            customers.append({"route": "", "account": acc, "customer_name": r["customer_name"]})
 
     # 3. Latest contact-log outcome per (customer, delivery-date) in the
     # range. Keyed on dDeliveryDate (not dCallDate) so a NO_ORDER logged
@@ -202,7 +290,7 @@ def export_orders_per_day(
     range_label = frm.isoformat() if frm == to else f"{frm.isoformat()} to {to.isoformat()}"
     ws.title = f"Orders {range_label}"[:31]  # Excel caps sheet names at 31 chars
 
-    headers = [date_label, "Route", "CustomerAccount", "CustomerName", "NoOfOrders", "Reason"]
+    headers = [date_label, "Route", "CustomerAccount", "CustomerName", "NoOfOrders", "Litres", "Reason"]
     ws.append(headers)
     for cell in ws[1]:
         cell.font = Font(bold=True)
@@ -211,15 +299,15 @@ def export_orders_per_day(
     # blocks top-to-bottom. Within each date, Route then Customer name.
     customers_sorted = sorted(
         customers,
-        key=lambda r: ((r["route"] or "").strip(), (r["customer_name"] or "").strip()),
+        key=lambda r: (_route_label(r["route"]), (r["customer_name"] or "").strip()),
     )
 
     for d in all_dates:
         for c in customers_sorted:
-            route = (c["route"] or "").strip()
+            route = _route_label(c["route"])
             account = (c["account"] or "").strip()
             name = (c["customer_name"] or "").strip()
-            count = counts_by_key.get((account, d), 0)
+            count, litres = counts_by_key.get((account, d), (0, 0.0))
             outcome = outcomes_by_key.get((account, d))
             ws.append([
                 d.isoformat(),
@@ -227,11 +315,12 @@ def export_orders_per_day(
                 account,
                 name,
                 count,
+                round(litres, 2),
                 _reason(count, outcome, d),
             ])
 
     # Reasonable default column widths (approximate — openpyxl uses char units).
-    for col_letter, width in zip(("A", "B", "C", "D", "E", "F"), (12, 20, 18, 48, 12, 16)):
+    for col_letter, width in zip(("A", "B", "C", "D", "E", "F", "G"), (12, 20, 18, 48, 12, 12, 16)):
         ws.column_dimensions[col_letter].width = width
     ws.freeze_panes = "A2"
 
@@ -371,6 +460,17 @@ def list_customer_deal_items(
     ]
 
 
+def _parse_size(raw) -> Optional[float]:
+    """StkItem.ulIISize is a free-text UDF ('0.5', '0.350', occasionally
+    blank or junk). Return a float, or None when it isn't a clean number."""
+    if raw is None:
+        return None
+    try:
+        return float(str(raw).strip().replace(",", "."))
+    except ValueError:
+        return None
+
+
 @router.get("/orders", response_model=List[schemas.HistoricalOrder])
 def list_orders(customer_id: str = Query(...), db: Session = Depends(get_db)):
     sql = """
@@ -427,7 +527,7 @@ def list_orders(customer_id: str = Query(...), db: Session = Depends(get_db)):
                 "stockCode": stock_code,
                 "description": description,
                 "category": (row["Category"] or "Uncategorized").strip() or "Uncategorized",
-                "size": float(row["Size"]) if row["Size"] is not None else None,
+                "size": _parse_size(row["Size"]),
                 "quantity": 0.0,
                 "exclAmount": 0.0,
                 "vat": 0.0,

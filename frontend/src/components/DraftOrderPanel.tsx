@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { ArrowRight, Trash2, Plus, Lock, Unlock, AlertCircle, X } from "lucide-react";
+import { ArrowRight, Trash2, Plus, Lock, Unlock, AlertCircle, X, Check } from "lucide-react";
 import type {
   CustomerDetail,
   InventoryItem,
@@ -31,6 +31,13 @@ type Props = {
   onClearAll: () => void;
   onAddItem: (item: InventoryItem) => void;
   onContinue: () => void;
+  /** Save the order as a draft to finish later. */
+  onSaveDraft?: () => void;
+  savingDraft?: boolean;
+  /** Time the draft was last saved on this screen (shown under the buttons). */
+  draftSavedAt?: string | null;
+  /** This order continues a saved draft. */
+  isDraft?: boolean;
   taxTypes: TaxType[];
   /** Object identity bumps whenever a line is added/merged; the Qty cell at
    *  `idx` is then focused + scrolled into view. */
@@ -161,6 +168,10 @@ export function DraftOrderPanel({
   onClearAll,
   onAddItem,
   onContinue,
+  onSaveDraft,
+  savingDraft = false,
+  draftSavedAt = null,
+  isDraft = false,
   taxTypes,
   focusTarget,
   unprocessedCount,
@@ -274,17 +285,17 @@ export function DraftOrderPanel({
 
   return (
     <div className="bg-white rounded border shadow-sm flex flex-col overflow-hidden h-full">
-      <div className="px-3 py-2 border-b border-gray-200 bg-gray-50 flex justify-between items-center">
-        <div>
-          <div className="text-xs font-semibold text-gray-700 uppercase tracking-wide">
+      <div className="px-3 py-1 border-b border-gray-200 bg-gray-50 flex justify-between items-center gap-2">
+        <div className="min-w-0 flex items-baseline gap-2">
+          <span className="text-xs font-semibold text-gray-700 uppercase tracking-wide flex-shrink-0">
             Draft Order
-          </div>
+          </span>
           {customer ? (
-            <div className="text-sm text-gray-900">
+            <span className="text-sm text-gray-900 truncate" title={`${customer.account} · ${customer.name}`}>
               {customer.account} · {customer.name}
-            </div>
+            </span>
           ) : (
-            <div className="text-sm text-gray-400">No customer selected</div>
+            <span className="text-sm text-gray-400">No customer selected</span>
           )}
         </div>
         {lines.length > 0 && (
@@ -588,27 +599,26 @@ export function DraftOrderPanel({
         </div>
       </div>
 
-      <div className="border-t border-gray-200 bg-gray-50 px-3 py-2 text-sm">
-        <div className="flex justify-between py-0.5">
-          <span className="text-gray-600">Excl:</span>
-          <span className="font-mono">{fmtCurrency(totals.excl)}</span>
-        </div>
-        <div className="flex justify-between py-0.5">
-          <span className="text-gray-600">VAT:</span>
-          <span className="font-mono">{fmtCurrency(totals.tax)}</span>
-        </div>
-        <div className="flex justify-between py-0.5 font-bold border-t border-gray-300 pt-1 mt-1">
-          <span>Incl:</span>
-          <span className="font-mono">{fmtCurrency(totals.incl)}</span>
-        </div>
+      {/* Totals on one row. */}
+      <div className="border-t border-gray-200 bg-gray-50 px-3 py-1 flex items-baseline gap-3 text-xs">
+        <span className="text-gray-500">
+          Excl <span className="font-mono text-gray-700">{fmtCurrency(totals.excl)}</span>
+        </span>
+        <span className="text-gray-500">
+          VAT <span className="font-mono text-gray-700">{fmtCurrency(totals.tax)}</span>
+        </span>
+        <span className="ml-auto font-bold text-sm">
+          Incl <span className="font-mono">{fmtCurrency(totals.incl)}</span>
+        </span>
       </div>
 
       {customer && (
-        <div className="border-t border-gray-200 px-2 py-2">
+        <div className="border-t border-gray-200 draft-credit">
           <CreditStatus
             customer={customer}
             currentOrderIncl={totals.incl}
             compact
+            dense
             unprocessedCount={unprocessedCount}
             unprocessedWorstTier={unprocessedWorstTier}
             onShowUnprocessed={onShowUnprocessed}
@@ -616,9 +626,9 @@ export function DraftOrderPanel({
         </div>
       )}
 
-      <div className="border-t border-gray-200 p-2">
+      <div className="border-t border-gray-200 px-2 py-1.5">
         {missingPrice && (
-          <div className="mb-2 border border-red-200 bg-red-50 rounded shadow-sm flex items-center gap-2 px-2.5 py-1.5 text-[11px] text-red-900">
+          <div className="mb-1.5 border border-red-200 bg-red-50 rounded shadow-sm flex items-center gap-2 px-2.5 py-1.5 text-[11px] text-red-900">
             <AlertCircle className="w-3.5 h-3.5 text-red-600 flex-shrink-0" />
             <span className="flex-1">
               <span className="font-mono font-semibold">{missingPrice.stock_code}</span>
@@ -627,7 +637,7 @@ export function DraftOrderPanel({
           </div>
         )}
         {unconfirmedCount > 0 && !missingPrice && (
-          <div className="mb-2 border border-amber-200 bg-amber-50 rounded shadow-sm flex items-center gap-2 px-2.5 py-1.5 text-[11px] text-amber-900">
+          <div className="mb-1.5 border border-amber-200 bg-amber-50 rounded flex items-center gap-2 px-2 py-0.5 text-[11px] text-amber-900">
             <span className="flex-shrink-0 w-3 h-3 rounded-full bg-amber-400 ring-2 ring-amber-100" />
             <span className="flex-1">
               <strong>{unconfirmedCount}</strong>
@@ -640,11 +650,27 @@ export function DraftOrderPanel({
         {continueBlockMsg && !missingPrice && unconfirmedCount === 0 && (
           <div
             ref={continueBlockRef}
-            className="mb-2 border border-blue-200 bg-blue-50 rounded shadow-sm flex items-center gap-2 px-2.5 py-1.5 text-[11px] text-blue-900"
+            className="mb-1.5 border border-blue-200 bg-blue-50 rounded shadow-sm flex items-center gap-2 px-2.5 py-1.5 text-[11px] text-blue-900"
           >
             <AlertCircle className="w-3.5 h-3.5 text-blue-600 flex-shrink-0" />
             <span className="flex-1">{continueBlockMsg}</span>
           </div>
+        )}
+        <div className="flex gap-2">
+        {onSaveDraft && (
+          <button
+            onClick={onSaveDraft}
+            disabled={!customer || savingDraft || !lines.some((l) => l.stock_code)}
+            title={
+              draftSavedAt
+                ? `Draft saved at ${draftSavedAt}. Open it later from Drafts at the top.`
+                : "Save this order to finish later (deleted automatically after 3 days)"
+            }
+            className="flex-none px-3 py-1.5 rounded border border-gray-300 bg-white text-sm font-semibold text-gray-700 hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed inline-flex items-center gap-1"
+          >
+            {draftSavedAt && !savingDraft && <Check className="w-3.5 h-3.5 text-emerald-600" />}
+            {savingDraft ? "Saving…" : isDraft ? "Update draft" : "Save draft"}
+          </button>
         )}
         <button
           onClick={onContinue}
@@ -656,7 +682,7 @@ export function DraftOrderPanel({
               ? `${unconfirmedCount} suggested quantity${unconfirmedCount === 1 ? "" : "s"} still need confirming`
               : undefined
           }
-          className={`w-full py-2 rounded font-semibold text-sm flex items-center justify-center gap-2 ${
+          className={`flex-1 py-1.5 rounded font-semibold text-sm flex items-center justify-center gap-2 ${
             canContinue
               ? "bg-blue-600 hover:bg-blue-700 text-white"
               : "bg-gray-200 text-gray-500 cursor-not-allowed"
@@ -665,6 +691,7 @@ export function DraftOrderPanel({
           Continue to Order
           <ArrowRight className="w-4 h-4" />
         </button>
+        </div>
       </div>
     </div>
   );

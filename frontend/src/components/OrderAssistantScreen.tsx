@@ -1,12 +1,16 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { WarehouseMismatchBanner } from "./WarehouseMismatchBanner";
+import { dcMismatchMessage, useMoveLinesOnWarehouseSwitch } from "../utils/warehouse";
 import Select from "react-select";
 import AsyncSelect from "react-select/async";
-import { Truck, Users, XCircle, Check } from "lucide-react";
+import { Truck, Users, XCircle, Check, FileClock } from "lucide-react";
 import { api } from "../api/client";
 import type {
   ContactLogEntry,
   ContactOutcome,
   CustomerDetail,
+  DraftDetail,
+  DraftSummary,
   HistoricalOrder,
   InventoryItem,
   OrderSuggestion,
@@ -31,13 +35,21 @@ import {
   resolvedPriceSource,
   type CategoryProduct,
 } from "../utils/history";
-import { makeEmptyLine, pickDefaultWarehouse, snapToPack } from "./LineItemsGrid";
+import { makeEmptyLine, orderTotals, pickDefaultWarehouse, snapToPack } from "./LineItemsGrid";
 import { SalesOrderScreen } from "./SalesOrderScreen";
 import { useAuth } from "../context/AuthContext";
 import { today } from "../utils/date";
 import { worstDeliveryTier } from "../utils/deliveryAge";
 import { useCustomerAutoRefresh } from "../utils/useCustomerAutoRefresh";
 import { useFocusRefresh } from "../utils/useFocusRefresh";
+import {
+  draftSavedLabel,
+  readDraftPayload,
+  repriceLines,
+  saveDraftWithConfirm,
+  type DraftHeader,
+} from "../utils/drafts";
+import { extractErrorMsg } from "../utils/format";
 
 type Option = { value: string; label: string };
 
@@ -162,10 +174,22 @@ type OrderAssistantProps = {
    *  Supplied by App.tsx so the "Edit this order" button on the summary
    *  modal routes through the same path as Route Overview. */
   onOpenOrder?: (orderNo: string) => void;
+  /** The agent's drafts (App.tsx): hints when the customer has one. */
+  drafts?: DraftSummary[];
+  onOpenDraft?: (d: DraftSummary) => void;
+  /** An Order Assistant draft to reopen. */
+  pendingDraft?: DraftDetail | null;
+  clearPendingDraft?: () => void;
 };
 
-export function OrderAssistantScreen({ onOpenOrder }: OrderAssistantProps = {}) {
-  const { defaultWarehouseCode, sessionDate } = useAuth();
+export function OrderAssistantScreen({
+  onOpenOrder,
+  drafts = [],
+  onOpenDraft,
+  pendingDraft = null,
+  clearPendingDraft,
+}: OrderAssistantProps = {}) {
+  const { defaultWarehouseCode, sessionDate, role } = useAuth();
   const [routes, setRoutes] = useState<Option[]>([]);
   const [selectedRoute, setSelectedRoute] = useState<Option | null>(null);
   const [selectedCustomer, setSelectedCustomer] = useState<Option | null>(null);
@@ -234,6 +258,10 @@ export function OrderAssistantScreen({ onOpenOrder }: OrderAssistantProps = {}) 
   const [error, setError] = useState<string | null>(null);
 
   const [draftLines, setDraftLines] = useState<DraftLine[]>([]);
+  // The warehouse the customer data was last loaded at (see the load effect).
+  const loadedWarehouse = useRef(defaultWarehouseCode);
+  // Supervisor switched warehouse mid-order: move + re-price the lines.
+  useMoveLinesOnWarehouseSwitch(draftLines, setDraftLines, selectedCustomer?.value, true);
   // Object identity bumps whenever a line is added/merged, so the DraftOrderPanel
   // can focus the Qty cell at the given index each time (not just when length grows).
   const [focusTarget, setFocusTarget] = useState<{ idx: number } | null>(null);
@@ -263,6 +291,19 @@ export function OrderAssistantScreen({ onOpenOrder }: OrderAssistantProps = {}) 
   const [blockedPick, setBlockedPick] = useState<{ code: string; description: string; category: string } | null>(null);
   const [finalizeOpen, setFinalizeOpen] = useState(false);
   const [finalizeSessionKey, setFinalizeSessionKey] = useState(0);
+
+  // -- Drafts ------------------------------------------------------------------
+  // The draft this customer's order continues (null: none saved yet).
+  const [draftId, setDraftId] = useState<number | null>(null);
+  // Header restored from a draft: seeds the finalize sheet.
+  const [draftHeader, setDraftHeader] = useState<DraftHeader | null>(null);
+  // Latest header from the finalize sheet, saved with a draft from the panel.
+  const headerRef = useRef<DraftHeader | null>(null);
+  // A draft waiting for its customer to load (see the customer effect).
+  const restoreRef = useRef<DraftDetail | null>(null);
+  const [restoringDraft, setRestoringDraft] = useState<DraftDetail | null>(null);
+  const [savingDraft, setSavingDraft] = useState(false);
+  const [draftSavedAt, setDraftSavedAt] = useState<string | null>(null);
 
   useEffect(() => {
     (async () => {
@@ -407,6 +448,12 @@ export function OrderAssistantScreen({ onOpenOrder }: OrderAssistantProps = {}) 
   );
 
   useEffect(() => {
+    // A supervisor switched warehouse with this customer open: reload the
+    // per-warehouse data (suggestions, deal items, prices) but keep the
+    // order being built — its lines are moved + re-priced by
+    // useMoveLinesOnWarehouseSwitch, and its draft / header stay.
+    const warehouseOnly = !!selectedCustomer && loadedWarehouse.current !== defaultWarehouseCode;
+    loadedWarehouse.current = defaultWarehouseCode;
     if (!selectedCustomer) {
       setOrders([]);
       setSuggestions([]);
@@ -416,18 +463,42 @@ export function OrderAssistantScreen({ onOpenOrder }: OrderAssistantProps = {}) 
       setNewDealStocks(new Set());
       setCustomerDetail(null);
       setDraftLines([]);
+      setDraftId(null);
+      setDraftHeader(null);
+      setDraftSavedAt(null);
+      headerRef.current = null;
+      restoreRef.current = null;
+      setRestoringDraft(null);
+      setIsLoadingOrders(false);
       setOpenedCategories(new Set());
       setPickedCategories(null);
       setBlockedPick(null);
       setContinueBlockMsg(null);
       return;
     }
-    // Fresh customer — rep hasn't reviewed any categories yet.
-    setOpenedCategories(new Set());
-    setPickedCategories(null);
-    setBlockedPick(null);
-    setContinueBlockMsg(null);
+    // Reopening a draft for this customer? Its lines / header come back once
+    // the customer has loaded (below).
+    const restoring =
+      !warehouseOnly && restoreRef.current?.customer_account === selectedCustomer.value
+        ? restoreRef.current
+        : null;
+    if (!warehouseOnly) {
+      restoreRef.current = null;
+      if (!restoring) setRestoringDraft(null);
+      setDraftId(null);
+      setDraftHeader(null);
+      setDraftSavedAt(null);
+      headerRef.current = null;
+      // Fresh customer — rep hasn't reviewed any categories yet.
+      setOpenedCategories(new Set());
+      setPickedCategories(null);
+      setBlockedPick(null);
+      setContinueBlockMsg(null);
+    }
 
+    // Cleared or changed while this load was in flight: drop its results
+    // (otherwise the old customer's history shows with nobody selected).
+    let cancelled = false;
     (async () => {
       setIsLoadingOrders(true);
       setError(null);
@@ -444,6 +515,7 @@ export function OrderAssistantScreen({ onOpenOrder }: OrderAssistantProps = {}) 
           // Targets are an add-on — never let them block the screen.
           api.listWeekTargets(selectedCustomer.value, sessionDate!).catch(() => [] as WeekTarget[]),
         ]);
+        if (cancelled) return;
 
         // Inject synthetic 0-qty "orders" for dealed stocks the customer
         // has never purchased, so the HistoryGrid still surfaces them
@@ -541,6 +613,7 @@ export function OrderAssistantScreen({ onOpenOrder }: OrderAssistantProps = {}) 
         if (codes.size > 0) {
           try {
             const map = await api.getPackSizes([...codes]);
+            if (cancelled) return;
             // Seed with suggestion pack sizes (which the backend already snapped against)
             suggestionsData.forEach((s) => {
               if (s.pack_size) map[s.stock_code] = s.pack_size;
@@ -556,6 +629,7 @@ export function OrderAssistantScreen({ onOpenOrder }: OrderAssistantProps = {}) 
               sessionDate!,
               defaultWarehouseCode,
             );
+            if (cancelled) return;
             const srcMap = new Map<string, string>();
             Object.entries(priceMap).forEach(([code, p]) => {
               if (p.source) srcMap.set(code, p.source);
@@ -568,15 +642,46 @@ export function OrderAssistantScreen({ onOpenOrder }: OrderAssistantProps = {}) 
           setPackSizes(new Map());
           setPriceSources(new Map());
         }
+
+        if (restoring) {
+          // The draft's lines, priced as they are today. If prices can't be
+          // fetched the lines come back unpriced, which blocks Continue.
+          const payload = readDraftPayload(restoring);
+          const lines = await repriceLines(
+            payload.lines, selectedCustomer.value, sessionDate!, defaultWarehouseCode,
+          ).catch(() =>
+            payload.lines.map((l) => ({
+              ...l, unit_price: 0, unit_price_incl: 0, price_source: "None", price_locked: false,
+              ...(defaultWarehouseCode && l.stock_code ? { warehouse_code: defaultWarehouseCode } : {}),
+            })),
+          );
+          if (cancelled) return;
+          setDraftLines(lines);
+          setOpenedCategories(new Set(payload.openedCategories ?? []));
+          setDraftId(restoring.id);
+          setDraftHeader(payload.header ?? null);
+          headerRef.current = payload.header ?? null;
+          // Remount the finalize sheet so it picks up the draft's header.
+          setFinalizeSessionKey((k) => k + 1);
+        }
       } catch {
-        setError("Failed to load history / suggestions.");
+        if (!cancelled) setError("Failed to load history / suggestions.");
       } finally {
-        setIsLoadingOrders(false);
+        if (!cancelled) {
+          setIsLoadingOrders(false);
+          setRestoringDraft(null);
+        }
       }
     })();
 
-    setDraftLines([]);
-  }, [selectedCustomer, sessionDate]);
+    if (!warehouseOnly) setDraftLines([]);
+    return () => {
+      cancelled = true;
+    };
+    // defaultWarehouseCode: a supervisor switched warehouse — suggestions,
+    // deal items and prices are per warehouse, so reload them.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedCustomer, sessionDate, defaultWarehouseCode]);
 
   // Suggestion quantities tick down live as the user drafts lines for the
   // same stock code. When the remaining suggestion reaches 0, the item drops
@@ -829,6 +934,79 @@ export function OrderAssistantScreen({ onOpenOrder }: OrderAssistantProps = {}) 
 
   const handleClearAll = useCallback(() => setDraftLines([]), []);
 
+  // Reopen a draft (from Drafts, the next-day prompt or the hint below):
+  // select its customer; the customer effect restores the lines.
+  useEffect(() => {
+    if (!pendingDraft) return;
+    const draft = pendingDraft;
+    clearPendingDraft?.();
+    const option: Option = {
+      value: draft.customer_account,
+      label: `${draft.customer_account} — ${draft.customer_name}`,
+    };
+    const go = () => {
+      restoreRef.current = draft;
+      setRestoringDraft(draft);
+      setFinalizeOpen(false);
+      setSelectedCustomer(option);
+    };
+    // Same customer already open: no "what happened?" prompt for it.
+    if (selectedCustomer?.value === draft.customer_account) go();
+    else tryLeaveCurrentCustomer(go);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pendingDraft]);
+
+  const handleSaveDraft = useCallback(async () => {
+    if (!customerDetail) return;
+    const filled = draftLines.filter((l) => l.stock_code);
+    if (filled.length === 0) return;
+    // Same gate as Continue: no draft while the customer's DC doesn't match.
+    const dcBlock = dcMismatchMessage(customerDetail, defaultWarehouseCode, role);
+    if (dcBlock) {
+      setContinueBlockMsg(dcBlock.replace("before placing the order", "before saving a draft"));
+      return;
+    }
+    setSavingDraft(true);
+    setError(null);
+    try {
+      const saved = await saveDraftWithConfirm({
+        id: draftId,
+        source: "ORDER_ASSISTANT",
+        customer_account: customerDetail.account,
+        customer_name: customerDetail.name,
+        line_count: filled.length,
+        total_incl: orderTotals(filled, taxTypes, "Inclusive", headerRef.current?.documentDiscount ?? 0).incl,
+        payload: {
+          version: 1,
+          header: headerRef.current,
+          lines: filled,
+          openedCategories: [...openedCategories],
+        },
+      });
+      if (saved) {
+        setDraftId(saved.id);
+        setDraftSavedAt(new Date().toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" }));
+      }
+    } catch (e) {
+      setError(extractErrorMsg(e, "Could not save the draft"));
+    } finally {
+      setSavingDraft(false);
+    }
+  }, [customerDetail, draftLines, draftId, taxTypes, openedCategories, defaultWarehouseCode, role]);
+
+  // Another draft of this agent for the customer that's open (not the one
+  // being continued): offer to open it instead of starting over.
+  const otherDraft = useMemo(
+    () =>
+      selectedCustomer
+        ? drafts.find(
+            (d) => d.customer_account === selectedCustomer.value
+              && d.id !== draftId && d.id !== restoringDraft?.id,
+          ) ?? null
+        : null,
+    [drafts, selectedCustomer, draftId, restoringDraft],
+  );
+
   const handleAddItem = useCallback(
     (item: InventoryItem) => {
       // Enforce "add in-history items from the history grid". The point of
@@ -901,6 +1079,12 @@ export function OrderAssistantScreen({ onOpenOrder }: OrderAssistantProps = {}) 
 
   const handleContinue = useCallback(() => {
     if (!customerDetail || draftLines.length === 0) return;
+    // Gate: the customer's DC (card) must be the warehouse we capture from.
+    const dcBlock = dcMismatchMessage(customerDetail, defaultWarehouseCode, role);
+    if (dcBlock) {
+      setContinueBlockMsg(dcBlock);
+      return;
+    }
     // Gate: the rep must have opened every category in the customer's
     // history at least once before placing the order. The blue highlight
     // on each unopened category points them at what's left to review.
@@ -919,7 +1103,7 @@ export function OrderAssistantScreen({ onOpenOrder }: OrderAssistantProps = {}) 
     }
     setContinueBlockMsg(null);
     setFinalizeOpen(true);
-  }, [customerDetail, draftLines.length, unopenedCategories]);
+  }, [customerDetail, draftLines.length, unopenedCategories, defaultWarehouseCode, role]);
 
   const handleFinalizeClose = useCallback(() => setFinalizeOpen(false), []);
 
@@ -1247,25 +1431,54 @@ export function OrderAssistantScreen({ onOpenOrder }: OrderAssistantProps = {}) 
           />
         </div>
 
-        {/* Route progress chips moved out of the Customer header — now
-            their own compact strip, only shown when a route is selected. */}
-        {routeProgress.total > 0 && (
-          <div className="bg-white rounded border shadow-sm px-2 py-1 flex items-center gap-3 text-xs text-gray-700 flex-shrink-0 w-fit">
-            <span className="text-[10px] uppercase tracking-wide text-gray-500 font-semibold">
-              Route progress
-            </span>
-            <span className="inline-flex items-center gap-1">
-              <span className="w-2 h-2 rounded-full bg-emerald-500" />
-              {routeProgress.placed} placed
-            </span>
-            <span className="inline-flex items-center gap-1">
-              <span className="w-2 h-2 rounded-full bg-amber-500" />
-              {routeProgress.contacted} contacted
-            </span>
-            <span className="inline-flex items-center gap-1">
-              <span className="w-2 h-2 rounded-full bg-red-500" />
-              {routeProgress.remaining} to call
-            </span>
+        {/* Top strip: route progress + this customer's saved draft, each as
+            wide as its content. */}
+        {(routeProgress.total > 0 || restoringDraft || (otherDraft && onOpenDraft)) && (
+          <div className="flex items-center gap-2 flex-wrap flex-shrink-0">
+          {/* Route progress chips moved out of the Customer header — now
+              their own compact strip, only shown when a route is selected. */}
+          {routeProgress.total > 0 && (
+            <div className="bg-white rounded border shadow-sm px-2 py-1 flex items-center gap-3 text-xs text-gray-700 flex-shrink-0 w-fit">
+              <span className="text-[10px] uppercase tracking-wide text-gray-500 font-semibold">
+                Route progress
+              </span>
+              <span className="inline-flex items-center gap-1">
+                <span className="w-2 h-2 rounded-full bg-emerald-500" />
+                {routeProgress.placed} placed
+              </span>
+              <span className="inline-flex items-center gap-1">
+                <span className="w-2 h-2 rounded-full bg-amber-500" />
+                {routeProgress.contacted} contacted
+              </span>
+              <span className="inline-flex items-center gap-1">
+                <span className="w-2 h-2 rounded-full bg-red-500" />
+                {routeProgress.remaining} to call
+              </span>
+            </div>
+          )}
+
+          {restoringDraft && (
+            <div className="px-2 py-1 bg-blue-50 border border-blue-200 text-blue-800 rounded flex items-center gap-2 text-xs flex-shrink-0 w-fit">
+              <span className="inline-block w-3 h-3 rounded-full border-2 border-blue-300 border-t-blue-700 animate-spin" />
+              Loading draft…
+            </div>
+          )}
+          {!restoringDraft && otherDraft && onOpenDraft && (
+            <div className="px-2 py-1 bg-amber-50 border border-amber-300 text-amber-900 rounded flex items-center gap-2 text-xs flex-shrink-0 w-fit">
+              <FileClock className="w-3.5 h-3.5 flex-shrink-0" />
+              <span>
+                You have a draft for this customer ({otherDraft.line_count} line
+                {otherDraft.line_count === 1 ? "" : "s"}, saved {draftSavedLabel(otherDraft)}).
+              </span>
+              <button
+                className="px-2 py-0.5 rounded bg-amber-600 text-white font-semibold hover:bg-amber-700"
+                onClick={() => onOpenDraft(otherDraft)}
+              >
+                Open draft
+              </button>
+            </div>
+          )}
+
           </div>
         )}
 
@@ -1275,6 +1488,15 @@ export function OrderAssistantScreen({ onOpenOrder }: OrderAssistantProps = {}) 
             onUpdated={setCustomerDetail}
           />
         )}
+        <WarehouseMismatchBanner
+          customer={customerDetail}
+          onCustomerUpdated={setCustomerDetail}
+          onPickAnother={() => {
+            // Nothing was done with this customer: skip the call-outcome prompt.
+            skipNextLeaveModalRef.current = true;
+            setSelectedCustomer(null);
+          }}
+        />
 
         {error && (
           <div className="p-1 bg-red-100 border border-red-300 text-red-800 rounded flex items-center text-xs flex-shrink-0">
@@ -1317,6 +1539,10 @@ export function OrderAssistantScreen({ onOpenOrder }: OrderAssistantProps = {}) 
               onClearAll={handleClearAll}
               onAddItem={handleAddItem}
               onContinue={handleContinue}
+              onSaveDraft={handleSaveDraft}
+              savingDraft={savingDraft}
+              draftSavedAt={draftSavedAt}
+              isDraft={draftId != null}
               taxTypes={taxTypes}
               focusTarget={focusTarget}
               unprocessedCount={unprocessedOrders.length}
@@ -1345,6 +1571,16 @@ export function OrderAssistantScreen({ onOpenOrder }: OrderAssistantProps = {}) 
                 onControlledLinesChange={setDraftLines}
                 suggestionIds={presentedSuggestionIds}
                 source="ORDER_ASSISTANT"
+                draftId={draftId}
+                initialHeader={draftHeader}
+                onHeaderChange={(h) => {
+                  headerRef.current = h;
+                }}
+                onDraftSaved={(d) => {
+                  setDraftId(d.id);
+                  setDraftSavedAt(new Date().toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" }));
+                }}
+                draftExtra={() => ({ openedCategories: [...openedCategories] })}
                 lockedCustomer
                 hideOpenButton
                 onClose={handleFinalizeClose}

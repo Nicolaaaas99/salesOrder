@@ -4,16 +4,48 @@ import { Warehouse } from "lucide-react";
 import { useAuth } from "../context/AuthContext";
 import { api } from "../api/client";
 import type { Warehouse as WarehouseOption } from "../api/types";
+import { canChooseWarehouse } from "../utils/warehouse";
 
 type Option = { value: string; label: string };
 
 /**
- * One-time prompt shown after login when the telesales agent has no default
- * warehouse set in _rtblAgents.iDefWhseId. Writing the choice goes through
- * AuthContext → POST /auth/default-warehouse, which also updates the agent
- * row so this modal never appears again for that user.
+ * Shown after login when the user has no default warehouse in
+ * _rtblAgents.iDefWhseId. Supervisors / admins pick one of the DCs here
+ * (POST /auth/default-warehouse). An AGENT can't choose — their warehouse
+ * is set by an admin on Users & Roles — so they get a "ask an admin" note.
  */
 export function DefaultWarehouseModal() {
+  const { role } = useAuth();
+  if (!canChooseWarehouse(role)) return <AskAdminForWarehouse />;
+  return <PickWarehouse />;
+}
+
+function AskAdminForWarehouse() {
+  const { logout } = useAuth();
+  return (
+    <div className="h-screen flex items-center justify-center bg-gray-50 p-4">
+      <div className="bg-white rounded border shadow-sm p-6 w-full max-w-sm flex flex-col gap-3">
+        <div className="flex items-center gap-2">
+          <Warehouse className="w-5 h-5 text-blue-600" />
+          <h1 className="text-base font-semibold text-gray-900">Your warehouse isn't set yet</h1>
+        </div>
+        <p className="text-sm text-gray-600">
+          Orders are captured from your warehouse (Makhado or Polokwane). Ask an admin to set it for you on the{" "}
+          <strong>Users &amp; Roles</strong> screen, then sign in again.
+        </p>
+        <button
+          type="button"
+          onClick={logout}
+          className="mt-1 bg-blue-600 text-white rounded px-3 py-2 text-sm font-semibold hover:bg-blue-700"
+        >
+          Sign out
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function PickWarehouse() {
   const { setDefaultWarehouseCode } = useAuth();
   const [warehouses, setWarehouses] = useState<WarehouseOption[]>([]);
   const [code, setCode] = useState("");
@@ -76,8 +108,8 @@ export function DefaultWarehouseModal() {
           </h1>
         </div>
         <p className="text-xs text-gray-500 -mt-1 mb-1">
-          Pricing and stock defaults will use this warehouse. We only ask once —
-          it's saved to your agent profile for future sessions.
+          New orders are captured from this warehouse (stock and prices). It's
+          saved to your agent profile; you can switch it any time in the top bar.
         </p>
 
         <label className="flex flex-col gap-1 text-xs text-gray-700">

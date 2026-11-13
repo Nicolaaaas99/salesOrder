@@ -7,16 +7,19 @@ from sqlalchemy import bindparam, text
 from sqlalchemy.orm import Session
 
 import schemas
-from auth import get_current_user
+from auth import get_current_user, resolve_role
+from routers.auth import _default_warehouse_for
+from services.dc_warehouse import check_customer_dc, check_order_line_warehouses
 from database import get_db
 from routers.lookups import (
-    CORPORATE_GROUPS,
+    corporate_groups,
     CUSTOMER_CREDIT_SQL,
     _build_customer_detail,
     is_corporate_customer,
 )
 from services.audit import write_order_audit
 from services.contact_log import write_contact_log
+from services.drafts import delete_after_order
 from services.forecasting.suggestions import record_order_decisions
 from services.sales_order_service import create_sales_order, update_sales_order
 from services import short_cache
@@ -139,6 +142,18 @@ def place_order(
 
     _enforce_ext_order_requirement(db, payload)
 
+    # Which warehouse the lines may come from depends on who is capturing
+    # (services/dc_warehouse.py). Resolved here, not as a dependency,
+    # because Order Import / Price Review call place_order directly.
+    check_order_line_warehouses(
+        db,
+        resolve_role(db, username),
+        _default_warehouse_for(db, username),
+        (l.warehouse_code for l in payload.lines),
+    )
+    # ...and they must come from the customer's own DC (customer card).
+    check_customer_dc(db, payload.customer_account, (l.warehouse_code for l in payload.lines))
+
     row = db.execute(text(CUSTOMER_CREDIT_SQL), {"account": payload.customer_account}).mappings().first()
     if not row:
         raise HTTPException(404, f"Customer '{payload.customer_account}' not found")
@@ -155,7 +170,7 @@ def place_order(
         raise HTTPException(
             400,
             f"{customer.name} is not a corporate customer "
-            f"({', '.join(CORPORATE_GROUPS)}). Use the Order Assistant "
+            f"({', '.join(corporate_groups(db))}). Use the Order Assistant "
             f"to place orders for this customer.",
         )
 
@@ -259,6 +274,8 @@ def place_order(
             delivery_date=payload.delivery_date,
             lines=[(l.stock_code, l.quantity) for l in payload.lines],
         )
+    # The order finishes its draft (best-effort).
+    delete_after_order(db, payload.draft_id, username)
     return result
 
 

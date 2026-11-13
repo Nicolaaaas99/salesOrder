@@ -3,6 +3,11 @@ export type CustomerSummary = { account: string; name: string };
 export type CustomerDetail = {
   account: string;
   name: string;
+  /** Dist Centre on the customer card (Client.ulARDistCentre). */
+  dist_centre?: string;
+  /** The DC warehouse that Dist Centre maps to (01.HOF_POL / 01.HOF_MAK),
+   *  or null when it's blank / not a DC. */
+  dc_warehouse_code?: string | null;
   /** The AR route this customer is linked to (Client.ulARRoute). Shown next
    *  to contact info so reps know which route to adjust in master data when
    *  a customer appears under the "wrong" route. */
@@ -91,6 +96,39 @@ export type SalesOrderCreate = {
   /** Which screen saved the order. Stamped onto cSourceApp in both
    *  _tb_SOOrderAssistantAudit and _tb_SOCustomerContactLog (PLACED row). */
   source?: OrderSource;
+  /** The draft this order finishes: deleted once the order is created. */
+  draft_id?: number | null;
+};
+
+/** An order saved half-way (see utils/drafts.ts). Private to its agent. */
+export type DraftSource = "ORDER_ASSISTANT" | "SALES_ORDER_ENTRY";
+
+export type DraftSummary = {
+  id: number;
+  source: DraftSource;
+  customer_account: string;
+  customer_name: string;
+  line_count: number;
+  total_incl: number | null;
+  created_at: string;
+  updated_at: string;
+  /** The day it is deleted automatically (3 days after it was saved). */
+  expires_on: string;
+  /** Saved before today: the agent must finish or delete it. */
+  stale: boolean;
+};
+
+export type DraftDetail = DraftSummary & { payload: unknown };
+
+export type DraftSaveRequest = {
+  id?: number | null;
+  replace?: boolean;
+  source: DraftSource;
+  customer_account: string;
+  customer_name: string;
+  line_count: number;
+  total_incl: number | null;
+  payload: unknown;
 };
 
 /** Screen an order was saved from — lets reports tell Order Assistant
@@ -176,6 +214,15 @@ export type SalesOrderDetail = {
 export type HistoryRoute = { id: string; display: string };
 export type HistoryCustomer = { id: string; display: string };
 export type CustomerOrderCount = { account: string; order_count: number };
+/** Deliveries report row: every active routed customer (+ any customer with
+ *  an order in the range), with orders and ordered litres by delivery date. */
+export type DeliveryCustomer = {
+  route: string;
+  account: string;
+  customer_name: string;
+  order_count: number;
+  litres: number;
+};
 export type CustomerOrderCountRow = {
   order_date: string | null;
   route: string;
@@ -638,6 +685,7 @@ export type ImportLineStatus =
   | "ITEM_ISSUE"
   | "NO_PRICE"
   | "PRICE_MISMATCH"
+  | "PACK_MISMATCH"   // case sizes differ and rounding down to our crates leaves 0: fix it in Evolution
   | "VAT_MISMATCH"
   | "PARSE_ERROR"
   | "EXCLUDED";       // crates: not charged, left off the order and the PO total
@@ -658,9 +706,27 @@ export type ImportLineResult = {
   doc_vat_rate: number;
   doc_line_excl: number;
   doc_line_incl: number;
-  /** Packs x pack size, when the PO orders in packs (Pick n Pay). */
+  /** Packs x pack size, when the PO orders in packs (Pick n Pay). After a
+   *  supervisor corrected THEIR pack, the corrected pack. */
   doc_pack_size?: number | null;
   doc_pack_qty?: number | null;
+  /** Our pack size (StkItem.ulIIPerCrate); null until matched. */
+  our_pack_size?: number | null;
+  /** The PO's case size (> 1) isn't ours and nobody resolved it: blocks. */
+  /** Their case isn't our crate: units rounded down to whole crates of ours (flag only). */
+  pack_conflict?: boolean;
+  /** The PO's units before that rounding. */
+  qty_before_pack?: number | null;
+  /** Rounding down left nothing: blocks create. */
+  pack_blocks?: boolean;
+  /** Units aren't whole crates of ours (warning: the order shows off-pack). */
+  off_pack?: boolean;
+  /** Remembered supervisor decision on THEIR pack. */
+  pack_fix?: "CORRECTED" | "ACCEPTED" | null;
+  pack_fix_id?: number | null;
+  /** What the PO printed, when a correction changed it. */
+  doc_pack_printed?: number | null;
+  doc_qty_printed?: number | null;
   barcode?: string;
   match_source: "MAPPING" | "DIRECT" | "NONE";
   mapping_id: number | null;
@@ -705,6 +771,8 @@ export type ImportTotals = {
   doc_excl: number | null;
   doc_vat: number | null;
   doc_incl: number | null;
+  /** The PO prints excl only (Spar): doc_incl is its lines' incl at each item's VAT. */
+  doc_incl_from_lines?: boolean;
   parsed_qty: number;
   parsed_incl: number;
   order_qty: number;
@@ -717,6 +785,9 @@ export type ImportTotals = {
   price_adjust_incl: number;
   /** PO prices rounded down to the cent per unit (never overcharge). */
   rounding_incl: number;
+  /** Units added / removed by correcting a retailer's pack size. */
+  pack_adjust_qty?: number;
+  pack_round_incl?: number;
   /** PO total after crates and price choices — what the order must match. */
   expected_incl: number | null;
   difference_incl: number | null;

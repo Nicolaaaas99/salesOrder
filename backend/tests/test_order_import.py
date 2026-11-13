@@ -157,6 +157,7 @@ def evo(monkeypatch, boxer):
 
     state["mapped_from"] = {}
     monkeypatch.setattr(v, "is_corporate_customer", lambda db, a: True)
+    monkeypatch.setattr(v, "load_pack_fixes", lambda db, scope: state.get("pack_fixes", []))
     monkeypatch.setattr(v, "load_mappings", lambda db, scope: state["mappings"])
     monkeypatch.setattr(v, "_stock_info", stock_info)
     monkeypatch.setattr(v, "resolve_customer_prices", prices)
@@ -758,6 +759,7 @@ def evo_pnp(monkeypatch, pnp):
                             "tax_type_id": 1, "warehouse_codes": ["01.HOF_MAK"]} for c in codes}
 
     monkeypatch.setattr(v, "is_corporate_customer", lambda db, a: True)
+    monkeypatch.setattr(v, "load_pack_fixes", lambda db, scope: state.get("pack_fixes", []))
     monkeypatch.setattr(v, "load_mappings", lambda db, scope: [])
     monkeypatch.setattr(v, "_stock_info", stock_info)
     monkeypatch.setattr(v, "resolve_customer_prices", prices)
@@ -953,6 +955,7 @@ def evo_ok(monkeypatch, okdoc):
                 for c in codes if c in state["price"]}
 
     monkeypatch.setattr(v, "is_corporate_customer", lambda db, a: True)
+    monkeypatch.setattr(v, "load_pack_fixes", lambda db, scope: state.get("pack_fixes", []))
     monkeypatch.setattr(v, "load_mappings", lambda db, scope: state["mappings"])
     monkeypatch.setattr(v, "_stock_info", stock_info)
     monkeypatch.setattr(v, "resolve_customer_prices", prices)
@@ -1032,3 +1035,434 @@ def test_ok_ours_1c_above_in_excl_is_still_caught(evo_ok, okdoc):
     _map_cases(evo_ok)
     line = _line(_run(okdoc.model_copy(update={"order_no": "X1"}), customer=OK_CUSTOMER), "626")
     assert line.status == "PRICE_MISMATCH" and line.needs_review
+
+
+# ---------------------------------------------------------------------------
+# Spar
+# ---------------------------------------------------------------------------
+
+from services.order_import.parsers import DESCRIPTION_KEY_PREFIX, description_key  # noqa: E402
+
+SPAR_FIXTURE = Path(__file__).parent / "fixtures" / "spar_144843.txt"
+SPAR_ZERO_RATED = {"001", "002", "003", "005", "007"}       # milk
+SPAR_CUSTOMER = {"account": "SPA279", "name": "DWARSLOOP SUPERSPAR - 60130", "dclink": 9001,
+                 "store_code": "60130", "corp_group": "Spar", "def_tax_type_id": 1}
+
+
+def _spar_pages(text=None):
+    return (text or SPAR_FIXTURE.read_text(encoding="utf-8")).split("<<PAGE>>\n")
+
+
+@pytest.fixture
+def spar():
+    return parse_order_text(_spar_pages())
+
+
+def test_spar_header(spar):
+    assert spar.format_name == "SPAR"
+    assert spar.order_no == "144843"
+    assert (spar.store_code, spar.store_name) == ("60130", "Dwarsloop SUPERSPAR")
+    assert spar.order_date == date(2026, 11, 11)
+    assert spar.delivery_from == spar.delivery_to == date(2026, 11, 13)
+    assert spar.total_excl == 14583.49 and spar.total_incl is None
+    assert spar.total_qty == 648                        # TOTALS 158 cases, in units
+    assert spar.warnings == []
+
+
+def test_spar_header_labels_side_by_side():
+    """pdfplumber may give "Order Number : 144843" on one line."""
+    text = SPAR_FIXTURE.read_text(encoding="utf-8").replace(
+        "Order Number\nDelivery Date\n: 144843\n13/11/26\n",
+        "Order Number : 144843\nOrder Date : 11/11/26\nDelivery Date : 13/11/26\n", 1)
+    doc = parse_order_text(_spar_pages(text))
+    assert (doc.order_no, doc.order_date, doc.delivery_from) == (
+        "144843", date(2026, 11, 11), date(2026, 11, 13))
+
+
+def test_spar_lines(spar):
+    assert len(spar.lines) == 55
+    assert round(sum(l.line_excl for l in spar.lines), 2) == 14583.49
+    assert all(l.parse_warning is None for l in spar.lines)
+    assert all(l.prices_excl and l.unit_incl == 0 for l in spar.lines)
+    codes = [l.supplier_code for l in spar.lines if l.supplier_code]
+    assert len(codes) == 26 and {"002", "003", "005", "059"} <= set(codes)   # zeros put back
+    milk = next(l for l in spar.lines if l.supplier_code == "002")
+    assert (milk.pack_size, milk.pack_qty, milk.qty, milk.unit_excl) == (12, 2, 24, 32.30)
+    yog = next(l for l in spar.lines if l.supplier_code == "628")
+    assert yog.unit_excl == pytest.approx(8.9567) and yog.line_excl == 107.48
+    four_l = next(l for l in spar.lines if l.supplier_code == "001")
+    assert (four_l.qty, four_l.pack_size) == (5, None)                      # pack 1
+
+
+def test_spar_lines_without_a_code_are_keyed_on_description_and_size(spar):
+    nocode = [l for l in spar.lines if not l.supplier_code]
+    assert len(nocode) == 29
+    assert all(l.item_code.startswith(DESCRIPTION_KEY_PREFIX) and len(l.item_code) <= 40
+               for l in nocode)
+    assert len({l.item_code for l in nocode}) == 29                         # all different
+    maas = nocode[7]
+    assert maas.description == "LIMPIE MAAS 2L (2LT)"
+    assert maas.item_code == description_key("LIMPIE MAAS 2L", "2LT")
+    # Same text in other case / spacing: same key; another size: another key.
+    assert description_key("limpie  maas 2l", "2lt") == maas.item_code
+    assert description_key("LIMPIE MAAS 2L", "1LT") != maas.item_code
+    # The size isn't repeated when the description already ends with it.
+    assert nocode[0].description == "SUPER LIMPIE TROPICAL PUNCH 500ML"
+
+
+def test_spar_free_stock_and_bad_value_are_flagged():
+    text = SPAR_FIXTURE.read_text(encoding="utf-8")
+    free = text.replace("624 LIMP DRINK YOG BANANA HYG 350ML 6 53.7402 0,00 0,00 C 2 107.4800 N",
+                        "624 LIMP DRINK YOG BANANA HYG 350ML 6 53.7402 0,00 0,00 C 2 107.4800 Y", 1)
+    doc = parse_order_text(_spar_pages(free))
+    assert "free stock" in next(l for l in doc.lines if l.supplier_code == "624").parse_warning
+    bad = text.replace("C 5 274.9500 N", "C 5 247.9500 N", 1)
+    doc = parse_order_text(_spar_pages(bad))
+    assert "misread" in next(l for l in doc.lines if l.supplier_code == "001").parse_warning
+
+
+@pytest.fixture
+def evo_spar(monkeypatch, spar):
+    """Ours = the PO's excl + VAT, to the cent (milk zero-rated). Lines
+    without a code are mapped to made-up stock codes N01..N29."""
+    state = {"price": {}, "mappings": [], "nocode": {}}
+    n = 0
+    for l in spar.lines:
+        code = l.supplier_code
+        if not code:
+            n += 1
+            code = f"N{n:02d}"
+            state["nocode"][l.item_code] = code
+        rate = 0 if code in SPAR_ZERO_RATED else 15
+        state["price"][code] = v._cents(round(l.unit_excl * (1 + rate / 100), 6))
+
+    def prices(db, account, codes, as_of, warehouse_code=None):
+        out = {}
+        for c in codes:
+            incl = state["price"][c]
+            rate = 0 if c in SPAR_ZERO_RATED else 15
+            out[c] = schemas.CustomerPrice(stock_code=c, excl_price=round(incl / (1 + rate / 100), 2),
+                                           incl_price=incl, source="Price List")
+        return out
+
+    def stock_info(db, codes):
+        return {c.upper(): {"code": c, "description": f"Item {c}", "is_whse_item": True,
+                            "tax_type_id": 2 if c in SPAR_ZERO_RATED else 1,
+                            "warehouse_codes": ["01.HOF_MAK"]}
+                for c in codes if c in state["price"]}
+
+    monkeypatch.setattr(v, "is_corporate_customer", lambda db, a: True)
+    monkeypatch.setattr(v, "load_pack_fixes", lambda db, scope: state.get("pack_fixes", []))
+    monkeypatch.setattr(v, "load_mappings", lambda db, scope: state["mappings"])
+    monkeypatch.setattr(v, "_stock_info", stock_info)
+    monkeypatch.setattr(v, "resolve_customer_prices", prices)
+    monkeypatch.setattr(v, "_tax_rates", lambda db, ids: {1: 15.0, 2: 0.0})
+    monkeypatch.setattr(v, "_duplicate_orders", lambda db, dc, ext: [])
+    monkeypatch.setattr(v, "_customers_with_store_code", lambda db, code: [])
+    monkeypatch.setattr(v, "_pending_reviews", lambda db, acc, po: [])
+    return state
+
+
+def _map_nocode(state):
+    for i, (key, code) in enumerate(state["nocode"].items(), start=1):
+        state["mappings"].append(ItemMapping(id=i, scope="GROUP:Spar", supplier_code="",
+                                             item_code=key, stock_code=code))
+
+
+def _spar_run(doc):
+    return _run(doc, customer=SPAR_CUSTOMER, delivery=date(2026, 11, 13))
+
+
+def test_spar_lines_without_a_code_need_mapping_once(evo_spar, spar):
+    r = _spar_run(spar)
+    unmatched = [l for l in r.lines if l.status == "UNMATCHED"]
+    assert len(unmatched) == 29 and all(not l.supplier_code for l in unmatched)
+    assert "No supplier code" in unmatched[0].issues[0]
+    assert r.store_check == "MATCH"
+    assert not r.can_create
+    # The PO's excl total is still checked: nothing was missed.
+    assert not any(i.code == "PARSE_TOTALS" for i in r.issues)
+
+
+def test_spar_mapped_order_can_be_created(evo_spar, spar):
+    _map_nocode(evo_spar)
+    r = _spar_run(spar)
+    assert all(l.status == "OK" for l in r.lines), [(l.description, l.issues) for l in r.lines]
+    assert r.totals.doc_incl_from_lines
+    assert r.totals.doc_incl == round(sum(l.doc_line_incl for l in r.lines), 2)
+    assert r.totals.agrees and r.can_create, (r.totals, [i.message for i in r.issues])
+    milk = _line(r, "002")
+    assert milk.doc_unit_incl == 32.30 and milk.doc_vat_rate == 0           # zero-rated
+    yog = _line(r, "628")
+    assert yog.doc_unit_incl == 10.30 and yog.unit_incl == 10.30            # 8.9567 ex + 15%
+
+
+def test_spar_ours_above_po_needs_review(evo_spar, spar):
+    _map_nocode(evo_spar)
+    evo_spar["price"]["628"] = 11.10
+    line = _line(_spar_run(spar), "628")
+    assert line.status == "PRICE_MISMATCH" and line.needs_review
+
+
+def test_spar_missed_line_is_caught(evo_spar):
+    text = SPAR_FIXTURE.read_text(encoding="utf-8").replace(
+        "LIMPIE MAAS 2L 2LT 12", "LIMPIE MAAS 2L 2LT twelve", 1)       # row no longer read
+    doc = parse_order_text(_spar_pages(text))
+    assert any("158" in w for w in doc.warnings)                           # TOTALS cases
+    r = _spar_run(doc)
+    assert any(i.code == "PARSE_TOTALS" and "excl" in i.message for i in r.issues)
+    assert not r.can_create
+
+
+# ---------------------------------------------------------------------------
+# Pack sizes: the PO's vs ours (StkItem.ulIIPerCrate)
+# ---------------------------------------------------------------------------
+
+from services.order_import.models import PackFix  # noqa: E402
+
+
+def _our_packs(monkeypatch, packs, default=None):
+    """Give the stock stub our pack sizes ({stock code: pack})."""
+    inner = v._stock_info
+
+    def stock_info(db, codes):
+        info = inner(db, codes)
+        for d in info.values():
+            p = packs.get(d["code"], default)
+            if p is not None:
+                d["pack_size"] = p
+        return info
+    monkeypatch.setattr(v, "_stock_info", stock_info)
+
+
+def _spar_line(r, description_start):
+    return next(l for l in r.lines if l.description.startswith(description_start))
+
+
+def test_pack_int_reads_ulIIPerCrate_like_the_rest_of_the_app():
+    assert [v.pack_int(x) for x in (None, "", " ", "0", "-3", "6", " 10 ", "6.0", "abc")] == [
+        1, 1, 1, 1, 1, 6, 10, 6, 1]
+
+
+def test_boxer_pack_size_is_units_over_packs(boxer):
+    yog = next(l for l in boxer.lines if l.supplier_code == "620")
+    assert (yog.pack_size, yog.pack_qty, yog.qty) == (10, 4, 40)
+    maas = next(l for l in boxer.lines if l.supplier_code == "014")
+    assert (maas.pack_size, maas.pack_qty) == (None, None)        # 1 Case: singles
+
+
+def test_pack_conflict_rounds_down_to_our_crates(evo_spar, spar, monkeypatch):
+    """PO: 1 x 10 = 10 units; our crate is 6: 6 go on the order, flagged."""
+    _map_nocode(evo_spar)
+    _our_packs(monkeypatch, {"336": 6})
+    r = _spar_run(spar)
+    line = _line(r, "336")
+    assert line.status == "OK" and line.pack_conflict and not line.pack_blocks
+    assert (line.qty, line.qty_before_pack) == (6, 10)
+    assert line.our_pack_size == 6 and line.doc_pack_size == 10 and not line.off_pack
+    assert line.line_incl == round(6 * line.unit_incl, 2)
+    assert any("10 units rounded down to 6" in n for n in line.notes)
+    assert r.totals.pack_adjust_qty == -4
+    assert r.totals.pack_round_incl == pytest.approx(-round(4 * line.doc_unit_incl, 2), abs=0.011)
+    assert r.totals.agrees and r.can_create, (r.totals, [i.message for i in r.issues])
+
+
+def test_pack_rounding_to_nothing_blocks(evo_spar, spar, monkeypatch):
+    _map_nocode(evo_spar)
+    _our_packs(monkeypatch, {"336": 12})                # 10 units < one crate of 12
+    r = _spar_run(spar)
+    line = _line(r, "336")
+    assert line.status == "PACK_MISMATCH" and line.pack_blocks and line.qty == 0
+    assert "leaves nothing" in line.issues[0]
+    assert not r.can_create and not r.can_submit_review
+
+
+def test_pack_not_set_on_our_side_is_flagged_not_rounded(evo_spar, spar, monkeypatch):
+    _map_nocode(evo_spar)
+    _our_packs(monkeypatch, {"336": 1})
+    r = _spar_run(spar)
+    line = _line(r, "336")
+    assert line.pack_conflict and line.qty == 10 and line.qty_before_pack is None
+    assert any("isn't set" in n for n in line.notes) and r.can_create
+
+
+def test_same_pack_is_fine(evo_spar, spar, monkeypatch):
+    _map_nocode(evo_spar)
+    _our_packs(monkeypatch, {"620": 6, "002": 12})
+    r = _spar_run(spar)
+    assert not _line(r, "620").pack_conflict and not _line(r, "620").off_pack
+    assert r.can_create
+
+
+def test_singles_that_dont_fill_our_crates_only_warn(evo_spar, spar, monkeypatch):
+    _map_nocode(evo_spar)
+    _our_packs(monkeypatch, {"001": 6})                # PO: 5 x pack 1 = 5 units
+    r = _spar_run(spar)
+    line = _line(r, "001")
+    assert line.status == "OK" and line.off_pack and not line.pack_conflict
+    assert any("off-pack" in n for n in line.notes)
+    assert r.can_create
+
+
+def test_price_review_with_a_rounded_pack(evo_spar, spar, monkeypatch):
+    _map_nocode(evo_spar)
+    evo_spar["price"]["336"] = 12.00                   # ours above the PO's 11.20
+    _our_packs(monkeypatch, {"336": 6})
+    r = _spar_run(spar)
+    line = _line(r, "336")
+    assert line.status == "PRICE_MISMATCH" and line.needs_review and line.qty == 6
+    assert r.can_submit_review
+
+
+def test_accepted_pack_decision_still_rounds(evo_spar, spar, monkeypatch):
+    """"Both are right" from before the round-down rule changes nothing now."""
+    _map_nocode(evo_spar)
+    _our_packs(monkeypatch, {"336": 6})
+    evo_spar["pack_fixes"] = [PackFix(id=7, scope="GROUP:Spar", supplier_code="336",
+                                      item_code="", doc_pack=10, pack=10)]
+    r = _spar_run(spar)
+    line = _line(r, "336")
+    assert line.pack_fix == "ACCEPTED" and line.qty == 6 and line.pack_conflict
+    assert r.can_create
+
+
+def test_corrected_their_pack_rereads_qty_and_price(evo_spar, spar, monkeypatch):
+    """Spar's Vanilla Custard 2lt: pack 1 x 6 at R174.78 is really 6 cases of 6."""
+    _map_nocode(evo_spar)
+    custard = _spar_line(_spar_run(spar), "LIMP Hyjo DR Yog Vanilla Custard")
+    stock = custard.stock_code
+    evo_spar["price"][stock] = 33.50                   # 29.13 ex + 15%
+    _our_packs(monkeypatch, {stock: 6})
+    evo_spar["pack_fixes"] = [PackFix(id=3, scope="GROUP:Spar", supplier_code="",
+                                      item_code=custard.item_code, doc_pack=1, pack=6)]
+    r = _spar_run(spar)
+    line = _spar_line(r, "LIMP Hyjo DR Yog Vanilla Custard")
+    assert line.pack_fix == "CORRECTED" and line.doc_pack_printed == 1 and line.doc_qty_printed == 6
+    assert (line.qty, line.doc_pack_size, line.doc_pack_qty) == (36, 6, 6)
+    assert line.doc_unit_excl == pytest.approx(29.13) and line.doc_line_excl == 1048.68
+    assert line.status == "OK" and line.unit_incl == 33.50 and not line.off_pack
+    assert r.totals.pack_adjust_qty == 30
+    assert r.totals.agrees and r.can_create, (r.totals, [i.message for i in r.issues])
+
+
+def test_correction_stops_when_the_retailer_fixes_its_pack(evo_spar, spar, monkeypatch):
+    _map_nocode(evo_spar)
+    _our_packs(monkeypatch, {"336": 6})
+    # Remembered for "Spar prints 12": this PO prints 10, so it doesn't apply.
+    evo_spar["pack_fixes"] = [PackFix(id=7, scope="GROUP:Spar", supplier_code="336",
+                                      item_code="", doc_pack=12, pack=6)]
+    line = _line(_spar_run(spar), "336")
+    assert line.pack_fix is None and line.pack_conflict and line.qty == 6
+
+
+def test_boxer_pack_conflict(evo, boxer, monkeypatch):
+    _map(evo, "08D020", "020")
+    _map(evo, "12", "012")
+    _our_packs(monkeypatch, {"620": 6}, default=None)
+    r = _run(boxer)
+    yog = _line(r, "620")                               # 4 x 10 = 40 -> 36
+    assert yog.pack_conflict and yog.status == "OK" and (yog.qty, yog.qty_before_pack) == (36, 40)
+    assert r.totals.pack_adjust_qty == -4
+    assert r.totals.agrees, (r.totals, [i.message for i in r.issues])
+
+
+class _TxDb:
+    def __init__(self):
+        self.committed = self.rolled_back = False
+
+    def commit(self):
+        self.committed = True
+
+    def rollback(self):
+        self.rolled_back = True
+
+
+def _pack_fix_body(pack=6):
+    return {"customer_account": "BOX07D", "supplier_code": "620", "item_code": "87593010",
+            "doc_pack": 10, "pack": pack, "description": "Hyjo 350ml", "stock_code": "620"}
+
+
+def test_pack_fix_endpoints_are_supervisor_only(client, monkeypatch):
+    saved = []
+    monkeypatch.setattr(router_mod, "upsert_pack_fix", lambda *a: saved.append(a) or 5)
+    monkeypatch.setattr(router_mod, "set_our_pack", lambda *a: saved.append(a) or "6")
+    assert client.post("/api/order-import/pack-fixes", json=_pack_fix_body()).status_code == 403
+    r = client.post("/api/order-import/our-pack", json={"stock_code": "620", "pack": 10})
+    assert r.status_code == 403
+    assert client.delete("/api/order-import/pack-fixes/5").status_code == 403
+    assert saved == []
+
+
+def test_supervisor_corrects_their_pack(client, monkeypatch):
+    db = _TxDb()
+    main.app.dependency_overrides[get_db] = lambda: db
+    ROLE["role"] = "SUPERVISOR"
+    saved = []
+    monkeypatch.setattr(router_mod, "upsert_pack_fix",
+                        lambda d, scope, req, user: saved.append((scope, req.pack, user)) or 5)
+    r = client.post("/api/order-import/pack-fixes", json=_pack_fix_body())
+    assert r.status_code == 200, r.text
+    assert r.json()["id"] == 5 and saved == [("GROUP:Boxer", 6, "tester")] and db.committed
+    assert client.post("/api/order-import/pack-fixes",
+                       json=_pack_fix_body(pack=2.5)).status_code == 400
+
+
+def test_supervisor_sets_our_pack(client, monkeypatch):
+    db = _TxDb()
+    main.app.dependency_overrides[get_db] = lambda: db
+    ROLE["role"] = "SUPERVISOR"
+    calls = []
+    monkeypatch.setattr(router_mod, "set_our_pack",
+                        lambda d, req, user: calls.append((req.stock_code, req.pack, user)) or "6")
+    r = client.post("/api/order-import/our-pack",
+                    json={"stock_code": "620", "pack": 10, "po_number": "284529"})
+    assert r.status_code == 200, r.text
+    assert r.json() == {"stock_code": "620", "old_pack": "6", "new_pack": 10}
+    assert calls == [("620", 10, "tester")] and db.committed
+    assert client.post("/api/order-import/our-pack",
+                       json={"stock_code": "620", "pack": 0}).status_code == 400
+
+    def denied(*a):
+        raise RuntimeError("The UPDATE permission was denied on the column 'ulIIPerCrate'")
+    monkeypatch.setattr(router_mod, "set_our_pack", denied)
+    r = client.post("/api/order-import/our-pack", json={"stock_code": "620", "pack": 10})
+    assert r.status_code == 503 and "grants" in r.json()["detail"] and db.rolled_back
+
+
+class _SqlDb:
+    """Records the SQL; StkItem has one row for 620 (pack '6')."""
+
+    def __init__(self):
+        self.sql = []
+
+    def execute(self, stmt, params=None):
+        self.sql.append((str(stmt), params))
+        db = self
+
+        class _R:
+            def mappings(self):
+                return self
+
+            def all(self):
+                return [{"Code": "620", "ulIIPerCrate": "6"}] if "SELECT" in db.sql[-1][0] else []
+        return _R()
+
+
+def test_set_our_pack_updates_evolution_and_logs_it():
+    from services.order_import.models import OurPackRequest
+    db = _SqlDb()
+    old = v.set_our_pack(db, OurPackRequest(stock_code="620", pack=10, po_number="284529"), "sup")
+    assert old == "6"
+    update = next(p for s, p in db.sql if s.startswith("UPDATE dbo.StkItem"))
+    assert update == {"pack": "10", "code": "620"}                 # VARCHAR column
+    audit = next(p for s, p in db.sql if "_tb_SOPackSizeAudit" in s)
+    assert (audit["old"], audit["new"], audit["user"], audit["po"]) == ("6", "10", "sup", "284529")
+
+
+def test_boxer_printed_pack_is_cross_checked():
+    """The Size column ("10" in "10 Case") must agree with Qty (Unit) / Qty (Pack)."""
+    text = FIXTURE.read_text(encoding="utf-8").replace(
+        "Strawberry 350.00ml 10 Case", "Strawberry 350.00ml 12 Case", 1)
+    doc = parse_order_text(text.split("<<PAGE>>\n"))
+    yog = next(l for l in doc.lines if l.supplier_code == "620")
+    assert yog.pack_size == 12 and "Size 12 doesn't agree" in yog.parse_warning

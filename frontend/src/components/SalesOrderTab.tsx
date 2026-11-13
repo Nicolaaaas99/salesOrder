@@ -3,9 +3,13 @@ import { FilePlus, FileUp, FolderOpen, Scale } from "lucide-react";
 import { api } from "../api/client";
 import type {
   CustomerDetail,
+  DraftDetail,
   SalesOrderDetail,
   SalesOrderSearchResult,
 } from "../api/types";
+import { useAuth } from "../context/AuthContext";
+import { readDraftPayload, repriceLines, type DraftHeader } from "../utils/drafts";
+import type { LineRow } from "./LineItemsGrid";
 import { SalesOrderScreen } from "./SalesOrderScreen";
 import { SalesOrderSearchModal } from "./SalesOrderSearchModal";
 import { OrderImportScreen } from "./OrderImportScreen";
@@ -27,6 +31,13 @@ type Mode =
       kind: "loaded";
       detail: SalesOrderDetail;
       customer: CustomerDetail;
+    }
+  | {
+      kind: "draft";
+      draftId: number;
+      customer: CustomerDetail;
+      header: DraftHeader | null;
+      lines: LineRow[];
     };
 
 type Props = {
@@ -40,6 +51,9 @@ type Props = {
   onEditDone?: () => void;
   /** Imported orders waiting for a supervisor (0 for agents). */
   pendingReviews?: number;
+  /** A Sales Order Entry draft to reopen (from Drafts / the next-day prompt). */
+  pendingDraft?: DraftDetail | null;
+  clearPendingDraft?: () => void;
 };
 
 export function SalesOrderTab({
@@ -47,7 +61,10 @@ export function SalesOrderTab({
   clearPendingOrder,
   onEditDone,
   pendingReviews = 0,
+  pendingDraft = null,
+  clearPendingDraft,
 }: Props = {}) {
+  const { sessionDate, defaultWarehouseCode } = useAuth();
   const [mode, setMode] = useState<Mode>({ kind: "landing" });
   const [loading, setLoading] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
@@ -89,6 +106,34 @@ export function SalesOrderTab({
     })();
   }, [pendingOrderNo, clearPendingOrder]);
 
+  // Reopen a draft: the customer as it is now, the lines re-priced for the
+  // session date (never the prices saved with the draft).
+  useEffect(() => {
+    if (!pendingDraft) return;
+    const draft = pendingDraft;
+    clearPendingDraft?.();
+    (async () => {
+      setLoading(true);
+      setErrorMsg(null);
+      try {
+        const payload = readDraftPayload(draft);
+        const [customer, lines] = await Promise.all([
+          api.getCustomer(draft.customer_account),
+          repriceLines(payload.lines, draft.customer_account, sessionDate!, defaultWarehouseCode),
+        ]);
+        setFormSessionKey((k) => k + 1);
+        setExternallyLaunched(false);
+        setMode({ kind: "draft", draftId: draft.id, customer, header: payload.header ?? null, lines });
+      } catch (e: any) {
+        setErrorMsg(e?.response?.data?.detail ?? e?.message ?? "Failed to open the draft");
+        setMode({ kind: "landing" });
+      } finally {
+        setLoading(false);
+      }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pendingDraft]);
+
   async function handleSelectOrder(result: SalesOrderSearchResult) {
     setLoading(true);
     setErrorMsg(null);
@@ -118,6 +163,21 @@ export function SalesOrderTab({
         key={`new-${formSessionKey}`}
         source="SALES_ORDER_ENTRY"
         onBack={backToLanding}
+      />
+    );
+  }
+
+  if (mode.kind === "draft") {
+    return (
+      <SalesOrderScreen
+        key={`draft-${mode.draftId}-${formSessionKey}`}
+        source="SALES_ORDER_ENTRY"
+        initialCustomer={mode.customer}
+        initialLines={mode.lines}
+        initialHeader={mode.header}
+        draftId={mode.draftId}
+        onBack={backToLanding}
+        onPlaced={backToLanding}
       />
     );
   }
@@ -219,7 +279,7 @@ export function SalesOrderTab({
 
         {loading && (
           <div className="mt-4 text-center text-xs text-gray-600">
-            Loading sales order…
+            Loading…
           </div>
         )}
         {errorMsg && (

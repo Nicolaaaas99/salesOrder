@@ -1,6 +1,9 @@
 import axios from "axios";
 import type {
   ContactLogCreate,
+  DraftDetail,
+  DraftSaveRequest,
+  DraftSummary,
   ContactLogEntry,
   PivotDim,
   PivotLevelResponse,
@@ -47,6 +50,7 @@ import type {
   TargetUpsert,
   OrderIntakeSummary,
   OrderIntakeOrder,
+  DeliveryCustomer,
   OrderIntakeDrillFilter,
   ParsedOrder,
   ImportValidation,
@@ -125,6 +129,9 @@ export type LoginResponse = {
 };
 
 export const auth = {
+  /** "Still here" ping for Users & Roles presence. No DB on the server. */
+  heartbeat: () => http.post<{ ok: boolean }>("/auth/heartbeat").then((r) => r.data),
+
   login: (username: string, password: string) =>
     http
       .post<LoginResponse>("/auth/login", { username, password })
@@ -157,7 +164,7 @@ export const api = {
       telesale?: string | null;
       sales_rep?: string | null;
       /** Only corporate groups — Spar / Checkers / Boxer / Pick n Pay / OK
-       *  (Client.ulARCorpGroup; list lives in backend lookups.CORPORATE_GROUPS). */
+       *  (Client.ulARCorpGroup in view _vw_SOCorporateGroups: Evolution's dropdown options except Non Corporate). */
       corporate_only?: boolean;
     },
   ) =>
@@ -327,6 +334,13 @@ export const api = {
     http
       .get<ImportReviewSummary[]>("/order-import/reviews", { params: { status } })
       .then((r) => r.data),
+  /** The signed-in agent's draft orders (also purges expired ones). */
+  listDrafts: () => http.get<DraftSummary[]>("/drafts").then((r) => r.data),
+  getDraft: (id: number) => http.get<DraftDetail>(`/drafts/${id}`).then((r) => r.data),
+  /** 409 when the agent already has a draft for the customer (replace: true overwrites it). */
+  saveDraft: (payload: DraftSaveRequest) =>
+    http.post<DraftSummary>("/drafts", payload).then((r) => r.data),
+  deleteDraft: (id: number) => http.delete(`/drafts/${id}`).then(() => undefined),
   /** Orders waiting for a supervisor (badge). Always 0 for agents. */
   getPendingReviewCount: () =>
     http
@@ -573,6 +587,22 @@ export const api = {
 
   /** Latest outcome per customer across a date range (inclusive). Used by
    *  the Deliveries Reason column. For a single day pass `from === to`. */
+  /** Deliveries report: all routes' customers with orders + litres for
+   *  orders delivered in [from, to]. Cached 20 s on the backend. */
+  listDeliveries: (from: string, to: string) =>
+    http
+      .get<DeliveryCustomer[]>("/history/deliveries", { params: { from, to } })
+      .then((r) => r.data),
+
+  /** SUPERVISOR+: set the customer card's Dist Centre to this DC warehouse's
+   *  DC (fixing a wrongly set-up customer from the mismatch banner). */
+  fixCustomerDistCentre: (account: string, warehouseCode: string) =>
+    http
+      .patch<CustomerDetail>(`/lookups/customers/${encodeURIComponent(account)}/dist-centre`, {
+        warehouse_code: warehouseCode,
+      })
+      .then((r) => r.data),
+
   listOutcomesInRange: (from: string, to: string) =>
     http
       .get<ContactLogEntry[]>("/contact-log/by-date", {
@@ -731,11 +761,26 @@ export type AdminUserRow = {
   is_active: boolean | null;
   registered_at: string | null;
   registered_by: string | null;
+  /** _rtblAgents.iDefWhseId as a code; null = not set. */
+  default_warehouse_code: string | null;
+};
+
+/** A signed-in user (Users & Roles "who is logged in"). */
+export type UserPresence = {
+  username: string;
+  /** Active in the last ~2.5 minutes. */
+  online: boolean;
+  since: string;
+  last_seen: string;
+  sessions: number;
 };
 
 export const adminApi = {
   listUsers: () =>
     http.get<AdminUserRow[]>("/admin/users").then((r) => r.data),
+
+  /** Memory-only on the server; polled every 60 s while the screen is open. */
+  listPresence: () => http.get<UserPresence[]>("/admin/presence").then((r) => r.data),
 
   createUser: (payload: { agent_id: number; role: AppUserRole }) =>
     http
@@ -744,7 +789,7 @@ export const adminApi = {
 
   updateUser: (
     appUserId: number,
-    payload: { role?: AppUserRole; is_active?: boolean },
+    payload: { role?: AppUserRole; is_active?: boolean; default_warehouse_code?: string },
   ) =>
     http
       .patch<AdminUserRow>(`/admin/users/${appUserId}`, payload)

@@ -81,6 +81,9 @@ function fmtDay(iso: string, long = false): string {
     : { weekday: "short", day: "2-digit", month: "short" });
 }
 
+/** "Mon 03 Nov" or "Mon 03 Nov – Sun 09 Nov". */
+const fmtRange = (from: string, to: string) => (from === to ? fmtDay(from) : `${fmtDay(from)} – ${fmtDay(to)}`);
+
 type Props = {
   onBack?: () => void;
   /** Opens an order in the Sales Order Entry tab (from the summary modal). */
@@ -103,7 +106,19 @@ export function OrderIntakeScreen({ onBack, onOpenOrder }: Props) {
   const [corpFilter, setCorpFilter] = useState("");
   const [userFilter, setUserFilter] = useState("");
 
+  // Drill page (the orders behind a bar / cell). The report stays mounted
+  // underneath, only hidden, so every filter, toggle and the scroll
+  // position are exactly as they were when the user comes back.
   const [drill, setDrill] = useState<OrderIntakeDrillFilter | null>(null);
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const savedScroll = useRef(0);
+  const openDrill = (f: OrderIntakeDrillFilter) => {
+    savedScroll.current = scrollRef.current?.scrollTop ?? 0;
+    setDrill(f);
+  };
+  useLayoutEffect(() => {
+    if (scrollRef.current) scrollRef.current.scrollTop = drill ? 0 : savedScroll.current;
+  }, [drill]);
 
   const load = useCallback(async () => {
     if (!fromDate || !toDate) return;
@@ -196,8 +211,8 @@ export function OrderIntakeScreen({ onBack, onOpenOrder }: Props) {
   const isRange = fromDate !== toDate;
 
   return (
-    <div className="h-full bg-gray-50 p-2 flex flex-col overflow-y-auto">
-      <div className="max-w-[1600px] mx-auto w-full flex flex-col gap-2">
+    <div ref={scrollRef} className="h-full bg-gray-50 p-2 flex flex-col overflow-y-auto">
+      <div className={drill ? "hidden" : "max-w-[1600px] mx-auto w-full flex flex-col gap-2"}>
         {/* Frozen pane: back link, dates, filters, toggles and KPI tiles stay
             on screen while the chart and table scroll underneath. */}
         <div className="sticky -top-2 z-20 -mx-2 -mt-2 px-2 pt-2 pb-2 bg-gray-50 border-b border-gray-200 shadow-sm flex flex-col gap-2">
@@ -369,7 +384,7 @@ export function OrderIntakeScreen({ onBack, onOpenOrder }: Props) {
               sources={visibleSources}
               metric={metric}
               basis={basis}
-              onPickHour={(hour) => setDrill({ hour })}
+              onPickHour={(hour) => openDrill({ hour })}
             />
           )}
         </section>
@@ -381,13 +396,13 @@ export function OrderIntakeScreen({ onBack, onOpenOrder }: Props) {
             hours={hours}
             metric={metric}
             basis={basis}
-            onPick={(f) => setDrill(f)}
+            onPick={(f) => openDrill(f)}
           />
         )}
       </div>
 
       {drill && (
-        <DrillModal
+        <DrillPage
           from={fromDate}
           to={toDate}
           filter={{
@@ -541,16 +556,14 @@ function KpiTile({
 }) {
   const share = total.orders > 0 && color ? Math.round((metrics.orders / total.orders) * 100) : null;
   return (
-    <div className={`bg-white border rounded shadow-sm px-3 py-2 ${muted ? "opacity-50" : ""}`}>
+    <div className={`bg-white border rounded shadow-sm px-2.5 py-1.5 ${muted ? "opacity-50" : ""}`}>
       <div className="flex items-center gap-1.5 text-xs font-semibold text-gray-700">
         {color && <Swatch color={color} />}
         {title}
+        <span className="font-normal text-gray-600 tabular-nums">· {int.format(metrics.orders)} orders</span>
         {share !== null && <span className="ml-auto font-normal text-gray-500">{share}% of orders</span>}
       </div>
-      <div className="mt-0.5 text-sm font-medium text-gray-700 tabular-nums">
-        {int.format(metrics.orders)} <span className="font-normal text-gray-500">orders</span>
-      </div>
-      <dl className="mt-1.5 grid grid-cols-3 gap-x-3 text-sm tabular-nums">
+      <dl className="mt-1 grid grid-cols-3 gap-x-3 text-xs tabular-nums">
         <Stat label="Qty" ordered={metrics.ordered_qty} invoiced={metrics.invoiced_qty} lost={metrics.lost_qty} pending={metrics.pending_qty} k="qty" basis={basis} />
         <Stat label="Litres" ordered={metrics.ordered_litres} invoiced={metrics.invoiced_litres} lost={metrics.lost_litres} pending={metrics.pending_litres} k="litres" basis={basis} />
         <Stat label="Amount (excl)" ordered={metrics.ordered_excl} invoiced={metrics.invoiced_excl} lost={metrics.lost_excl} pending={metrics.pending_excl} k="excl" basis={basis} />
@@ -575,18 +588,18 @@ function Stat({
   ];
   return (
     <div>
-      <dt className="text-xs text-gray-500">{label}</dt>
+      <dt className="text-[11px] text-gray-500">{label}</dt>
       {lines.map((l) =>
         l.key === basis ? (
-          <dd key={l.key} className="text-xl font-semibold text-gray-900 leading-tight whitespace-nowrap" title={l.title}>
-            <span className="mr-1 text-xs font-semibold text-gray-600">{l.tag}</span>
+          <dd key={l.key} className="text-base font-semibold text-gray-900 leading-tight whitespace-nowrap" title={l.title}>
+            <span className="mr-1 text-[11px] font-semibold text-gray-600">{l.tag}</span>
             {fmtMetric(l.v, k)}
           </dd>
         ) : null,
       )}
       {lines.map((l) =>
         l.key !== basis ? (
-          <dd key={l.key} className="text-gray-600 whitespace-nowrap" title={l.title}>
+          <dd key={l.key} className="text-gray-600 whitespace-nowrap leading-snug" title={l.title}>
             <span className="font-medium text-gray-700">{l.tag}</span> {fmtMetric(l.v, k)}
           </dd>
         ) : null,
@@ -857,15 +870,37 @@ function UserHourTable({
 // Drill-down: the orders behind a bar / cell
 // ---------------------------------------------------------------------------
 
-/** Drill-modal tree levels, outermost first. The last level (customer)
- *  opens onto the orders themselves. */
-const LEVELS: { tag: string; key: (o: OrderIntakeOrder) => string; label: (o: OrderIntakeOrder) => string }[] = [
-  { tag: "DC", key: (o) => o.dist_centre, label: (o) => o.dist_centre },
-  { tag: "Route", key: (o) => o.route, label: (o) => o.route },
-  { tag: "Group", key: (o) => o.corp_group, label: (o) => o.corp_group },
-  { tag: "Customer", key: (o) => o.customer_account, label: (o) => `${o.customer_account} · ${o.customer_name}` },
-];
-/** Row look per level: darker = higher up the tree. */
+/** The levels a user can group the drill page by. They pick which ones
+ *  and in what order; the last chosen level opens onto the orders. */
+type LevelKey = "dc" | "route" | "group" | "customer";
+const LEVEL_DEFS: Record<LevelKey, { tag: string; name: string; key: (o: OrderIntakeOrder) => string; label: (o: OrderIntakeOrder) => string }> = {
+  dc: { tag: "DC", name: "DC", key: (o) => o.dist_centre, label: (o) => o.dist_centre },
+  route: { tag: "Route", name: "Route", key: (o) => o.route, label: (o) => o.route },
+  group: { tag: "Group", name: "Corporate group", key: (o) => o.corp_group, label: (o) => o.corp_group },
+  customer: {
+    tag: "Customer",
+    name: "Customer",
+    key: (o) => o.customer_account,
+    label: (o) => `${o.customer_account} · ${o.customer_name}`,
+  },
+};
+const ALL_LEVELS: LevelKey[] = ["dc", "route", "group", "customer"];
+const LEVELS_STORAGE_KEY = "orderIntake.drillLevels";
+
+/** The user's last level choice (remembered on this PC), else all four. */
+function loadLevels(): LevelKey[] {
+  try {
+    const v = JSON.parse(localStorage.getItem(LEVELS_STORAGE_KEY) ?? "null");
+    if (Array.isArray(v) && v.every((x) => ALL_LEVELS.includes(x)) && new Set(v).size === v.length) {
+      return v as LevelKey[];
+    }
+  } catch {
+    /* fall through to the default */
+  }
+  return ALL_LEVELS;
+}
+
+/** Row look per depth: darker = higher up the tree. */
 const LEVEL_ROW = [
   "bg-slate-200 hover:bg-slate-300 font-semibold text-slate-900 border-slate-300",
   "bg-slate-100 hover:bg-slate-200 font-semibold text-slate-800 border-slate-200",
@@ -875,19 +910,62 @@ const LEVEL_ROW = [
 
 type TreeNode = { id: string; label: string; depth: number; orders: OrderIntakeOrder[]; children: TreeNode[] };
 
-function buildTree(list: OrderIntakeOrder[], depth: number, parent: string): TreeNode[] {
-  if (depth >= LEVELS.length) return [];
+function buildTree(list: OrderIntakeOrder[], levels: LevelKey[], depth: number, parent: string): TreeNode[] {
+  if (depth >= levels.length) return [];
+  const def = LEVEL_DEFS[levels[depth]];
   const groups = new Map<string, OrderIntakeOrder[]>();
   for (const o of list) {
-    const k = LEVELS[depth].key(o);
+    const k = def.key(o);
     if (!groups.has(k)) groups.set(k, []);
     groups.get(k)!.push(o);
   }
   const litres = (l: OrderIntakeOrder[]) => l.reduce((a, o) => a + o.ordered_litres, 0);
   return Array.from(groups, ([k, orders]) => {
     const id = `${parent}/${k}`;
-    return { id, label: LEVELS[depth].label(orders[0]), depth, orders, children: buildTree(orders, depth + 1, id) };
+    return { id, label: def.label(orders[0]), depth, orders, children: buildTree(orders, levels, depth + 1, id) };
   }).sort((x, y) => litres(y.orders) - litres(x.orders));
+}
+
+/** Pick the drill levels: click a level to add it at the end, click a
+ *  chosen one to remove it. The number shows its place in the order. */
+function LevelPicker({ levels, onChange }: { levels: LevelKey[]; onChange: (l: LevelKey[]) => void }) {
+  const isDefault = levels.join() === ALL_LEVELS.join();
+  return (
+    <div className="flex items-center gap-1.5 flex-wrap">
+      <span className="text-gray-500">Show by:</span>
+      {ALL_LEVELS.map((k) => {
+        const pos = levels.indexOf(k);
+        const on = pos >= 0;
+        return (
+          <button
+            key={k}
+            type="button"
+            onClick={() => onChange(on ? levels.filter((x) => x !== k) : [...levels, k])}
+            aria-pressed={on}
+            title={on ? `Remove ${LEVEL_DEFS[k].name}` : `Add ${LEVEL_DEFS[k].name} as the next level`}
+            className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full border ${
+              on ? "bg-blue-600 border-blue-600 text-white" : "bg-white text-gray-600 hover:bg-gray-50 border-dashed"
+            }`}
+          >
+            {on && (
+              <span className="inline-flex items-center justify-center w-4 h-4 rounded-full bg-white text-blue-700 text-[10px] font-bold">
+                {pos + 1}
+              </span>
+            )}
+            {LEVEL_DEFS[k].name}
+          </button>
+        );
+      })}
+      <span className="text-gray-500 ml-1">
+        {[...levels.map((k) => LEVEL_DEFS[k].name), "Orders"].join(" → ")}
+      </span>
+      {!isDefault && (
+        <button type="button" className="text-blue-700 hover:underline ml-1" onClick={() => onChange(ALL_LEVELS)}>
+          Reset
+        </button>
+      )}
+    </div>
+  );
 }
 
 type TotalKey =
@@ -911,7 +989,9 @@ function Totals({ list, bold }: { list: OrderIntakeOrder[]; bold?: boolean }) {
   );
 }
 
-function DrillModal({
+/** The orders behind a chart bar / table cell, as a page that replaces the
+ *  report until "Back" (the report keeps its state underneath). */
+function DrillPage({
   from, to, filter, pendingOnlyAtStart, onClose, onOpenOrder,
 }: {
   from: string;
@@ -977,9 +1057,21 @@ function DrillModal({
     [orders, dayPick, sourcePick, pendingOnly],
   );
 
-  // Hierarchy: DC -> route -> corporate group -> customer -> orders. Every
-  // level is ordered by litres ordered (biggest first), orders by capture time.
-  const tree = useMemo(() => buildTree(shown, 0, ""), [shown]);
+  // Hierarchy: the levels the user picked, in their order, then orders.
+  // Every level is ordered by litres ordered (biggest first), orders by
+  // capture time. The choice is remembered on this PC.
+  const [levels, setLevelsState] = useState<LevelKey[]>(loadLevels);
+  const setLevels = (l: LevelKey[]) => {
+    setLevelsState(l);
+    setOpen(new Set());
+    try {
+      localStorage.setItem(LEVELS_STORAGE_KEY, JSON.stringify(l));
+    } catch {
+      /* private mode etc. — just don't remember */
+    }
+  };
+  const tree = useMemo(() => buildTree(shown, levels, 0, ""), [shown, levels]);
+  const showCustomerOnOrder = !levels.includes("customer");
 
   const [open, setOpen] = useState<Set<string>>(new Set());
   const toggle = (k: string) =>
@@ -1004,7 +1096,8 @@ function DrillModal({
   const renderNode = (n: TreeNode): React.ReactNode => {
     const isOpen = open.has(n.id);
     const customers = new Set(n.orders.map((o) => o.customer_account)).size;
-    const isCustomer = n.depth === LEVELS.length - 1;
+    const isLeaf = n.depth === levels.length - 1;
+    const isCustomer = levels[n.depth] === "customer";
     return (
       <Fragment key={n.id}>
         <tr className={`border-b cursor-pointer ${LEVEL_ROW[n.depth]}`} onClick={() => toggle(n.id)}>
@@ -1021,7 +1114,7 @@ function DrillModal({
               )}
               {!isCustomer && (
                 <span className="text-[10px] uppercase tracking-wide font-normal text-slate-500 mr-0.5">
-                  {LEVELS[n.depth].tag}
+                  {LEVEL_DEFS[levels[n.depth]].tag}
                 </span>
               )}
               {n.label}
@@ -1033,50 +1126,50 @@ function DrillModal({
           </td>
           <Totals list={n.orders} bold={n.depth < 2} />
         </tr>
-        {isOpen &&
-          (isCustomer
-            ? n.orders.map((o) => (
-                <tr key={o.order_no} className="border-b bg-white hover:bg-blue-50/40">
-                  <td className="py-1.5 pr-2" style={{ paddingLeft: 12 + LEVELS.length * 18 + 4 }}>
-                    <button className="text-blue-700 hover:underline" onClick={() => setViewing(o.order_no)}>
-                      {o.order_no}
-                    </button>
-                  </td>
-                  <td className="px-2 py-1.5 whitespace-nowrap">
-                    {multiDay ? o.created_at.replace("T", " ").slice(0, 16) : o.created_at.slice(11, 16)}
-                  </td>
-                  <td className="px-2 py-1.5">{o.user}</td>
-                  <td className="px-2 py-1.5">
-                    <span className="inline-flex items-center gap-1.5">
-                      <Swatch color={SOURCE_COLOR[o.source]} />
-                      {o.source}
-                    </span>
-                  </td>
-                  <td className="text-right px-2 py-1.5">{int.format(o.ordered_qty)}</td>
-                  <td className="text-right px-2 py-1.5">{int.format(o.ordered_litres)}</td>
-                  <td className="text-right px-2 py-1.5">{fmtMetric(o.ordered_excl, "excl")}</td>
-                  <td className="text-right px-2 py-1.5">{int.format(o.invoiced_litres)}</td>
-                  <td className="text-right px-2 py-1.5">{fmtMetric(o.invoiced_excl, "excl")}</td>
-                  {o.doc_state === 1 ? (
-                    <td
-                      colSpan={2}
-                      className="text-right px-3 py-1.5 text-gray-400"
-                      title="Unprocessed in Evolution, so nothing is lost yet"
-                    >
-                      not invoiced yet
-                    </td>
-                  ) : (
-                    <>
-                      <td className="text-right px-2 py-1.5">{int.format(o.lost_litres)}</td>
-                      <td className="text-right px-3 py-1.5">{fmtMetric(o.lost_excl, "excl")}</td>
-                    </>
-                  )}
-                </tr>
-              ))
-            : n.children.map(renderNode))}
+        {isOpen && (isLeaf ? n.orders.map((o) => orderRow(o, levels.length)) : n.children.map(renderNode))}
       </Fragment>
     );
   };
+
+  const orderRow = (o: OrderIntakeOrder, depth: number) => (
+    <tr key={o.order_no} className="border-b bg-white hover:bg-blue-50/40">
+      <td className="py-1.5 pr-2" style={{ paddingLeft: 12 + depth * 18 + 4 }}>
+        <button className="text-blue-700 hover:underline" onClick={() => setViewing(o.order_no)}>
+          {o.order_no}
+        </button>
+        {showCustomerOnOrder && (
+          <span className="text-gray-600" title={o.customer_name}>
+            {" "}· {o.customer_account} · {o.customer_name}
+          </span>
+        )}
+      </td>
+      <td className="px-2 py-1.5 whitespace-nowrap">
+        {multiDay ? o.created_at.replace("T", " ").slice(0, 16) : o.created_at.slice(11, 16)}
+      </td>
+      <td className="px-2 py-1.5">{o.user}</td>
+      <td className="px-2 py-1.5">
+        <span className="inline-flex items-center gap-1.5">
+          <Swatch color={SOURCE_COLOR[o.source]} />
+          {o.source}
+        </span>
+      </td>
+      <td className="text-right px-2 py-1.5">{int.format(o.ordered_qty)}</td>
+      <td className="text-right px-2 py-1.5">{int.format(o.ordered_litres)}</td>
+      <td className="text-right px-2 py-1.5">{fmtMetric(o.ordered_excl, "excl")}</td>
+      <td className="text-right px-2 py-1.5">{int.format(o.invoiced_litres)}</td>
+      <td className="text-right px-2 py-1.5">{fmtMetric(o.invoiced_excl, "excl")}</td>
+      {o.doc_state === 1 ? (
+        <td colSpan={2} className="text-right px-3 py-1.5 text-gray-400" title="Unprocessed in Evolution, so nothing is lost yet">
+          not invoiced yet
+        </td>
+      ) : (
+        <>
+          <td className="text-right px-2 py-1.5">{int.format(o.lost_litres)}</td>
+          <td className="text-right px-3 py-1.5">{fmtMetric(o.lost_excl, "excl")}</td>
+        </>
+      )}
+    </tr>
+  );
 
   // Same SO Assistant / Evolution split the bar's hover tooltip shows.
   const bySource = SOURCES.map((s) => {
@@ -1091,19 +1184,17 @@ function DrillModal({
   }).filter((b) => b.orders > 0);
 
   return (
-    <div className="fixed inset-0 z-40 bg-black/30 flex items-center justify-center p-4" onClick={onClose}>
-      <div
-        className="bg-white rounded shadow-lg max-w-[90rem] w-full max-h-[85vh] flex flex-col overflow-hidden"
-        onClick={(e) => e.stopPropagation()}
-      >
-        <div className="px-4 py-3 border-b bg-gray-50 flex items-center justify-between">
-          <div>
-            <div className="text-xs text-gray-500 uppercase tracking-wide">Orders</div>
-            <div className="text-sm font-semibold text-gray-900">{title}</div>
-          </div>
-          <button onClick={onClose} className="text-gray-400 hover:text-gray-700" aria-label="Close">
-            <X className="w-5 h-5" />
-          </button>
+    <div className="max-w-[1600px] mx-auto w-full flex-1 min-h-0 flex flex-col gap-2">
+      <div className="flex items-center flex-shrink-0">
+        <button onClick={onClose} className="flex items-center gap-1 text-xs text-blue-600 hover:text-blue-800">
+          <ArrowLeft className="w-3.5 h-3.5" />
+          Back to Order Intake
+        </button>
+      </div>
+      <div className="bg-white rounded border shadow-sm flex-1 min-h-0 flex flex-col overflow-hidden">
+        <div className="px-4 py-3 border-b bg-gray-50">
+          <div className="text-xs text-gray-500 uppercase tracking-wide">Orders · {fmtRange(from, to)}</div>
+          <div className="text-sm font-semibold text-gray-900">{title}</div>
         </div>
         {orders && multiDay && (
           <div className="px-4 py-2 border-b flex flex-wrap items-center gap-1.5 text-xs">
@@ -1174,7 +1265,7 @@ function DrillModal({
           </div>
         )}
         {orders && orders.length > 0 && (
-          <div className="px-4 py-1.5 border-b flex items-center gap-3 text-xs">
+          <div className="px-4 py-1.5 border-b flex items-center gap-3 text-xs flex-wrap">
             <Segmented
               small
               options={[
@@ -1190,16 +1281,20 @@ function DrillModal({
             <button type="button" className="text-blue-700 hover:underline" onClick={() => setOpen(new Set())}>
               Collapse all
             </button>
+            <span className="w-px h-4 bg-gray-200" />
+            <LevelPicker levels={levels} onChange={setLevels} />
           </div>
         )}
-        <div className="overflow-auto">
+        <div className="flex-1 min-h-0 overflow-auto">
           {error && <div className="p-3 text-xs text-red-700">{error}</div>}
           {!orders && !error && <div className="p-6 text-center text-sm text-gray-400">Loading…</div>}
           {orders && (
             <table className="w-full text-xs tabular-nums">
               <thead className="sticky top-0 bg-white z-10">
                 <tr className="text-gray-500 border-b">
-                  <th className="text-left font-medium px-3 py-1.5">DC / route / group / customer / order</th>
+                  <th className="text-left font-medium px-3 py-1.5">
+                    {[...levels.map((k) => LEVEL_DEFS[k].name), "Order"].join(" / ")}
+                  </th>
                   <th className="text-left font-medium px-2 py-1.5">Captured</th>
                   <th className="text-left font-medium px-2 py-1.5">Agent</th>
                   <th className="text-left font-medium px-2 py-1.5">Source</th>
@@ -1213,7 +1308,7 @@ function DrillModal({
                 </tr>
               </thead>
               <tbody>
-                {tree.map(renderNode)}
+                {levels.length === 0 ? shown.map((o) => orderRow(o, 0)) : tree.map(renderNode)}
                 {shown.length === 0 && (
                   <tr><td colSpan={11} className="p-6 text-center text-gray-400">
                     {orders.length === 0

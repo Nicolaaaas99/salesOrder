@@ -80,6 +80,14 @@ ALLOWED_INTERVAL_FILES = {
     # indexed status column of the tiny _tb_SOImportReview table, every 2 min
     # while visible + single in-flight — reviewed 2026-11-10.
     "frontend/src/utils/usePendingReviewCount.ts",
+    # "Still here" ping for Users & Roles presence, every 60 s while
+    # visible + single in-flight. Server stamps memory only, no DB —
+    # reviewed 2026-11-12.
+    "frontend/src/utils/useHeartbeat.ts",
+    # Users & Roles presence list, every 60 s while the screen is open and
+    # visible + single in-flight. Memory-only on the server (one tiny role
+    # lookup for supervisors) — reviewed 2026-11-12.
+    "frontend/src/components/AdminUsersScreen.tsx",
 }
 
 # Raw window "focus" listeners. New code must use useFocusRefresh (throttled).

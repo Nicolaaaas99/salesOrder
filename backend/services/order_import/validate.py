@@ -26,16 +26,21 @@ from services.order_import.models import (
     ImportTotals,
     ImportValidation,
     ItemMapping,
+    OurPackRequest,
+    PackFix,
+    PackFixRequest,
     PriceChoice,
     StoreMatch,
 )
-from services.order_import.parsers import ParsedOrder
+from services.order_import.parsers import ParsedLine, ParsedOrder
 from services.pricing import cents as _cents
 from services.pricing import inclusive_unit_price, resolve_customer_prices
 
 logger = logging.getLogger(__name__)
 
 MAP_TABLE = "[SOAssistant].dbo._tb_SOCustomerItemMap"
+PACK_FIX_TABLE = "[SOAssistant].dbo._tb_SOImportPackFix"
+PACK_AUDIT_TABLE = "[SOAssistant].dbo._tb_SOPackSizeAudit"
 
 # Unit price tolerance. The order is saved tax-INCLUSIVE, so the incl unit
 # price is what the customer is charged — it must agree with the PO to the
@@ -256,6 +261,7 @@ def _stock_info(db: Session, codes: List[str]) -> Dict[str, dict]:
                    MAX(StockDesc)                                             AS description,
                    MAX(CAST(IsWhseItem AS int))                               AS is_whse_item,
                    MAX(DefaultTaxTypeId)                                      AS tax_type_id,
+                   MAX(PackSize)                                              AS pack_size,
                    STRING_AGG(WhseCode, ',') WITHIN GROUP (ORDER BY WhseCode) AS warehouse_codes
             FROM [SOAssistant].dbo._vw_SOInventory
             WHERE StockCode IN :codes
@@ -271,11 +277,179 @@ def _stock_info(db: Session, codes: List[str]) -> Dict[str, dict]:
             "description": r["description"] or "",
             "is_whse_item": bool(r["is_whse_item"]),
             "tax_type_id": int(r["tax_type_id"]) if r["tax_type_id"] else None,
+            "pack_size": pack_int(r.get("pack_size")),
             "warehouse_codes": [
                 _norm(c) for c in (r["warehouse_codes"] or "").split(",") if c
             ],
         }
     return out
+
+
+def pack_int(value) -> int:
+    """Our pack size from StkItem.ulIIPerCrate, a VARCHAR that can be NULL,
+    '' or '0': anything that isn't a whole number above 0 is 1 (no pack),
+    the same as the item picker / Order Assistant read it."""
+    try:
+        n = int(float(str(value).strip()))
+    except (TypeError, ValueError):
+        return 1
+    return n if n > 0 else 1
+
+
+# ---------------------------------------------------------------------------
+# Pack sizes
+# ---------------------------------------------------------------------------
+
+def load_pack_fixes(db: Session, scope: str) -> List[PackFix]:
+    """Supervisors' decisions on the retailer's pack sizes. Before the table
+    exists (create_views.sql not run yet) imports carry on without them."""
+    try:
+        rows = db.execute(
+            text(
+                f"""
+                SELECT idPackFix, cScope, cCustCode, cCustItemCode, fDocPack, fPack
+                FROM {PACK_FIX_TABLE}
+                WHERE cScope = :scope
+                """
+            ),
+            {"scope": scope},
+        ).mappings().all()
+    except Exception:
+        logger.warning("order-import: pack fixes unavailable (run create_views.sql)", exc_info=True)
+        db.rollback()
+        return []
+    return [
+        PackFix(
+            id=int(r["idPackFix"]), scope=r["cScope"],
+            supplier_code=r["cCustCode"] or "", item_code=r["cCustItemCode"] or "",
+            doc_pack=float(r["fDocPack"]), pack=float(r["fPack"]),
+        )
+        for r in rows
+    ]
+
+
+def find_pack_fix(fixes: List[PackFix], pl: ParsedLine) -> Optional[PackFix]:
+    """The decision for this item of theirs, while the PO still prints the
+    same pack it was made for (a retailer that fixes its setup no longer
+    matches)."""
+    sc, ic = _norm(pl.supplier_code), _norm(pl.item_code)
+    printed = pl.pack_size or 1.0
+    for f in fixes:
+        if (_norm(f.supplier_code) == sc and _norm(f.item_code) == ic
+                and abs(f.doc_pack - printed) < 1e-6):
+            return f
+    return None
+
+
+def apply_pack(pl: ParsedLine, pack: float) -> ParsedLine:
+    """Read the line again with another pack size: units = packs x pack,
+    unit prices = the PO's line amounts / units (the line amounts are what
+    the retailer will pay, whichever pack is right)."""
+    packs = pl.pack_qty if pl.pack_qty is not None else pl.qty
+    units = round(packs * pack, 4)
+    upd = {
+        "qty": units,
+        "pack_size": pack if pack != 1 else None,
+        "pack_qty": packs if pack != 1 else None,
+    }
+    if units:
+        if pl.line_excl:
+            upd["unit_excl"] = round(pl.line_excl / units, 4)
+        if pl.line_incl:
+            upd["unit_incl"] = round(pl.line_incl / units, 4)
+    return pl.model_copy(update=upd)
+
+
+def upsert_pack_fix(
+    db: Session, scope: str, req: PackFixRequest, username: str
+) -> int:
+    params = {
+        "scope": scope,
+        "code": (req.supplier_code or "").strip()[:40],
+        "item": (req.item_code or "").strip()[:40],
+        "doc": round(req.doc_pack, 2),
+        "pack": round(req.pack, 2),
+        "descr": (req.description or "").strip()[:200] or None,
+        "stock": (req.stock_code or "").strip()[:20] or None,
+        "acct": (req.customer_account or "").strip()[:20] or None,
+        "user": username[:50],
+    }
+    existing = db.execute(
+        text(
+            f"SELECT idPackFix FROM {PACK_FIX_TABLE} "
+            "WHERE cScope = :scope AND cCustCode = :code AND cCustItemCode = :item "
+            "AND fDocPack = :doc"
+        ),
+        params,
+    ).mappings().first()
+    if existing:
+        db.execute(
+            text(
+                f"""
+                UPDATE {PACK_FIX_TABLE}
+                SET fPack = :pack, cCustDescription = :descr, cStockCode = :stock,
+                    cCustomerAccount = :acct, cUpdatedBy = :user, dtUpdatedAt = sysdatetime()
+                WHERE idPackFix = :id
+                """
+            ),
+            {**params, "id": existing["idPackFix"]},
+        )
+        return int(existing["idPackFix"])
+    row = db.execute(
+        text(
+            f"""
+            INSERT INTO {PACK_FIX_TABLE}
+                (cScope, cCustCode, cCustItemCode, fDocPack, fPack, cCustDescription,
+                 cStockCode, cCustomerAccount, cCreatedBy)
+            OUTPUT INSERTED.idPackFix
+            VALUES (:scope, :code, :item, :doc, :pack, :descr, :stock, :acct, :user)
+            """
+        ),
+        params,
+    ).first()
+    return int(row[0])
+
+
+def delete_pack_fix(db: Session, fix_id: int) -> bool:
+    res = db.execute(
+        text(f"DELETE FROM {PACK_FIX_TABLE} WHERE idPackFix = :id"), {"id": fix_id}
+    )
+    return (res.rowcount or 0) > 0
+
+
+def set_our_pack(db: Session, req: OurPackRequest, username: str) -> Optional[str]:
+    """Set StkItem.ulIIPerCrate (OUR pack size) in Evolution and log it in
+    _tb_SOPackSizeAudit. Returns the old value; raises LookupError when the
+    stock code doesn't exist. The caller commits (both writes or neither)."""
+    code = req.stock_code.strip()
+    rows = db.execute(
+        text("SELECT Code, ulIIPerCrate FROM dbo.StkItem WHERE Code = :code"),
+        {"code": code},
+    ).mappings().all()
+    if len(rows) != 1:
+        raise LookupError(code)
+    old = rows[0]["ulIIPerCrate"]
+    db.execute(
+        text("UPDATE dbo.StkItem SET ulIIPerCrate = :pack WHERE Code = :code"),
+        {"pack": str(int(req.pack)), "code": rows[0]["Code"]},
+    )
+    db.execute(
+        text(
+            f"""
+            INSERT INTO {PACK_AUDIT_TABLE}
+                (cStockCode, cOldPack, cNewPack, cChangedBy, cCustomerAccount, cPoNumber, cNote)
+            VALUES (:code, :old, :new, :user, :acct, :po, :note)
+            """
+        ),
+        {
+            "code": rows[0]["Code"].strip(), "old": None if old is None else str(old)[:50],
+            "new": str(int(req.pack)), "user": username[:50],
+            "acct": (req.customer_account or "").strip()[:20] or None,
+            "po": (req.po_number or "").strip()[:50] or None,
+            "note": (req.note or "").strip()[:400] or None,
+        },
+    )
+    return None if old is None else str(old)
 
 
 def _tax_rates(db: Session, ids: List[int]) -> Dict[int, float]:
@@ -520,15 +694,21 @@ def validate_import(
     # -- lines -----------------------------------------------------------------
     scope = mapping_scope(customer)
     mappings = load_mappings(db, scope)
+    pack_fixes = load_pack_fixes(db, scope)
 
-    resolved: List[tuple] = []   # (parsed line, mapping or None, candidate code)
+    # (parsed line, mapping or None, candidate code, pack fix or None, printed line)
+    resolved: List[tuple] = []
     for pl in doc.lines:
         m = find_mapping(mappings, pl.supplier_code, pl.item_code)
         candidate = m.stock_code if m else (pl.supplier_code or "").strip()
-        resolved.append((pl, m, candidate))
+        printed = pl
+        fix = find_pack_fix(pack_fixes, pl)
+        if fix and abs(fix.pack - (pl.pack_size or 1)) > 1e-6:
+            pl = apply_pack(pl, fix.pack)       # their pack is wrong: re-read it
+        resolved.append((pl, m, candidate, fix, printed))
 
-    stock = _stock_info(db, [c for _, _, c in resolved])
-    found_codes = [stock[_norm(c)]["code"] for _, _, c in resolved if _norm(c) in stock]
+    stock = _stock_info(db, [r[2] for r in resolved])
+    found_codes = [stock[_norm(r[2])]["code"] for r in resolved if _norm(r[2]) in stock]
     prices = (
         resolve_customer_prices(
             db, customer["account"], found_codes,
@@ -542,7 +722,7 @@ def validate_import(
 
     whse_norm = _norm(warehouse_code)
     lines: List[ImportLineResult] = []
-    for pl, m, candidate in resolved:
+    for pl, m, candidate, fix, printed in resolved:
         lr = ImportLineResult(
             line_no=pl.line_no,
             supplier_code=pl.supplier_code,
@@ -559,6 +739,13 @@ def validate_import(
             barcode=pl.barcode,
             mapping_id=m.id if m else None,
         )
+        if fix:
+            lr.pack_fix_id = fix.id
+            lr.pack_fix = (
+                "ACCEPTED" if abs(fix.pack - (printed.pack_size or 1)) < 1e-6 else "CORRECTED"
+            )
+            lr.doc_pack_printed = printed.pack_size or 1.0
+            lr.doc_qty_printed = printed.qty
         line_issues: List[str] = []
         status = "OK"
 
@@ -637,6 +824,57 @@ def validate_import(
                 )
             lr.warehouse_code = warehouse_code
 
+        # -- pack size: theirs vs ours ----------------------------------------
+        # (_stock_info always gives a pack size, 1 when ulIIPerCrate is blank.)
+        # When the PO's case isn't our crate, the units are rounded DOWN to
+        # whole crates of ours (4 x 10 = 40 -> 36 at 6): we never send more
+        # than was ordered. Flagged, not blocking, unless nothing is left.
+        qty = pl.qty
+        our_pack = info.get("pack_size")
+        lr.our_pack_size = our_pack
+        doc_pack = pl.pack_size or 1.0
+        if our_pack is None:
+            pass
+        elif doc_pack > 1 and abs(doc_pack - our_pack) > 1e-6:
+            lr.pack_conflict = True
+            if our_pack > 1:
+                rounded = math.floor(qty / our_pack + 1e-9) * our_pack
+                if abs(rounded - qty) > 1e-6:
+                    lr.qty_before_pack = qty
+                    qty = float(rounded)
+                    lr.qty = qty
+                if qty <= 0:
+                    lr.pack_blocks = True
+                    if status == "OK":
+                        status = "PACK_MISMATCH"
+                    line_issues.append(
+                        f"The PO packs {doc_pack:g} per case and orders {pl.qty:g} units; "
+                        f"our crate is {our_pack}, so rounding down leaves nothing. "
+                        "Fix the pack size in Evolution (or capture this line manually), then re-check."
+                    )
+                elif lr.qty_before_pack is not None:
+                    lr.notes = lr.notes + [
+                        f"The PO packs {doc_pack:g} per case; ours is {our_pack}. "
+                        f"{pl.qty:g} units rounded down to {qty:g} "
+                        f"({qty / our_pack:g} crates of {our_pack})."
+                    ]
+                else:
+                    lr.notes = lr.notes + [
+                        f"The PO packs {doc_pack:g} per case; ours is {our_pack}. "
+                        f"{qty:g} units is whole crates of ours: nothing rounded."
+                    ]
+            else:
+                lr.notes = lr.notes + [
+                    f"The PO packs {doc_pack:g} per case; our pack size isn't set "
+                    "in Evolution, so the units aren't rounded."
+                ]
+        elif our_pack > 1 and abs(qty / our_pack - round(qty / our_pack)) > 1e-6:
+            lr.off_pack = True
+            lr.notes = lr.notes + [
+                f"{qty:g} units isn't a whole number of our crates of {our_pack}: "
+                "the order will show off-pack."
+            ]
+
         price = prices_by_norm.get(_norm(info["code"]))
         if price is None:
             if status == "OK":
@@ -661,7 +899,7 @@ def validate_import(
             )
             lr.unit_incl = charged_incl
             rate = lr.tax_rate or 0
-            lr.line_incl = _cents(pl.qty * charged_incl)
+            lr.line_incl = _cents(qty * charged_incl)
             lr.line_excl = _cents(lr.line_incl / (1 + rate / 100)) if rate else lr.line_incl
             lr.line_tax = round(lr.line_incl - lr.line_excl, 2)
             if price_problem:
@@ -731,18 +969,49 @@ def validate_import(
             if l.unit_incl is not None and not l.excluded
             and abs(l.unit_incl - _po_unit(l.doc_unit_incl)) > PRICE_TOL_INCL + 1e-6
         ), 2),
+        # Their pack corrected (units re-read) and units rounded down to our
+        # crates: both move the PO's qty total.
+        pack_adjust_qty=round(sum(
+            (l.qty_before_pack if l.qty_before_pack is not None else l.qty) - l.doc_qty_printed
+            for l in lines
+            if l.pack_fix == "CORRECTED" and l.doc_qty_printed is not None
+        ) + sum(
+            l.qty - l.qty_before_pack for l in lines if l.qty_before_pack is not None
+        ), 4),
+        pack_round_incl=round(sum(
+            _cents(l.qty * l.doc_unit_incl) - l.doc_line_incl
+            for l in lines
+            if l.qty_before_pack is not None and l.unit_incl is not None and not l.excluded
+        ), 2),
         rounding_incl=round(sum(
-            l.line_incl - (l.doc_line_incl if l.doc_line_incl else _cents(l.qty * l.doc_unit_incl))
+            l.line_incl - (
+                l.doc_line_incl if l.doc_line_incl and l.qty_before_pack is None
+                else _cents(l.qty * l.doc_unit_incl)
+            )
             for l in lines
             if l.unit_incl is not None and not l.excluded
             and abs(l.unit_incl - _po_unit(l.doc_unit_incl)) <= PRICE_TOL_INCL + 1e-6
         ), 2),
     )
 
-    if doc.total_incl is not None:
-        # Excl-only layouts (OK Foods) are checked on excl: the lines carry
-        # no incl until they're matched to an item's VAT.
-        by_excl = any(l.prices_excl for l in doc.lines) and doc.total_excl is not None
+    by_excl = any(l.prices_excl for l in doc.lines) and doc.total_excl is not None
+    doc_total_incl = doc.total_incl
+    if doc_total_incl is None and by_excl and lines and all(
+        # Every line matched to an item (so its incl is known).
+        l.doc_line_incl > 0 or not l.doc_line_excl for l in lines
+    ):
+        # Excl-only PO with no VAT or incl total (Spar): its incl is the sum
+        # of its lines' incl, each worked out from the item's VAT. The excl
+        # total (parse check below) still proves every line was read.
+        doc_total_incl = round(sum(l.doc_line_incl for l in lines), 2)
+        totals.doc_incl = doc_total_incl
+        totals.doc_incl_from_lines = True
+
+    parse_ok = False
+    if by_excl or doc_total_incl is not None:
+        # Excl-only layouts (OK Foods, Spar) are checked on excl: the lines
+        # carry no incl until they're matched to an item's VAT. Checked even
+        # before every line is mapped, so a missed line shows up at once.
         read, printed = (
             (totals.parsed_excl, doc.total_excl) if by_excl
             else (totals.parsed_incl, doc.total_incl)
@@ -759,15 +1028,18 @@ def validate_import(
                         f"R{printed:,.2f}{' excl' if by_excl else ''}). Some lines may not "
                         "have been read. Capture this order manually.",
             ))
+
+    if doc_total_incl is not None:
         # Compare with the PO total less crates and adjusted for lines not
         # charged at the PO price.
         totals.expected_incl = round(
-            doc.total_incl - totals.excluded_incl + totals.price_adjust_incl
-            + totals.rounding_incl, 2
+            doc_total_incl - totals.excluded_incl + totals.pack_round_incl
+            + totals.price_adjust_incl + totals.rounding_incl, 2
         )
         totals.difference_incl = round(totals.order_incl - totals.expected_incl, 2)
         qty_ok = doc.total_qty is None or abs(
-            totals.order_qty - (doc.total_qty - totals.excluded_qty)
+            totals.order_qty
+            - (doc.total_qty - totals.excluded_qty + totals.pack_adjust_qty)
         ) < 0.001
         totals.agrees = (
             parse_ok and qty_ok and abs(totals.difference_incl) <= tolerance
@@ -779,8 +1051,8 @@ def validate_import(
                 code="TOTAL_MISMATCH",
                 message=f"Order total R{totals.order_incl:,.2f} incl does not agree with "
                         f"the purchase order's R{totals.expected_incl:,.2f} "
-                        + ("(after crates, price differences and rounding) "
-                           if totals.expected_incl != doc.total_incl else "")
+                        + ("(after crates, pack rounding, price differences and rounding) "
+                           if totals.expected_incl != doc_total_incl else "")
                         + 
                         f"(difference R{totals.difference_incl:,.2f}, "
                         f"tolerance R{tolerance:,.2f}).",
@@ -793,8 +1065,12 @@ def validate_import(
         and not bad_lines
         and not any(i.blocking for i in issues)
     )
-    # Only price lines stand in the way: the agent may hand it to a supervisor.
-    review_lines = [l for l in lines if l.needs_review and l.price_override is None]
+    # Only price lines stand in the way: the agent may hand it to
+    # a supervisor.
+    review_lines = [
+        l for l in lines
+        if l.needs_review and l.price_override is None
+    ]
     can_submit_review = (
         not can_create
         and bool(review_lines)

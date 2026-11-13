@@ -54,7 +54,7 @@ export function AnalyticsScreen({ onOpenOrder }: Props = {}) {
   if (view === "performance" && TARGETS_FEATURE_ENABLED) {
     return <PerformanceScreen onBack={backToHub} />;
   }
-  if (view === "admin-users" && isAdmin) {
+  if (view === "admin-users" && isSupervisorPlus) {
     return <AdminUsersScreen onBack={backToHub} />;
   }
   if (canManage && (view === "targets" || view === "inbox" || view === "models")) {
@@ -136,12 +136,16 @@ export function AnalyticsScreen({ onOpenOrder }: Props = {}) {
               />
             </>
           )}
-          {isAdmin && (
+          {isSupervisorPlus && (
             <HubCard
               icon={<Shield className="w-6 h-6" />}
               iconClass="bg-purple-100 text-purple-700"
               title="Users & Roles"
-              description="Add agents, set roles, deactivate access."
+              description={
+                isAdmin
+                  ? "Add agents, set roles and warehouses, see who is online."
+                  : "Set agents' warehouses, see who is online."
+              }
               onClick={() => setView("admin-users")}
             />
           )}

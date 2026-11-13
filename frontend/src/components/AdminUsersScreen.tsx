@@ -1,14 +1,19 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { api } from "../api/client";
+import type { Warehouse } from "../api/types";
+import { shortWarehouse } from "../utils/warehouse";
 import { ArrowLeft, Loader2, Plus, Shield, UserCheck, UserX, XCircle } from "lucide-react";
-import { adminApi, type AdminUserRow } from "../api/client";
+import { adminApi, type AdminUserRow, type UserPresence } from "../api/client";
 import type { AppUserRole } from "../api/client";
 import { useAuth } from "../context/AuthContext";
 
-/** Analytics → Users & Roles. ADMIN only. Lists every active
- *  Evolution agent with their current role (if any) and lets the
- *  admin add + change + deactivate. The backend enforces ADMIN role
- *  separately so a non-admin hitting these endpoints 403s even if the
- *  frontend hides the entrypoint. */
+/** Analytics → Users & Roles.
+ *  ADMIN: every active Evolution agent with their role (if any); add,
+ *  change role / warehouse, deactivate.
+ *  SUPERVISOR: registered agents and supervisors only (no admins), and the
+ *  only change they can make is an AGENT's warehouse.
+ *  Both see who is signed in right now (Status column, refreshed every
+ *  60 s). The backend enforces all of this independently. */
 
 type Props = {
   onBack?: () => void;
@@ -43,11 +48,12 @@ function fmtDate(iso: string): string {
 type Filter = "all" | "registered" | "unregistered" | "inactive";
 
 export function AdminUsersScreen({ onBack }: Props = {}) {
-  const { agentId: myAgentId } = useAuth();
+  const { agentId: myAgentId, role: myRole } = useAuth();
+  const isAdmin = myRole === "ADMIN";
   const [rows, setRows] = useState<AdminUserRow[] | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [filter, setFilter] = useState<Filter>("all");
+  const [filter, setFilter] = useState<Filter>("registered");
   const [search, setSearch] = useState("");
   // Set of agent_ids currently waiting on a server request — used to
   // disable controls so the user can't double-click into inconsistent
@@ -72,6 +78,37 @@ export function AdminUsersScreen({ onBack }: Props = {}) {
   useEffect(() => {
     refetch();
   }, [refetch]);
+
+  // Who is signed in right now. Memory-only on the server; refreshed every
+  // 60 s while this screen is visible, one request at a time.
+  const [presence, setPresence] = useState<Map<string, UserPresence>>(new Map());
+  useEffect(() => {
+    let inFlight = false;
+    const load = () => {
+      if (inFlight || document.visibilityState !== "visible") return;
+      inFlight = true;
+      adminApi
+        .listPresence()
+        .then((list) => setPresence(new Map(list.map((p) => [p.username.trim().toLowerCase(), p]))))
+        .catch(() => {})
+        .finally(() => {
+          inFlight = false;
+        });
+    };
+    load();
+    const id = window.setInterval(load, 60_000);
+    return () => window.clearInterval(id);
+  }, []);
+  const onlineCount = useMemo(
+    () => (rows ?? []).filter((r) => presence.get(r.agent_name.toLowerCase())?.online).length,
+    [rows, presence],
+  );
+
+  // The DC warehouses an admin can assign (MAK / POL).
+  const [warehouses, setWarehouses] = useState<Warehouse[]>([]);
+  useEffect(() => {
+    api.listDefaultWarehouseChoices().then(setWarehouses).catch(() => setWarehouses([]));
+  }, []);
 
   const filtered = useMemo(() => {
     if (!rows) return [];
@@ -129,6 +166,22 @@ export function AdminUsersScreen({ onBack }: Props = {}) {
     }
   };
 
+  // Default warehouse lives on the Evolution agent record. The only way an
+  // AGENT's warehouse changes (they can't change it themselves).
+  const handleWarehouseChange = async (row: AdminUserRow, code: string) => {
+    if (!row.app_user_id || !code || code === row.default_warehouse_code) return;
+    markPending(row.agent_id, true);
+    setError(null);
+    try {
+      const updated = await adminApi.updateUser(row.app_user_id, { default_warehouse_code: code });
+      setRows((prev) => prev?.map((r) => (r.agent_id === row.agent_id ? updated : r)) ?? null);
+    } catch (e: any) {
+      setError(e?.response?.data?.detail ?? e?.message ?? "Warehouse update failed.");
+    } finally {
+      markPending(row.agent_id, false);
+    }
+  };
+
   const handleActiveToggle = async (row: AdminUserRow, nextActive: boolean) => {
     if (!row.app_user_id) return;
     markPending(row.agent_id, true);
@@ -163,9 +216,13 @@ export function AdminUsersScreen({ onBack }: Props = {}) {
         <div className="flex items-center gap-2 flex-wrap flex-shrink-0 bg-white rounded border p-2 shadow-sm">
           <Shield className="w-4 h-4 text-purple-600" />
           <div className="text-sm font-semibold text-gray-900">Users &amp; Roles</div>
+          <span className="inline-flex items-center gap-1 text-xs text-gray-600" title="Active in the app in the last ~2.5 minutes">
+            <span className="w-2 h-2 rounded-full bg-emerald-500" />
+            {onlineCount} online now
+          </span>
           <div className="flex-1" />
           <div className="inline-flex rounded border border-gray-300 overflow-hidden text-xs">
-            {(["all", "registered", "unregistered", "inactive"] as Filter[]).map((k, i) => (
+            {((isAdmin ? ["registered", "all", "unregistered", "inactive"] : ["registered", "inactive"]) as Filter[]).map((k, i) => (
               <button
                 key={k}
                 onClick={() => setFilter(k)}
@@ -211,8 +268,15 @@ export function AdminUsersScreen({ onBack }: Props = {}) {
                 <thead className="bg-gray-100 sticky top-0 z-10">
                   <tr className="text-gray-700 border-b border-gray-300">
                     <th className="text-left px-2 py-1.5 font-semibold whitespace-nowrap">Agent</th>
+                    <th className="text-left px-2 py-1.5 font-semibold whitespace-nowrap">Status</th>
                     <th className="text-left px-2 py-1.5 font-semibold whitespace-nowrap">Description</th>
                     <th className="text-left px-2 py-1.5 font-semibold whitespace-nowrap">Role</th>
+                    <th
+                      className="text-left px-2 py-1.5 font-semibold whitespace-nowrap"
+                      title="The warehouse their orders are captured from. Agents can't change their own; supervisors and admins can switch theirs in the top bar."
+                    >
+                      Warehouse
+                    </th>
                     <th className="text-left px-2 py-1.5 font-semibold whitespace-nowrap">Active</th>
                     <th className="text-left px-2 py-1.5 font-semibold whitespace-nowrap">Registered</th>
                     <th className="w-56"></th>
@@ -224,12 +288,16 @@ export function AdminUsersScreen({ onBack }: Props = {}) {
                       key={r.agent_id}
                       row={r}
                       isSelf={myAgentId != null && r.agent_id === myAgentId}
+                      isAdmin={isAdmin}
+                      presence={presence.get(r.agent_name.toLowerCase())}
                       isPending={pending.has(r.agent_id)}
                       isAdding={addingAgent === r.agent_id}
                       onStartAdd={() => setAddingAgent(r.agent_id)}
                       onCancelAdd={() => setAddingAgent(null)}
                       onAdd={(role) => handleAdd(r.agent_id, role)}
                       onRoleChange={(role) => handleRoleChange(r, role)}
+                      warehouses={warehouses}
+                      onWarehouseChange={(code) => handleWarehouseChange(r, code)}
                       onActiveToggle={(active) => handleActiveToggle(r, active)}
                     />
                   ))}
@@ -246,27 +314,37 @@ export function AdminUsersScreen({ onBack }: Props = {}) {
 function UserRow({
   row,
   isSelf,
+  isAdmin,
+  presence,
   isPending,
   isAdding,
   onStartAdd,
   onCancelAdd,
   onAdd,
   onRoleChange,
+  warehouses,
+  onWarehouseChange,
   onActiveToggle,
 }: {
   row: AdminUserRow;
   isSelf: boolean;
+  /** Viewer is an ADMIN; a SUPERVISOR may only change an AGENT's warehouse. */
+  isAdmin: boolean;
+  presence?: UserPresence;
   isPending: boolean;
   isAdding: boolean;
   onStartAdd: () => void;
   onCancelAdd: () => void;
   onAdd: (role: AppUserRole) => void;
   onRoleChange: (role: AppUserRole) => void;
+  warehouses: Warehouse[];
+  onWarehouseChange: (code: string) => void;
   onActiveToggle: (active: boolean) => void;
 }) {
   const registered = row.app_user_id != null;
   const active = row.is_active ?? false;
-  const roleCellLocked = isSelf && registered;
+  const roleCellLocked = (isSelf && registered) || !isAdmin;
+  const warehouseLocked = !isAdmin && row.role !== "AGENT";
 
   return (
     <tr
@@ -282,6 +360,9 @@ function UserRow({
           </span>
         )}
       </td>
+      <td className="px-2 py-1.5 whitespace-nowrap">
+        <PresenceCell presence={presence} />
+      </td>
       <td className="px-2 py-1.5 text-gray-600 text-[11px]">{row.agent_description || "—"}</td>
       <td className="px-2 py-1.5">
         {registered && row.role ? (
@@ -292,7 +373,13 @@ function UserRow({
             className={`text-xs border rounded px-1.5 py-0.5 font-semibold ${
               ROLE_CHIP_CLASS[row.role]
             } ${isPending || roleCellLocked ? "opacity-60 cursor-not-allowed" : "cursor-pointer"}`}
-            title={roleCellLocked ? "You can't change your own role. Ask another admin." : undefined}
+            title={
+              !isAdmin
+                ? "Only an admin can change roles."
+                : roleCellLocked
+                  ? "You can't change your own role. Ask another admin."
+                  : undefined
+            }
           >
             {ROLES.map((r) => (
               <option key={r} value={r}>
@@ -306,14 +393,40 @@ function UserRow({
       </td>
       <td className="px-2 py-1.5">
         {registered ? (
+          <select
+            value={row.default_warehouse_code ?? ""}
+            disabled={isPending || warehouseLocked}
+            title={warehouseLocked ? "Supervisors can only change an agent's warehouse." : undefined}
+            onChange={(e) => onWarehouseChange(e.target.value)}
+            className={`text-xs border rounded px-1.5 py-0.5 ${
+              row.default_warehouse_code ? "bg-white" : "bg-amber-50 border-amber-300 text-amber-800"
+            } ${isPending || warehouseLocked ? "opacity-60 cursor-not-allowed" : "cursor-pointer"}`}
+          >
+            {!row.default_warehouse_code && <option value="">Not set</option>}
+            {row.default_warehouse_code &&
+              !warehouses.some((w) => w.code === row.default_warehouse_code) && (
+                <option value={row.default_warehouse_code}>{row.default_warehouse_code}</option>
+              )}
+            {warehouses.map((w) => (
+              <option key={w.code} value={w.code}>
+                {shortWarehouse(w.code)} — {w.description}
+              </option>
+            ))}
+          </select>
+        ) : (
+          <span className="text-[11px] text-gray-400">{shortWarehouse(row.default_warehouse_code) || "—"}</span>
+        )}
+      </td>
+      <td className="px-2 py-1.5">
+        {registered ? (
           <button
             onClick={() => onActiveToggle(!active)}
-            disabled={isPending || (isSelf && active)}
+            disabled={isPending || (isSelf && active) || !isAdmin}
             className={`inline-flex items-center gap-1 text-[11px] font-semibold px-2 py-0.5 rounded border ${
               active
                 ? "bg-emerald-50 text-emerald-700 border-emerald-200 hover:bg-emerald-100"
                 : "bg-gray-100 text-gray-600 border-gray-200 hover:bg-gray-200"
-            } ${isPending || (isSelf && active) ? "opacity-60 cursor-not-allowed" : ""}`}
+            } ${isPending || (isSelf && active) || !isAdmin ? "opacity-60 cursor-not-allowed" : ""}`}
             title={
               isSelf && active
                 ? "You can't deactivate yourself. Ask another admin."
@@ -335,7 +448,7 @@ function UserRow({
           : "—"}
       </td>
       <td className="px-2 py-1.5 text-right">
-        {!registered &&
+        {!registered && isAdmin &&
           (isAdding ? (
             <div className="inline-flex items-center gap-1">
               {ROLES.map((r) => (
@@ -371,5 +484,31 @@ function UserRow({
         )}
       </td>
     </tr>
+  );
+}
+
+function hhmm(iso: string): string {
+  const d = new Date(iso);
+  return isNaN(d.getTime())
+    ? ""
+    : `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+}
+
+/** Online (active in the last ~2.5 min) / Away (signed in, idle) / blank. */
+function PresenceCell({ presence }: { presence?: UserPresence }) {
+  if (!presence) return <span className="text-[11px] text-gray-300">Offline</span>;
+  const detail = `Signed in ${hhmm(presence.since)} · last active ${hhmm(presence.last_seen)}${
+    presence.sessions > 1 ? ` · ${presence.sessions} sessions` : ""
+  }`;
+  return presence.online ? (
+    <span className="inline-flex items-center gap-1 text-[11px] font-semibold text-emerald-700" title={detail}>
+      <span className="w-2 h-2 rounded-full bg-emerald-500" />
+      Online
+    </span>
+  ) : (
+    <span className="inline-flex items-center gap-1 text-[11px] text-amber-700" title={detail}>
+      <span className="w-2 h-2 rounded-full bg-amber-400" />
+      Away · {hhmm(presence.last_seen)}
+    </span>
   );
 }

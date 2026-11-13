@@ -14,6 +14,8 @@ just redirects back to the login screen on the next 401.
 """
 import secrets
 import threading
+import time
+from datetime import datetime
 from typing import Optional
 
 from fastapi import Depends, Header, HTTPException, status
@@ -25,13 +27,22 @@ from database import get_db
 
 _sessions: dict[str, str] = {}       # token -> username
 _sessions_lock = threading.Lock()
+# Presence for Users & Roles ("who is logged in"): token -> (login time,
+# last request time), both epoch seconds. Updated on every authenticated
+# request (plus the app's 60 s heartbeat) — memory only, no DB cost.
+_activity: dict[str, tuple[float, float]] = {}
+
+# Seen within this many seconds = "online"; older but still signed in = "away".
+ONLINE_WINDOW_SECONDS = 150
 
 
 def issue_token(username: str) -> str:
     """Mint a cryptographically-random token and bind it to the username."""
     token = secrets.token_urlsafe(32)
+    now = time.time()
     with _sessions_lock:
         _sessions[token] = username
+        _activity[token] = (now, now)
     return token
 
 
@@ -39,6 +50,32 @@ def revoke_token(token: str) -> None:
     """Idempotent logout."""
     with _sessions_lock:
         _sessions.pop(token, None)
+        _activity.pop(token, None)
+
+
+def presence() -> dict[str, dict]:
+    """Signed-in users, keyed by lower-cased username: when they signed in,
+    when they were last active, how many sessions, and whether that is
+    recent enough to count as online. A user who closes the browser without
+    signing out stays "away" until the backend restarts."""
+    now = time.time()
+    out: dict[str, dict] = {}
+    with _sessions_lock:
+        items = [(_sessions[t], _activity.get(t, (now, now))) for t in _sessions]
+    for username, (since, seen) in items:
+        key = (username or "").strip().lower()
+        cur = out.get(key)
+        if cur is None:
+            out[key] = {"username": username, "since": since, "last_seen": seen, "sessions": 1}
+        else:
+            cur["since"] = min(cur["since"], since)
+            cur["last_seen"] = max(cur["last_seen"], seen)
+            cur["sessions"] += 1
+    for p in out.values():
+        p["online"] = now - p["last_seen"] <= ONLINE_WINDOW_SECONDS
+        p["since"] = datetime.fromtimestamp(p["since"])
+        p["last_seen"] = datetime.fromtimestamp(p["last_seen"])
+    return out
 
 
 def _extract_bearer(authorization: Optional[str]) -> Optional[str]:
@@ -64,6 +101,9 @@ def get_current_user(authorization: Optional[str] = Header(None)) -> str:
         )
     with _sessions_lock:
         username = _sessions.get(token)
+        if username:
+            since = _activity.get(token, (time.time(), 0))[0]
+            _activity[token] = (since, time.time())
     if not username:
         raise HTTPException(
             status.HTTP_401_UNAUTHORIZED,

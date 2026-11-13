@@ -3,6 +3,7 @@ import { notifyReviewsChanged } from "../utils/usePendingReviewCount";
 import {
   AlertTriangle, CheckCircle2, FileText, FileUp, Link2, RefreshCw, Send, X,
 } from "lucide-react";
+import { confirmDialog } from "./ConfirmDialog";
 import { api } from "../api/client";
 import type {
   CustomerDetail,
@@ -52,6 +53,7 @@ const STATUS_LABEL: Record<ImportLineStatus, string> = {
   ITEM_ISSUE: "Item issue",
   NO_PRICE: "No price",
   PRICE_MISMATCH: "Needs review",
+  PACK_MISMATCH: "Pack differs",
   VAT_MISMATCH: "VAT differs",
   PARSE_ERROR: "Unreadable",
   EXCLUDED: "Not charged",
@@ -87,6 +89,116 @@ function PoNumberInput({
       <div className="text-xs text-gray-500 mt-0.5">Not on the document: type it from the e-mail</div>
     </div>
   );
+}
+
+/** The pack the PO prints for a line (before any correction); 1 = singles. */
+function printedPack(l: ImportLineResult): number {
+  return l.doc_pack_printed ?? l.doc_pack_size ?? 1;
+}
+
+/** Pack sizes are whole numbers: "10", not "10,00". */
+function fmtPack(n: number): string {
+  return Number.isInteger(n) ? String(n) : fmtNumber(n);
+}
+
+const PACK_CAPTION =
+  "mb-0.5 text-center text-[9px] font-semibold uppercase tracking-wide text-gray-500";
+
+/** One small captioned box, styled like the price boxes. */
+function PackBox({
+  caption, value, tone, title,
+}: { caption: string; value: React.ReactNode; tone: string; title?: string }) {
+  return (
+    <div title={title}>
+      <div className={PACK_CAPTION}>{caption}</div>
+      <div
+        className={`h-6 min-w-[2.5rem] px-1.5 rounded border text-xs leading-none flex items-center justify-center ${tone}`}
+      >
+        {value}
+      </div>
+    </div>
+  );
+}
+
+const TONE_PLAIN = "border-gray-200 bg-white text-gray-600";
+const TONE_BAD = "border-red-300 bg-red-50 text-red-700 font-semibold";
+const TONE_WARN = "border-amber-300 bg-amber-50 text-amber-800";
+const TONE_FIXED = "border-blue-300 bg-blue-50 text-blue-700 font-semibold";
+
+/** Units, the PO's packs x pack, and how that compares with OUR pack size
+ *  (StkItem.ulIIPerCrate): PO and Ours side by side, like the prices.
+ *  Only lines whose pack sizes don't agree can be fixed here. */
+function QtyPackCell({ line: l }: { line: ImportLineResult }) {
+  const ours = l.our_pack_size;
+  const docPack = l.doc_pack_size ?? 1;
+  const flagged = !!l.pack_conflict || l.pack_fix === "CORRECTED" || !!l.off_pack;
+
+  let poTone = TONE_PLAIN;
+  let oursTone = TONE_PLAIN;
+  if (l.pack_blocks) poTone = oursTone = TONE_BAD;
+  else if (l.pack_conflict) poTone = oursTone = TONE_WARN;
+  else if (l.pack_fix === "CORRECTED") poTone = TONE_FIXED;
+  if (!l.pack_conflict && l.off_pack) oursTone = TONE_WARN;
+
+  return (
+    <div className="flex flex-col items-end gap-1">
+      <div className="text-right">
+        {l.qty_before_pack != null ? (
+          <div
+            className="whitespace-nowrap"
+            title={`The PO orders ${fmtPack(l.qty_before_pack)} units: rounded down to whole crates of ${l.our_pack_size}`}
+          >
+            <span className="text-gray-400 line-through">{fmtNumber(l.qty_before_pack)}</span>
+            <span className="mx-1 text-gray-400">→</span>
+            <span className="font-semibold text-amber-800">{fmtNumber(l.qty)}</span>
+          </div>
+        ) : (
+          <div>{fmtNumber(l.qty)}</div>
+        )}
+        {l.doc_pack_qty != null && l.doc_pack_size != null && (
+          <div className="text-[11px] text-gray-500" title="Packs x pack size on the PO">
+            {fmtPack(l.doc_pack_qty)} × {fmtPack(l.doc_pack_size)}
+          </div>
+        )}
+      </div>
+      {flagged && (
+        <div className="flex items-end gap-1">
+          <PackBox
+            caption={l.pack_fix === "CORRECTED" ? "PO (fixed)" : "PO pack"}
+            value={
+              l.pack_fix === "CORRECTED"
+                ? <>{fmtPack(printedPack(l))}<span className="mx-0.5">→</span>{fmtPack(docPack)}</>
+                : fmtPack(docPack)
+            }
+            tone={poTone}
+            title={
+              l.pack_fix === "CORRECTED"
+                ? `The PO prints ${fmtPack(printedPack(l))}; a supervisor corrected it to ${fmtPack(docPack)}`
+                : l.pack_conflict
+                  ? `Their case is ${fmtPack(docPack)}, ours is ${ours && ours > 1 ? ours : "not set"}: the units are rounded down to whole crates of ours`
+                  : undefined
+            }
+          />
+          <PackBox
+            caption="Ours"
+            value={ours && ours > 1 ? ours : "—"}
+            tone={oursTone}
+            title={
+              l.off_pack && !l.pack_conflict
+                ? `${fmtPack(l.qty)} units isn't whole crates of ${ours}: the order will show off-pack`
+                : "Our pack size in Evolution"
+            }
+          />
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** Lines with no product code (Spar) are matched on description + size:
+ *  their item code is a fingerprint of that text, not something to show. */
+function isDescriptionKey(code: string | null | undefined): boolean {
+  return !!code && code.startsWith("D#");
 }
 
 function isoToDmy(iso: string | null | undefined): string {
@@ -305,9 +417,25 @@ export function OrderImportScreen({ onBack, reviewId = null }: Props) {
 
   async function removeMapping(line: ImportLineResult) {
     if (!customer || !doc || line.mapping_id == null) return;
-    if (!window.confirm(
-      `Remove the saved mapping ${line.supplier_code || line.item_code} → ${line.stock_code}?`,
-    )) return;
+    const theirs = line.supplier_code
+      || (isDescriptionKey(line.item_code) ? `"${line.description}"` : line.item_code);
+    const ok = await confirmDialog({
+      title: "Remove this mapping?",
+      message: (
+        <>
+          <div className="font-mono text-sm my-1">
+            {theirs} → {line.stock_code}
+          </div>
+          <div className="text-sm text-gray-600">{line.description}</div>
+          <div className="text-sm mt-2">
+            Their code stops matching our item on every PO from this group. You can map it again from this line.
+          </div>
+        </>
+      ),
+      confirmLabel: "Remove mapping",
+      tone: "danger",
+    });
+    if (!ok) return;
     setBusy("checking");
     try {
       await api.deleteImportMapping(line.mapping_id);
@@ -416,7 +544,8 @@ export function OrderImportScreen({ onBack, reviewId = null }: Props) {
   const canCreate = !!result?.can_create && datesConfirmed && !busy;
   const reviewMode = reviewId != null;
   const reviewOpen = reviewMode && review?.status === "PENDING";
-  const reviewLines = result?.lines.filter((l) => l.needs_review && l.price_override == null) ?? [];
+  const reviewLines =
+    result?.lines.filter((l) => l.needs_review && l.price_override == null) ?? [];
   // Agent: the only problem is price lines -> hand it to a supervisor.
   const canSubmit =
     !reviewMode && !!result?.can_submit_review && datesConfirmed && !busy;
@@ -701,7 +830,16 @@ export function OrderImportScreen({ onBack, reviewId = null }: Props) {
                         <td className="px-2 py-1.5 text-gray-500">{l.line_no}</td>
                         <td className="px-2 py-1.5 font-mono">
                           <div>{l.supplier_code || "—"}</div>
-                          <div className="text-gray-500">{l.item_code}</div>
+                          {isDescriptionKey(l.item_code) ? (
+                            <div
+                              className="font-sans text-[11px] text-gray-500"
+                              title="No code on the order: matched on its description and size"
+                            >
+                              by description
+                            </div>
+                          ) : (
+                            <div className="text-gray-500">{l.item_code}</div>
+                          )}
                           {/* OK Foods: the barcode IS their item code; show it once. */}
                           {l.barcode && l.barcode !== l.item_code && (
                             <div className="text-gray-400" title="Barcode">{l.barcode}</div>
@@ -797,12 +935,7 @@ export function OrderImportScreen({ onBack, reviewId = null }: Props) {
                           )}
                         </td>
                         <td className="px-2 py-1.5 text-right">
-                          {fmtNumber(l.qty)}
-                          {l.doc_pack_qty != null && l.doc_pack_size != null && (
-                            <div className="text-gray-500" title="Packs x pack size on the PO">
-                              {fmtNumber(l.doc_pack_qty)} × {fmtNumber(l.doc_pack_size)}
-                            </div>
-                          )}
+                          <QtyPackCell line={l} />
                         </td>
                         <td className="px-2 py-1.5 text-right">
                           {/* Line-total layouts (Pick n Pay) can give a fraction of a cent. */}
@@ -909,7 +1042,15 @@ export function OrderImportScreen({ onBack, reviewId = null }: Props) {
                     <td className="text-right px-3">{fmtOpt(result.totals.doc_qty, fmtNumber)}</td>
                     <td className="text-right px-3">{fmtOpt(result.totals.doc_excl, fmtCurrency)}</td>
                     <td className="text-right px-3">{fmtOpt(result.totals.doc_vat, fmtCurrency)}</td>
-                    <td className="text-right px-3">{fmtOpt(result.totals.doc_incl, fmtCurrency)}</td>
+                    <td
+                      className="text-right px-3"
+                      title={result.totals.doc_incl_from_lines
+                        ? "The order prints excl only: its incl is each line's excl plus the item's VAT"
+                        : undefined}
+                    >
+                      {fmtOpt(result.totals.doc_incl, fmtCurrency)}
+                      {result.totals.doc_incl_from_lines && <span className="text-gray-400">*</span>}
+                    </td>
                   </tr>
                   {result.totals.excluded_incl !== 0 && (
                     <tr className="text-gray-600">
@@ -918,6 +1059,26 @@ export function OrderImportScreen({ onBack, reviewId = null }: Props) {
                       <td />
                       <td />
                       <td className="text-right px-3">−{fmtCurrency(result.totals.excluded_incl)}</td>
+                    </tr>
+                  )}
+                  {(result.totals.pack_round_incl ?? 0) !== 0 && (
+                    <tr className="text-gray-600">
+                      <td
+                        className="pr-3"
+                        title="Their case size isn't ours: the units are rounded down to whole crates of ours"
+                      >
+                        Rounded down to our crates
+                      </td>
+                      <td className="text-right px-3">
+                        {fmtNumber(result.lines.reduce(
+                          (n, l) => n + (l.qty_before_pack != null ? l.qty - l.qty_before_pack : 0), 0,
+                        ))}
+                      </td>
+                      <td />
+                      <td />
+                      <td className="text-right px-3">
+                        {fmtCurrency(result.totals.pack_round_incl ?? 0)}
+                      </td>
                     </tr>
                   )}
                   {result.totals.price_adjust_incl !== 0 && (
@@ -1015,11 +1176,11 @@ export function OrderImportScreen({ onBack, reviewId = null }: Props) {
                 )
               ) : result.can_submit_review && !reviewMode ? (
                 <span className="text-amber-700">
-                  {reviewLines.length} line{reviewLines.length === 1 ? "" : "s"} differ too much
-                  from the PO price — {datesConfirmed ? "submit the order for review" : "confirm the dates, then submit for review"}
+                  {reviewLines.length} line{reviewLines.length === 1 ? "" : "s"} need a supervisor
+                  (price or pack size) — {datesConfirmed ? "submit the order for review" : "confirm the dates, then submit for review"}
                 </span>
               ) : reviewMode && reviewLines.length > 0 ? (
-                <span className="text-amber-700">Set the price on the highlighted lines</span>
+                <span className="text-amber-700">Set the price / fix the pack size on the highlighted lines</span>
               ) : (
                 <span className="text-red-700">
                   Resolve the items above before the order can be created
@@ -1097,8 +1258,8 @@ export function OrderImportScreen({ onBack, reviewId = null }: Props) {
             <h2 className="modal-title">Submit for review</h2>
             <p className="modal-body">
               A supervisor will check the {reviewLines.length} line
-              {reviewLines.length === 1 ? "" : "s"} whose PO price differs too much from ours,
-              set the prices and create the order.
+              {reviewLines.length === 1 ? "" : "s"} whose PO price differs from
+              ours, fix them and create the order.
             </p>
             <textarea
               className="input w-full"

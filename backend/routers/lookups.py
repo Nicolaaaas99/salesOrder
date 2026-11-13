@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 from auth import get_current_user, require_min_role
 from database import get_db
 import schemas
+from services.dc_warehouse import WAREHOUSE_DIST_CENTRE, warehouse_for_dist_centre
 from services.pricing import resolve_customer_prices
 
 
@@ -23,18 +24,25 @@ router = APIRouter(
 )
 
 
-# Client.ulARCorpGroup values that count as corporate. Sales Order Entry
-# may only place orders for these customers (Order Assistant is
-# unrestricted). 'OK' = OK Foods. Allowlist rather than
-# "<> 'Non Corporate'" so NULL and any group added later stay excluded
-# until someone opts them in here.
-CORPORATE_GROUPS = ("Spar", "Checkers", "Boxer", "Pick n Pay", "OK")
-
-# SQL predicate on alias CL. NULL is folded to 'Non Corporate' explicitly
-# (it would be excluded anyway, but this reads unambiguously).
+# Corporate customers: Client.ulARCorpGroup is one of the groups in
+# Evolution's user-dict dropdown for that field, except 'Non Corporate'
+# (view _vw_SOCorporateGroups). Sales Order Entry / Order Import may only
+# place orders for these customers (Order Assistant is unrestricted). A group
+# added in Evolution (e.g. 'WW' = Woolworths) counts at once. NULL / blank
+# never matches. The view is one user-dict row split on ';' (a handful of
+# rows), so the IN costs nothing next to the Client lookup.
+CORPORATE_GROUPS_VIEW = "[SOAssistant].dbo._vw_SOCorporateGroups"
 CORPORATE_GROUP_SQL = (
-    "LTRIM(RTRIM(ISNULL(CL.ulARCorpGroup, 'Non Corporate'))) IN :corp_groups"
+    f"LTRIM(RTRIM(CL.ulARCorpGroup)) IN (SELECT CorpGroup FROM {CORPORATE_GROUPS_VIEW})"
 )
+
+
+def corporate_groups(db: Session) -> List[str]:
+    """The corporate groups, for messages ("Boxer, Checkers, ...")."""
+    rows = db.execute(
+        text(f"SELECT CorpGroup FROM {CORPORATE_GROUPS_VIEW} ORDER BY CorpGroup")
+    ).all()
+    return [r[0] for r in rows if r[0]]
 
 
 def is_corporate_customer(db: Session, account: str) -> bool:
@@ -42,8 +50,8 @@ def is_corporate_customer(db: Session, account: str) -> bool:
         text(
             f"SELECT 1 FROM [BA_00_LPD_CON].dbo.Client CL "
             f"WHERE CL.Account = :account AND {CORPORATE_GROUP_SQL}"
-        ).bindparams(bindparam("corp_groups", expanding=True)),
-        {"account": (account or "").strip(), "corp_groups": list(CORPORATE_GROUPS)},
+        ),
+        {"account": (account or "").strip()},
     ).first()
     return row is not None
 
@@ -75,8 +83,9 @@ def list_customers(
         False,
         description=(
             "Only customers whose Client.ulARCorpGroup is a corporate "
-            "group (Spar / Checkers / Boxer / Pick n Pay). Used by the "
-            "Sales Order Entry customer picker."
+            "group (_vw_SOCorporateGroups: the Evolution dropdown's options "
+            "except Non Corporate). Used by the Sales Order Entry / Order "
+            "Import customer picker."
         ),
     ),
     db: Session = Depends(get_db),
@@ -118,11 +127,7 @@ def list_customers(
         "telesale": (telesale or "").strip() or None,
         "sales_rep": (sales_rep or "").strip() or None,
     }
-    stmt = text(sql)
-    if corporate_only:
-        stmt = stmt.bindparams(bindparam("corp_groups", expanding=True))
-        params["corp_groups"] = list(CORPORATE_GROUPS)
-    rows = db.execute(stmt, params).mappings().all()
+    rows = db.execute(text(sql), params).mappings().all()
     return [
         schemas.CustomerSummary(
             account=(r["account"] or "").strip(),
@@ -172,6 +177,8 @@ def _build_customer_detail(row) -> schemas.CustomerDetail:
         account=g("Account", ""),
         name=g("Name", "") or "",
         route=(g("Route", "") or "").strip(),
+        dist_centre=(g("DistCentre", "") or "").strip(),
+        dc_warehouse_code=warehouse_for_dist_centre(g("DistCentre")),
         delivery_address=_join_address(
             g("Physical1"), g("Physical2"), g("Physical3"),
             g("Physical4"), g("Physical5"), g("PhysicalPC"),
@@ -655,6 +662,98 @@ def get_customer_assignment(account: str, db: Session = Depends(get_db)):
         salesrep_code=_clean(row["salesrep_code"]),
         on_hold=bool(row["on_hold"]),
     )
+
+
+@router.patch(
+    "/customers/{account}/dist-centre",
+    response_model=schemas.CustomerDetail,
+    dependencies=[Depends(require_min_role("SUPERVISOR"))],
+)
+def update_customer_dist_centre(
+    account: str,
+    payload: schemas.CustomerDistCentreUpdate,
+    db: Session = Depends(get_db),
+    username: str = Depends(get_current_user),
+    app_version: Optional[str] = Depends(_app_version),
+):
+    """Fix a customer card's Dist Centre (Client.ulARDistCentre) from the
+    order screens' warehouse-mismatch banner, when the card is wrong and the
+    order's warehouse is right. SUPERVISOR+ only. Audited in
+    _tb_SOCustomerAssignmentAudit (route / telesales / rep / on-hold are
+    recorded unchanged, prev = new), in the same transaction as the UPDATE.
+    Returns the refreshed customer so the screen can drop the banner."""
+    new_dc = WAREHOUSE_DIST_CENTRE.get((payload.warehouse_code or "").strip().upper())
+    if not new_dc:
+        raise HTTPException(
+            400, f"Warehouse must be one of {', '.join(sorted(WAREHOUSE_DIST_CENTRE))}."
+        )
+    current = db.execute(
+        text(
+            """
+            SELECT CL.DCLink AS dclink, CL.ulARDistCentre AS prev_dc,
+                   CL.ulARRoute AS route, CL.ulARTelesalesRep AS telesale,
+                   CL.RepID AS rep_id, REP.Code AS rep_code,
+                   ISNULL(CL.On_Hold, 0) AS on_hold
+            FROM dbo.Client CL
+            LEFT JOIN dbo.SalesRep REP ON REP.idSalesRep = CL.RepID
+            WHERE CL.Account = :account
+            """
+        ),
+        {"account": account},
+    ).mappings().first()
+    if not current:
+        raise HTTPException(404, f"Customer '{account}' not found")
+
+    def _norm(v):
+        s = str(v).strip() if v is not None else ""
+        return s or None
+
+    prev_dc = _norm(current["prev_dc"])
+    if prev_dc != new_dc:
+        try:
+            db.execute(
+                text(
+                    """
+                    INSERT INTO [SOAssistant].dbo._tb_SOCustomerAssignmentAudit
+                        (iCustomerDCLink, cCustomerAccount,
+                         cPrevRoute, cNewRoute, cPrevTelesale, cNewTelesale,
+                         iPrevSalesRepId, iNewSalesRepId, cPrevSalesRepCode, cNewSalesRepCode,
+                         bPrevOnHold, bNewOnHold,
+                         cPrevDistCentre, cNewDistCentre,
+                         cUsername, cAppVersion, cNote)
+                    VALUES
+                        (:dclink, :account,
+                         :route, :route, :telesale, :telesale,
+                         :rep_id, :rep_id, :rep_code, :rep_code,
+                         :on_hold, :on_hold,
+                         :prev_dc, :new_dc,
+                         :username, :app_version, :note)
+                    """
+                ),
+                {
+                    "dclink": int(current["dclink"]),
+                    "account": account,
+                    "route": _norm(current["route"]),
+                    "telesale": _norm(current["telesale"]),
+                    "rep_id": int(current["rep_id"]) if current["rep_id"] is not None else None,
+                    "rep_code": _norm(current["rep_code"]),
+                    "on_hold": 1 if int(current["on_hold"] or 0) else 0,
+                    "prev_dc": prev_dc,
+                    "new_dc": new_dc,
+                    "username": username,
+                    "app_version": app_version,
+                    "note": "Dist Centre fixed from the order screen (warehouse mismatch)",
+                },
+            )
+            db.execute(
+                text("UPDATE dbo.Client SET ulARDistCentre = :dc WHERE DCLink = :dclink"),
+                {"dc": new_dc, "dclink": int(current["dclink"])},
+            )
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+    return get_customer(account, db)
 
 
 @router.patch(

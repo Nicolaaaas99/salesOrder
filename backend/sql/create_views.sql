@@ -11,15 +11,16 @@
  The USE + GO batches are required because CREATE/ALTER VIEW must be the
  first statement in its batch.
 
- Object list (19 views + 2 functions + 6 tables):
+ Object list (21 views + 2 functions + 6 tables):
    Views     — _vw_SOActiveDeals, _vw_SOAgentDefaultWhse, _vw_SOCustomerDetail,
                _vw_SOCustomerInvoiceHistory, _vw_SOCustomerOrdersPerDay,
                _vw_SOCustomers, _vw_SOInventory,
                _vw_SOPriceListPrices, _vw_SOProjects, _vw_SORoute,
                _vw_SORouteOptions, _vw_SOTelesaleOptions, _vw_SOSalesRep,
-               _vw_SOCategoryOptions,
+               _vw_SOCategoryOptions, _vw_SOCorporateGroups,
                _vw_SOSalesOrderConfig, _vw_SOSeasonalFactors,
-               _vw_SOSettlementTerms, _vw_SOTaxTypes, _vw_SOWarehouses
+               _vw_SOSettlementTerms, _vw_SOTaxTypes, _vw_SOWarehouses,
+               _vw_SODraftOrderLines
    Functions — _fn_SOCustomerPriceAsOf(@asOf date) — resolves deal/list price
                for a given session date; replaces the old _vw_SOCustomerPrice.
                _fn_SOOrderIntake(@from date, @to date) — one row per order
@@ -27,7 +28,7 @@
    Tables    — _tb_SOOrderAssistantAudit, _tb_SOCustomerContactLog,
                _tb_SOCustomerAssignmentAudit, _tb_SOTargets, _tb_SOAppUsers,
                _tb_SOCustomerItemMap, _tb_SOImportPriceDecision,
-               _tb_SOImportDocument, _tb_SOImportReview
+               _tb_SOImportDocument, _tb_SOImportReview, _tb_SODraftOrder
 ******************************************************************************/
 
 USE [SOAssistant];
@@ -129,8 +130,9 @@ GO
 
 -- =============================================================================
 -- 2. _vw_SOAgentDefaultWhse  (telesales agent -> default DC warehouse)
---     Filters to the two valid DCs (48 = 01.HOF_MAK, 49 = 01.HOF_POL) and
---     only active agents.
+--     Filters to the two valid DCs (48 = 01.HOF_POL, 49 = 01.HOF_MAK) and
+--     only active agents. Who may change it: services/dc_warehouse.py
+--     (AGENT fixed, set by an ADMIN; SUPERVISOR / ADMIN switch themselves).
 -- =============================================================================
 CREATE OR ALTER VIEW dbo._vw_SOAgentDefaultWhse AS
 SELECT
@@ -155,6 +157,9 @@ SELECT
     C.DCLink,
     C.Account, C.Name,
     C.ulARRoute AS Route,
+    -- The customer's DC on their card; the order screens warn when it is
+    -- not the DC the order is captured from (services/dc_warehouse.py).
+    C.ulARDistCentre AS DistCentre,
     C.Physical1, C.Physical2, C.Physical3, C.Physical4, C.Physical5, C.PhysicalPC,
     C.Post1,     C.Post2,     C.Post3,     C.Post4,     C.Post5,     C.PostPC,
     C.Contact_Person, C.Telephone, C.Telephone2, C.EMail,
@@ -543,6 +548,25 @@ WHERE cTableName = 'STKITEM'
 GO
 
 -- =============================================================================
+-- 11f. _vw_SOCorporateGroups  (the corporate groups: every option of the
+--      Evolution user-dict for Client.ulARCorpGroup except 'Non Corporate').
+--      A customer is corporate when its ulARCorpGroup is one of these: Sales
+--      Order Entry / Order Import are limited to them (routers/lookups.py,
+--      CORPORATE_GROUP_SQL). A group added to the dropdown in Evolution
+--      (e.g. 'WW' for Woolworths) counts at once, with no code change.
+--      Same STRING_SPLIT pattern as _vw_SOCategoryOptions.
+-- =============================================================================
+CREATE OR ALTER VIEW dbo._vw_SOCorporateGroups AS
+SELECT LTRIM(RTRIM(value)) AS CorpGroup
+FROM [BA_00_LPD_CON].dbo._rtblUserDict
+CROSS APPLY STRING_SPLIT(cLookupOptions, ';')
+WHERE cTableName = 'CLIENT'
+  AND cFieldName = 'ulARCorpGroup'
+  AND LTRIM(RTRIM(value)) <> ''
+  AND LTRIM(RTRIM(value)) <> 'Non Corporate';
+GO
+
+-- =============================================================================
 -- 12. _vw_SOSalesOrderConfig  (single-row tenant config)
 --     Mirrors Evolution's OrdersDf.bForceExtOrderNum so the app can read the
 --     Evolution-admin-controlled setting and force / allow blank External
@@ -831,6 +855,21 @@ IF NOT EXISTS (
 BEGIN
     ALTER TABLE [SOAssistant].dbo._tb_SOCustomerAssignmentAudit
         ADD bPrevOnHold BIT NULL, bNewOnHold BIT NULL;
+END;
+GO
+
+-- Idempotent migration: the customer card's Dist Centre before/after,
+-- for the "fix this customer's DC" action on the order screens'
+-- warehouse-mismatch banner (2026-11-12). NULL on rows that didn't
+-- touch it.
+IF NOT EXISTS (
+    SELECT 1 FROM sys.columns
+    WHERE name = 'cPrevDistCentre'
+      AND object_id = OBJECT_ID('[SOAssistant].dbo._tb_SOCustomerAssignmentAudit')
+)
+BEGIN
+    ALTER TABLE [SOAssistant].dbo._tb_SOCustomerAssignmentAudit
+        ADD cPrevDistCentre VARCHAR(100) NULL, cNewDistCentre VARCHAR(100) NULL;
 END;
 GO
 
@@ -1135,6 +1174,65 @@ END;
 GO
 
 -- -----------------------------------------------------------------------------
+-- _tb_SOImportPackFix  (Order Import: the retailer's pack size is set up
+-- wrong for one of its items). A supervisor's correction, remembered per
+-- corporate group (cScope, as for item mappings) + the customer's item
+-- (cCustCode / cCustItemCode as printed) + the pack the PO PRINTS
+-- (fDocPack). Applies only while their PO keeps printing that same pack:
+-- once the retailer fixes its setup, the row stops matching by itself.
+-- fPack: the pack to use instead; fPack = fDocPack means "both are right"
+-- (their case and our crate simply differ, accepted by a supervisor).
+-- -----------------------------------------------------------------------------
+IF OBJECT_ID('[SOAssistant].dbo._tb_SOImportPackFix', 'U') IS NULL
+BEGIN
+    CREATE TABLE [SOAssistant].dbo._tb_SOImportPackFix (
+        idPackFix         INT IDENTITY(1,1) NOT NULL,
+        cScope            VARCHAR(120)   NOT NULL,
+        cCustCode         VARCHAR(40)    NOT NULL,
+        cCustItemCode     VARCHAR(40)    NOT NULL,
+        fDocPack          DECIMAL(9,2)   NOT NULL,
+        fPack             DECIMAL(9,2)   NOT NULL,
+        cCustDescription  NVARCHAR(200)  NULL,
+        cStockCode        VARCHAR(20)    NULL,
+        cCustomerAccount  VARCHAR(20)    NULL,
+        cCreatedBy        VARCHAR(50)    NOT NULL,
+        dtCreatedAt       DATETIME2(7)   NOT NULL
+            CONSTRAINT DF_SOImportPackFix_dt DEFAULT (sysdatetime()),
+        cUpdatedBy        VARCHAR(50)    NULL,
+        dtUpdatedAt       DATETIME2(7)   NULL,
+        CONSTRAINT PK_SOImportPackFix PRIMARY KEY CLUSTERED (idPackFix),
+        CONSTRAINT UX_SOImportPackFix_Key UNIQUE (cScope, cCustCode, cCustItemCode, fDocPack),
+        CONSTRAINT CK_SOImportPackFix_Pack CHECK (fDocPack > 0 AND fPack > 0)
+    );
+END;
+GO
+
+-- -----------------------------------------------------------------------------
+-- _tb_SOPackSizeAudit  (every change the app makes to OUR pack size,
+-- StkItem.ulIIPerCrate in Evolution, from the Order Import screen).
+-- Append-only: who, when, old -> new, and the PO that prompted it.
+-- -----------------------------------------------------------------------------
+IF OBJECT_ID('[SOAssistant].dbo._tb_SOPackSizeAudit', 'U') IS NULL
+BEGIN
+    CREATE TABLE [SOAssistant].dbo._tb_SOPackSizeAudit (
+        idPackAudit       INT IDENTITY(1,1) NOT NULL,
+        cStockCode        VARCHAR(20)    NOT NULL,
+        cOldPack          VARCHAR(50)    NULL,
+        cNewPack          VARCHAR(50)    NOT NULL,
+        cChangedBy        VARCHAR(50)    NOT NULL,
+        dtChangedAt       DATETIME2(7)   NOT NULL
+            CONSTRAINT DF_SOPackSizeAudit_dt DEFAULT (sysdatetime()),
+        cCustomerAccount  VARCHAR(20)    NULL,
+        cPoNumber         VARCHAR(50)    NULL,
+        cNote             NVARCHAR(400)  NULL,
+        CONSTRAINT PK_SOPackSizeAudit PRIMARY KEY CLUSTERED (idPackAudit)
+    );
+    CREATE INDEX IX_SOPackSizeAudit_Stock
+        ON [SOAssistant].dbo._tb_SOPackSizeAudit (cStockCode, dtChangedAt DESC);
+END;
+GO
+
+-- -----------------------------------------------------------------------------
 -- _tb_SOImportPriceDecision  (Order Import: which price was charged on a
 -- purchase-order line whose PO price differs from our Evolution price).
 --
@@ -1315,6 +1413,94 @@ IF NOT EXISTS (
 )
     CREATE INDEX IX_SOImportDocument_Order
         ON [SOAssistant].dbo._tb_SOImportDocument (cOrderNum);
+GO
+
+-- -----------------------------------------------------------------------------
+-- _tb_SODraftOrder  (orders saved as a draft, to finish later).
+--
+-- Saved from the Order Assistant or Sales Order Entry; private to the agent
+-- who saved it (cUsername), one per agent per customer. cDraftJson is the
+-- screen's state (header + lines); prices are fetched again on reopen.
+-- Deleted when the order is placed, by the agent, or automatically 3 days
+-- after dtCreatedAt (purged when drafts are listed). From the next day the
+-- agent gets a pop-up to finish or delete it.
+-- -----------------------------------------------------------------------------
+IF OBJECT_ID('[SOAssistant].dbo._tb_SODraftOrder', 'U') IS NULL
+BEGIN
+    CREATE TABLE [SOAssistant].dbo._tb_SODraftOrder (
+        idDraft           INT IDENTITY(1,1) NOT NULL,
+        cUsername         VARCHAR(50)    NOT NULL,
+        cSource           VARCHAR(20)    NOT NULL,
+        cCustomerAccount  VARCHAR(50)    NOT NULL,
+        cCustomerName     NVARCHAR(100)  NULL,
+        iLines            INT            NOT NULL,
+        fTotalIncl        FLOAT          NULL,
+        cDraftJson        NVARCHAR(MAX)  NOT NULL,
+        dtCreatedAt       DATETIME2(7)   NOT NULL
+            CONSTRAINT DF_SODraftOrder_Created DEFAULT (sysdatetime()),
+        dtUpdatedAt       DATETIME2(7)   NOT NULL
+            CONSTRAINT DF_SODraftOrder_Updated DEFAULT (sysdatetime()),
+        CONSTRAINT PK_SODraftOrder PRIMARY KEY CLUSTERED (idDraft),
+        CONSTRAINT UQ_SODraftOrder_UserCustomer UNIQUE (cUsername, cCustomerAccount),
+        CONSTRAINT CK_SODraftOrder_Source
+            CHECK (cSource IN ('ORDER_ASSISTANT', 'SALES_ORDER_ENTRY'))
+    );
+    CREATE INDEX IX_SODraftOrder_Created
+        ON [SOAssistant].dbo._tb_SODraftOrder (dtCreatedAt);
+END;
+GO
+
+-- -----------------------------------------------------------------------------
+-- _vw_SODraftOrderLines  (read-only: the draft orders' lines as a table).
+--
+-- Drafts store their lines as JSON (cDraftJson, the screen's own state).
+-- This view unpacks them for ad-hoc queries; the app doesn't use it.
+-- Prices are as they were when the draft was saved: the app fetches them
+-- again when a draft is reopened. Needs compatibility level 130+ (OPENJSON).
+--   SELECT * FROM [SOAssistant].dbo._vw_SODraftOrderLines
+--   WHERE cUsername = '...' ORDER BY idDraft, iLineNo;
+-- -----------------------------------------------------------------------------
+CREATE OR ALTER VIEW dbo._vw_SODraftOrderLines AS
+SELECT
+    d.idDraft,
+    d.cUsername,
+    d.cSource,
+    d.cCustomerAccount,
+    d.cCustomerName,
+    d.dtCreatedAt,
+    d.dtUpdatedAt,
+    CAST(DATEADD(day, 3, CAST(d.dtCreatedAt AS date)) AS date)     AS dExpiresOn,
+    JSON_VALUE(d.cDraftJson, '$.header.externalOrder')              AS cPONumber,
+    TRY_CAST(JSON_VALUE(d.cDraftJson, '$.header.deliveryDate') AS date) AS dDeliveryDate,
+    CAST(l.[key] AS int) + 1                                        AS iLineNo,
+    j.cStockCode,
+    j.cItemDescription,
+    j.cDescription,
+    j.cWarehouse,
+    j.fQuantity,
+    j.iPackSize,
+    j.fPriceExclAtSave,
+    j.fPriceInclAtSave,
+    j.cPriceSource,
+    j.fDiscountPercent,
+    j.iTaxTypeId,
+    j.bNeedsConfirm
+FROM dbo._tb_SODraftOrder AS d
+CROSS APPLY OPENJSON(d.cDraftJson, '$.lines') AS l
+CROSS APPLY OPENJSON(l.[value]) WITH (
+    cStockCode        VARCHAR(20)    '$.stock_code',
+    cItemDescription  NVARCHAR(100)  '$.item_description',
+    cDescription      NVARCHAR(100)  '$.description',
+    cWarehouse        VARCHAR(20)    '$.warehouse_code',
+    fQuantity         DECIMAL(18,4)  '$.quantity',
+    iPackSize         INT            '$.pack_size',
+    fPriceExclAtSave  DECIMAL(18,4)  '$.unit_price',
+    fPriceInclAtSave  DECIMAL(18,4)  '$.unit_price_incl',
+    cPriceSource      VARCHAR(30)    '$.price_source',
+    fDiscountPercent  DECIMAL(9,4)   '$.discount_percent',
+    iTaxTypeId        INT            '$.tax_type_id',
+    bNeedsConfirm     BIT            '$.needs_confirm'
+) AS j;
 GO
 
 -- -----------------------------------------------------------------------------
@@ -1776,6 +1962,14 @@ SET @sql = N'GRANT INSERT, UPDATE ON OBJECT :: dbo._tb_SOImportDocument TO ' + Q
 EXEC sp_executesql @sql;
 SET @sql = N'GRANT INSERT, UPDATE ON OBJECT :: dbo._tb_SOImportReview TO ' + QUOTENAME(@login) + N';';
 EXEC sp_executesql @sql;
+-- Order Import: supervisors correct / accept a retailer's pack size.
+SET @sql = N'GRANT INSERT, UPDATE, DELETE ON OBJECT :: dbo._tb_SOImportPackFix TO ' + QUOTENAME(@login) + N';';
+EXEC sp_executesql @sql;
+SET @sql = N'GRANT INSERT ON OBJECT :: dbo._tb_SOPackSizeAudit TO ' + QUOTENAME(@login) + N';';
+EXEC sp_executesql @sql;
+-- Draft orders: saved, re-saved and deleted (incl. the 3-day purge).
+SET @sql = N'GRANT INSERT, UPDATE, DELETE ON OBJECT :: dbo._tb_SODraftOrder TO ' + QUOTENAME(@login) + N';';
+EXEC sp_executesql @sql;
 
 PRINT 'Granted SELECT + INSERT on [SOAssistant] to login ' + @login + '.';
 
@@ -1786,6 +1980,11 @@ PRINT 'Granted SELECT + INSERT on [SOAssistant] to login ' + @login + '.';
 -- grant it explicitly here just in case:
 USE [BA_00_LPD_CON];
 SET @sql = N'GRANT UPDATE ON OBJECT :: dbo.Client TO ' + QUOTENAME(@login) + N';';
+EXEC sp_executesql @sql;
+-- Order Import: a supervisor fixes OUR pack size (StkItem.ulIIPerCrate)
+-- when a PO shows it's wrong. That one column only; every change is
+-- logged in [SOAssistant].dbo._tb_SOPackSizeAudit.
+SET @sql = N'GRANT UPDATE (ulIIPerCrate) ON OBJECT :: dbo.StkItem TO ' + QUOTENAME(@login) + N';';
 EXEC sp_executesql @sql;
 USE [SOAssistant];
 PRINT 'Granted UPDATE on Client in [BA_00_LPD_CON] to login ' + @login + '.';
@@ -1965,7 +2164,7 @@ VALUES
 -- Verification
 -- =============================================================================
 SELECT name FROM [SOAssistant].sys.views  WHERE name LIKE '_vw_SO%' ORDER BY name;
--- Expected 19 rows.
+-- Expected 21 rows.
 
 SELECT name FROM [SOAssistant].sys.objects WHERE name LIKE '_fn_SO%' AND type IN ('IF','TF','FN') ORDER BY name;
 -- Expected 2 rows: _fn_SOCustomerPriceAsOf, _fn_SOOrderIntake.
@@ -1989,3 +2188,11 @@ FROM [BA_00_LPD_CON].dbo._tb_SOOrderAssistantAudit;
 IF OBJECT_ID('[SOAssistant].dbo._vw_SORouteCustomerDaily', 'V') IS NOT NULL
     DROP VIEW _vw_SORouteCustomerDaily;
 GO
+
+-- ============================================================================
+-- Selling Price Defaults
+-- ============================================================================
+CREATE OR ALTER VIEW _vw_SOSellingPriceDecimals AS
+SELECT Decimals SellingPriceDecimals 
+FROM [BA_00_LPD_CON].dbo.StDfTbl
+WHERE idStDfTbl = 1

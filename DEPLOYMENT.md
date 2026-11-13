@@ -18,6 +18,44 @@ and "the app is live".
 
 Order matters where noted. Everything else can be done in any order.
 
+### Release — Warehouse rules, Deliveries by route, Order Intake drill page
+**SQL first, then the app** (the "fix card" button writes the new audit columns).
+- [ ] Re-run `backend/sql/create_views.sql` (safe to re-run). `_vw_SOCustomerDetail`
+      adds `DistCentre` (the customer card's Dist Centre);
+      `_tb_SOCustomerAssignmentAudit` gets `cPrevDistCentre` / `cNewDistCentre`.
+- [ ] Verify: `SELECT TOP 1 DistCentre FROM [SOAssistant].dbo._vw_SOCustomerDetail;` runs.
+      The same run creates `_tb_SODraftOrder` (draft orders) if it's missing.
+- [ ] Deploy the app with `deploy.ps1`.
+- [ ] Users & Roles (admin): every registered user has a **Warehouse** (MAK / POL).
+      An AGENT without one now gets "ask an admin" at login and can't pick it.
+- [ ] Smoke test as a SUPERVISOR: top-bar warehouse dropdown switches MAK ↔ POL.
+      Open a customer whose card DC is the other DC → amber banner with
+      "Switch to …"; switching moves + re-prices the lines already added.
+      "Customer is MAK — fix card" (after a confirm) sets the customer's Dist
+      Centre and the banner disappears; check the audit row in
+      `_tb_SOCustomerAssignmentAudit` (cPrev/cNewDistCentre).
+- [ ] Order summary (open any order): lines show a **Whse** column.
+- [ ] Mismatch BLOCKS: with the banner showing, Continue (Order Assistant) and
+      Save (Sales Order Entry) and Save / Update draft (both screens) refuse with
+      the DC message; the server refuses orders and drafts too.
+      Customers with a blank / unknown card DC are not blocked.
+- [ ] Smoke test as an AGENT: top bar shows the warehouse with a lock; no switch;
+      a customer on the other DC can't be ordered (ask a supervisor).
+- [ ] Users & Roles opens on **Registered**, with a Status column (Online / Away)
+      and "n online now". As a SUPERVISOR: card visible, no admins listed, no
+      Add / role / active changes, only an agent's Warehouse can be changed.
+- [ ] Order Assistant: the draft panel shows Limit / Outst. / Existing / This
+      order on one always-visible row (no Details toggle).
+- [ ] Analytics → Deliveries: all routes listed (no route picker), Litres + Strike
+      rate columns, sortable headers, search on route or customer.
+- [ ] Analytics → Order Intake: clicking a bar opens a page (Back keeps the
+      report as it was); "Show by" picks the levels.
+- [ ] Drafts: Save draft on a customer, reopen it from Drafts (lines take the
+      current warehouse). Drafts are deleted 3 days after first save.
+- [ ] Login: after signing in, Chrome / Edge offers "Save password?". F12 →
+      Console shows a `[login] password save:` line explaining if it didn't.
+- Forecasting changes stay OUT of this release (not finished).
+
 ### Release — Order Import, Price Review, inclusive-tax saves (same deploy as below)
 **Before deploy.ps1** — the new backend imports these, so it won't start without them:
 - [ ] Install the two new Python packages into the server's backend Python

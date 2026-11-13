@@ -224,6 +224,9 @@ export function OrderSummaryModal({
                   <tr className="text-gray-700 border-b border-gray-300">
                     <th className="text-left px-3 py-1.5 font-semibold">Stock</th>
                     <th className="text-left px-3 py-1.5 font-semibold">Description</th>
+                    <th className="text-left px-3 py-1.5 font-semibold" title="Warehouse the line is captured from">
+                      Whse
+                    </th>
                     <th
                       className="text-right px-3 py-1.5 font-semibold whitespace-nowrap"
                       style={{ width: qtyColumnPx }}
@@ -244,6 +247,9 @@ export function OrderSummaryModal({
                         <td className="px-3 py-1.5 font-mono text-gray-800">{l.stock_code}</td>
                         <td className="px-3 py-1.5 text-gray-700 truncate max-w-[22rem]">
                           {l.item_description || l.description}
+                        </td>
+                        <td className="px-3 py-1.5 font-mono text-gray-700 whitespace-nowrap" title={l.warehouse_code}>
+                          {l.warehouse_code || "—"}
                         </td>
                         <td
                           className="px-3 py-1.5 text-right font-mono text-gray-900 whitespace-nowrap"
@@ -274,15 +280,15 @@ export function OrderSummaryModal({
                 </tbody>
                 <tfoot className="bg-gray-50 border-t border-gray-300">
                   <tr>
-                    <td colSpan={5} className="px-3 py-1.5 text-right text-gray-600">Excl</td>
+                    <td colSpan={6} className="px-3 py-1.5 text-right text-gray-600">Excl</td>
                     <td className="px-3 py-1.5 text-right font-mono text-gray-900">{fmtCurrency(totals.excl)}</td>
                   </tr>
                   <tr>
-                    <td colSpan={5} className="px-3 py-1.5 text-right text-gray-600">VAT</td>
+                    <td colSpan={6} className="px-3 py-1.5 text-right text-gray-600">VAT</td>
                     <td className="px-3 py-1.5 text-right font-mono text-gray-900">{fmtCurrency(vat)}</td>
                   </tr>
                   <tr className="border-t border-gray-300">
-                    <td colSpan={5} className="px-3 py-1.5 text-right font-semibold">Incl</td>
+                    <td colSpan={6} className="px-3 py-1.5 text-right font-semibold">Incl</td>
                     <td className="px-3 py-1.5 text-right font-mono font-semibold text-gray-900">{fmtCurrency(totals.incl)}</td>
                   </tr>
                 </tfoot>

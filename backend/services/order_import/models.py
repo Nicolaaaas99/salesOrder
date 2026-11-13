@@ -15,6 +15,7 @@ LineStatus = Literal[
     "ITEM_ISSUE",       # matched, but the item can't go on the order (inactive / not in DC)
     "NO_PRICE",         # no price for this customer in the agent's DC
     "PRICE_MISMATCH",   # PO price too far from ours: needs a supervisor (submit for review)
+    "PACK_MISMATCH",    # the PO's case size differs from ours and rounding down to our crates leaves 0: fix it in Evolution
     "VAT_MISMATCH",     # order VAT rate differs from the item's tax type
     "PARSE_ERROR",      # the line couldn't be read reliably from the PDF
     "EXCLUDED",         # crates (999000): not charged — left off the order and the PO total
@@ -47,9 +48,32 @@ class ImportLineResult(BaseModel):
     doc_vat_rate: float = 0.0
     doc_line_excl: float = 0.0
     doc_line_incl: float = 0.0
-    # Packs x pack size, when the PO orders in packs (Pick n Pay).
+    # Packs x pack size, when the PO orders in packs (Pick n Pay). After a
+    # supervisor's correction of THEIR pack (pack_fix), the corrected pack.
     doc_pack_size: Optional[float] = None
     doc_pack_qty: Optional[float] = None
+    # -- PO vs our pack size (StkItem.ulIIPerCrate) ----------------------------
+    # Our pack size; None until the line is matched to an item.
+    our_pack_size: Optional[int] = None
+    # The PO prints a case size (> 1) that isn't ours. Flagged, not blocking:
+    # the units are rounded DOWN to whole crates of ours (4 x 10 = 40 -> 36
+    # at 6 per crate) and qty_before_pack keeps the PO's units.
+    pack_conflict: bool = False
+    qty_before_pack: Optional[float] = None
+    # Rounding down leaves nothing (1 x 4 with our crate of 6): blocks create
+    # (PACK_MISMATCH) until the pack size is fixed in Evolution.
+    pack_blocks: bool = False
+    # The units aren't a whole number of our crates (warning only: the
+    # order will show "off-pack").
+    off_pack: bool = False
+    # A remembered supervisor decision on THEIR pack (_tb_SOImportPackFix):
+    #   CORRECTED  their pack is wrong: the line is read with fix_pack
+    #   ACCEPTED   their case and our crate differ, and both are right
+    pack_fix: Optional[Literal["CORRECTED", "ACCEPTED"]] = None
+    pack_fix_id: Optional[int] = None
+    # The pack the PO prints (before a correction) and its units.
+    doc_pack_printed: Optional[float] = None
+    doc_qty_printed: Optional[float] = None
     barcode: str = ""
     # How we resolved it
     match_source: Literal["MAPPING", "DIRECT", "NONE"] = "NONE"
@@ -104,6 +128,9 @@ class ImportTotals(BaseModel):
     doc_excl: Optional[float] = None
     doc_vat: Optional[float] = None
     doc_incl: Optional[float] = None
+    # True when the PO prints no incl total (Spar: excl only) and doc_incl is
+    # the sum of its lines' incl at each item's VAT.
+    doc_incl_from_lines: bool = False
     # Sum of the lines we read off the document (proves nothing was missed)
     parsed_qty: float = 0.0
     parsed_incl: float = 0.0
@@ -124,6 +151,11 @@ class ImportTotals(BaseModel):
     # (Pick n Pay line totals / OK Foods excl prices are fractions of a
     # cent): what that rounding takes off. Never positive.
     rounding_incl: float = 0.0
+    # Units added (+) or removed (-) by correcting a retailer's pack size:
+    # the PO's printed qty total is compared after this.
+    pack_adjust_qty: float = 0.0
+    # PO value of the units cut by rounding down to our crates (never positive).
+    pack_round_incl: float = 0.0
     expected_incl: Optional[float] = None   # PO total after the adjustments
     difference_incl: Optional[float] = None
     tolerance: float = 0.0
@@ -158,6 +190,43 @@ class ImportValidation(BaseModel):
     can_override_prices: bool = False
     # Reviews already waiting for this PO number (same customer).
     pending_reviews: List[int] = []
+
+
+class PackFixRequest(BaseModel):
+    """A supervisor's decision on a retailer's pack size for one of its
+    items: `pack` = the pack to read it with; `pack` = `doc_pack` accepts
+    that their case and our crate differ."""
+    customer_account: str
+    supplier_code: str = ""
+    item_code: str = ""
+    doc_pack: float
+    pack: float
+    description: str = ""
+    stock_code: Optional[str] = None
+
+
+class PackFix(BaseModel):
+    id: int
+    scope: str
+    supplier_code: str = ""
+    item_code: str = ""
+    doc_pack: float
+    pack: float
+
+
+class OurPackRequest(BaseModel):
+    """A supervisor fixes OUR pack size (StkItem.ulIIPerCrate) for an item."""
+    stock_code: str
+    pack: int
+    customer_account: Optional[str] = None
+    po_number: Optional[str] = None
+    note: Optional[str] = None
+
+
+class OurPackResult(BaseModel):
+    stock_code: str
+    old_pack: Optional[str] = None
+    new_pack: int
 
 
 class ImportValidateRequest(BaseModel):

@@ -11,10 +11,12 @@ from auth import (
     authenticate_against_evolution,
     get_current_token,
     get_current_user,
+    get_current_user_role,
     issue_token,
     resolve_role,
     revoke_token,
 )
+from services.dc_warehouse import can_choose_own_warehouse, dc_warehouses
 from connection import get_sdk
 from database import get_db
 
@@ -125,6 +127,13 @@ def login(payload: schemas.LoginRequest, db: Session = Depends(get_db)):
         default_warehouse_code=_default_warehouse_for(db, username),
         force_ext_order_num=_force_ext_order_num(db),
     )
+
+
+@router.post("/heartbeat")
+def heartbeat(username: str = Depends(get_current_user)):
+    """Keeps the user "online" on Users & Roles while the app is open.
+    Memory only (get_current_user stamps the last-seen time) — no DB."""
+    return {"ok": True}
 
 
 @router.post("/logout")
@@ -339,22 +348,26 @@ def my_performance(
 def set_default_warehouse(
     payload: schemas.SetDefaultWarehouseRequest,
     username: str = Depends(get_current_user),
+    role: str = Depends(get_current_user_role),
     db: Session = Depends(get_db),
 ):
-    """Set the logged-in telesales agent's default warehouse. Resolves the
-    warehouse code to its WhseLink via _vw_SOWarehouses, then writes it to
-    _rtblAgents.iDefWhseId for the row where cAgentName matches the token's
-    username. Called from the DefaultWarehouseModal prompt on first login."""
+    """Set the logged-in user's OWN default warehouse (one of the two DCs):
+    writes _rtblAgents.iDefWhseId for the row where cAgentName matches the
+    token's username. SUPERVISOR / ADMIN only (first-login prompt and the
+    warehouse switcher in the top bar) — an AGENT's warehouse is fixed and
+    set by an admin on Users & Roles (services/dc_warehouse.py)."""
+    if not can_choose_own_warehouse(role):
+        raise HTTPException(
+            403, "Your warehouse is set by an admin. Ask an admin to change it on Users & Roles."
+        )
     code = (payload.code or "").strip()
     if not code:
         raise HTTPException(400, "Warehouse code is required")
 
-    whse = db.execute(
-        text("SELECT WhseLink FROM [SOAssistant].dbo._vw_SOWarehouses WHERE Code = :code"),
-        {"code": code},
-    ).mappings().first()
-    if not whse:
-        raise HTTPException(404, f"Warehouse '{code}' not found")
+    links = dc_warehouses(db)
+    if code.upper() not in links:
+        raise HTTPException(400, f"Pick one of the DC warehouses: {', '.join(sorted(links))}.")
+    whse = {"WhseLink": links[code.upper()]}
 
     agent = db.execute(
         text("SELECT idAgents FROM dbo._rtblAgents WHERE cAgentName = :name AND bAgentActive = 1"),

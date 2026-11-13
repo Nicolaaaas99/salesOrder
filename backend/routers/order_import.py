@@ -40,19 +40,31 @@ from services.order_import.models import (
     ImportValidation,
     ItemMapping,
     ItemMappingUpsert,
+    OurPackRequest,
+    OurPackResult,
+    PackFix,
+    PackFixRequest,
     StoreCheck,
 )
-from services.order_import.parsers import OrderParseError, ParsedOrder, parse_order_pdf
+from services.order_import.parsers import (
+    DESCRIPTION_KEY_PREFIX,
+    OrderParseError,
+    ParsedOrder,
+    parse_order_pdf,
+)
 from services.order_import.validate import (
     MAP_TABLE,
     _stock_info,
     check_store,
+    delete_pack_fix,
     load_customer,
     load_mappings,
     log_price_decisions,
     mapping_conflict,
     mapping_scope,
+    set_our_pack,
     upsert_mapping,
+    upsert_pack_fix,
     validate_import,
 )
 
@@ -191,8 +203,15 @@ def save_mapping(
         db, scope, payload.supplier_code, payload.item_code, item["code"]
     )
     if clash:
-        codes = " / ".join(c for c in (clash["cCustCode"], clash["cCustItemCode"]) if c)
+        # A description key (lines with no code, Spar) is a fingerprint:
+        # name the item by its description instead.
+        codes = " / ".join(
+            c for c in (clash["cCustCode"], clash["cCustItemCode"])
+            if c and not c.startswith(DESCRIPTION_KEY_PREFIX)
+        )
         descr = (clash["cCustDescription"] or "").strip()
+        if not codes:
+            codes, descr = f'"{descr}"', ""
         raise HTTPException(
             409,
             f"{item['code']} is already mapped to the customer's item {codes}"
@@ -220,6 +239,101 @@ def save_mapping(
 def delete_mapping(map_id: int, db: Session = Depends(get_db)):
     db.execute(text(f"DELETE FROM {MAP_TABLE} WHERE idItemMap = :id"), {"id": map_id})
     db.commit()
+
+
+# ---------------------------------------------------------------------------
+# Pack sizes (supervisor / admin)
+# ---------------------------------------------------------------------------
+
+def _require_supervisor(role: str, what: str) -> None:
+    if not _is_supervisor(role):
+        raise HTTPException(403, f"Only a supervisor can {what}.")
+
+
+@router.post("/pack-fixes", response_model=PackFix)
+def save_pack_fix(
+    payload: PackFixRequest,
+    db: Session = Depends(get_db),
+    username: str = Depends(get_current_user),
+    role: str = Depends(get_current_user_role),
+):
+    """THEIR pack size: correct it (the line is read with `pack`) or accept
+    it (`pack` = `doc_pack`: their case and our crate differ, both right).
+    Remembered for the corporate group while their PO prints `doc_pack`."""
+    _require_supervisor(role, "change a retailer's pack size")
+    if not (payload.supplier_code or "").strip() and not (payload.item_code or "").strip():
+        raise HTTPException(400, "The line has no supplier code or item code.")
+    if not (0 < payload.doc_pack <= 10000 and 0 < payload.pack <= 10000):
+        raise HTTPException(400, "The pack size must be between 1 and 10 000.")
+    if abs(payload.pack - round(payload.pack)) > 1e-9:
+        raise HTTPException(400, "The pack size must be a whole number.")
+    customer = _customer_or_404(db, payload.customer_account)
+    scope = mapping_scope(customer)
+    try:
+        fix_id = upsert_pack_fix(db, scope, payload, username)
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        logger.exception("order-import pack fix failed")
+        raise HTTPException(
+            503, "Could not save the pack size (has create_views.sql been run?): " + str(e)[:200]
+        ) from e
+    logger.info(
+        "order-import pack fix: scope=%s supplier=%s item=%s printed=%s -> %s by %s",
+        scope, payload.supplier_code, payload.item_code, payload.doc_pack, payload.pack, username,
+    )
+    return PackFix(
+        id=fix_id, scope=scope,
+        supplier_code=(payload.supplier_code or "").strip(),
+        item_code=(payload.item_code or "").strip(),
+        doc_pack=payload.doc_pack, pack=payload.pack,
+    )
+
+
+@router.delete("/pack-fixes/{fix_id}", status_code=204)
+def remove_pack_fix(
+    fix_id: int,
+    db: Session = Depends(get_db),
+    role: str = Depends(get_current_user_role),
+):
+    _require_supervisor(role, "change a retailer's pack size")
+    delete_pack_fix(db, fix_id)
+    db.commit()
+
+
+@router.post("/our-pack", response_model=OurPackResult)
+def save_our_pack(
+    payload: OurPackRequest,
+    db: Session = Depends(get_db),
+    username: str = Depends(get_current_user),
+    role: str = Depends(get_current_user_role),
+):
+    """OUR pack size: StkItem.ulIIPerCrate in Evolution. Used everywhere
+    (Order Assistant pack snapping, forecasting), so supervisor only and
+    logged in _tb_SOPackSizeAudit."""
+    _require_supervisor(role, "change our pack size in Evolution")
+    if not 1 <= payload.pack <= 10000:
+        raise HTTPException(400, "The pack size must be between 1 and 10 000.")
+    try:
+        old = set_our_pack(db, payload, username)
+        db.commit()
+    except LookupError:
+        db.rollback()
+        raise HTTPException(404, f"Stock item '{payload.stock_code}' not found.")
+    except Exception as e:
+        db.rollback()
+        logger.exception("order-import our pack update failed")
+        raise HTTPException(
+            503,
+            "Could not update the pack size in Evolution (does the app's login have "
+            "UPDATE on StkItem.ulIIPerCrate? See the grants block in create_views.sql): "
+            + str(e)[:200],
+        ) from e
+    logger.info(
+        "order-import OUR pack: %s %s -> %s by %s (PO %s, %s)",
+        payload.stock_code, old, payload.pack, username, payload.po_number, payload.customer_account,
+    )
+    return OurPackResult(stock_code=payload.stock_code.strip(), old_pack=old, new_pack=payload.pack)
 
 
 @router.post("/create", response_model=schemas.SalesOrderCreateResponse, status_code=201)
