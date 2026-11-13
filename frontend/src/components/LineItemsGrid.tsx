@@ -127,6 +127,9 @@ type Props = {
   basis?: TaxMode;                  // SAVE basis the totals follow (default Inclusive)
   customerAccount: string | null;   // needed to resolve prices when items are picked
   onChange: (lines: LinesUpdater) => void;
+  /** When set, the whole grid is locked and this message shows instead
+   *  (e.g. no customer picked yet — prices depend on the customer). */
+  lockedMessage?: string | null;
 };
 
 function rateFor(line: LineRow, taxTypes: TaxType[]): number {
@@ -259,12 +262,20 @@ type FocusTarget = { row: number; col?: number };
 
 export function LineItemsGrid({
   lines, warehouses, taxTypes, defaultTaxTypeId, taxMode, basis = "Inclusive", customerAccount, onChange,
+  lockedMessage,
 }: Props) {
+  const locked = !!lockedMessage;
   const { defaultWarehouseCode, sessionDate } = useAuth();
   const tbodyRef = useRef<HTMLTableSectionElement>(null);
   const focusTarget = useRef<FocusTarget | null>(null);
   const prevLineCount = useRef(lines.length);
   const editedInputs = useRef<WeakSet<HTMLElement>>(new WeakSet());
+  // The latest lines, for handlers that run after a re-render (an item
+  // picker commit that waited for a search). Every write below is a
+  // functional update on the CURRENT lines, so a late handler can never
+  // put back an older copy of the order (old item code, old qty).
+  const linesRef = useRef(lines);
+  linesRef.current = lines;
 
   // Flash state for the "already on the order" row cue. Mirrors the draft
   // panel's behaviour: rep tries to add a duplicate stock → the existing
@@ -356,15 +367,15 @@ export function LineItemsGrid({
   }, [lines.length]);
 
   function updateLine(idx: number, patch: Partial<LineRow>) {
-    onChange(lines.map((l, i) => (i === idx ? { ...l, ...patch } : l)));
+    onChange((prev) => prev.map((l, i) => (i === idx ? { ...l, ...patch } : l)));
   }
   function removeLineAt(idx: number, targetCol?: number) {
     focusTarget.current = { row: Math.max(0, idx - 1), col: targetCol };
-    onChange(lines.filter((_, i) => i !== idx));
+    onChange((prev) => prev.filter((_, i) => i !== idx));
   }
   function appendLine(targetCol?: number) {
-    focusTarget.current = { row: lines.length, col: targetCol };
-    onChange([...lines, makeEmptyLine(defaultTaxTypeId)]);
+    focusTarget.current = { row: linesRef.current.length, col: targetCol };
+    onChange((prev) => [...prev, makeEmptyLine(defaultTaxTypeId)]);
   }
 
   function onGridKeyDown(e: React.KeyboardEvent<HTMLTableSectionElement>) {
@@ -403,7 +414,7 @@ export function LineItemsGrid({
       if (rowIndex < lines.length - 1) {
         e.preventDefault();
         focusRowCol(rowIndex + 1, colIndex);
-      } else if (lines[rowIndex]?.stock_code) {
+      } else if (!locked && lines[rowIndex]?.stock_code) {
         e.preventDefault();
         appendLine(colIndex);
       }
@@ -456,7 +467,12 @@ export function LineItemsGrid({
 
   return (
     <section className="panel grid-panel">
-      <header className="panel-header">Lines</header>
+      <header className="panel-header">
+        Lines
+        {locked && (
+          <span className="ml-3 text-xs font-semibold text-amber-700">{lockedMessage}</span>
+        )}
+      </header>
       <div className="grid-scroll">
         <table className="line-grid">
           <thead>
@@ -490,7 +506,7 @@ export function LineItemsGrid({
               const { excl: lineExcl, tax: lineTax, incl: lineIncl, rate } = lineAmounts(line, taxTypes, basis);
               const lineDisplayed = taxMode === "Inclusive" ? lineIncl : lineExcl;
               const hasItem = !!line.stock_code;
-              const cellsDisabled = !hasItem;
+              const cellsDisabled = !hasItem || locked;
               const isFlashing = flashRowIdx === i;
               return (
                 <tr
@@ -505,12 +521,19 @@ export function LineItemsGrid({
                   <td>
                     <ItemPicker
                       value={line.stock_code}
+                      disabled={locked}
+                      placeholder={locked ? "Pick a customer first" : undefined}
                       onSelect={(item) => {
+                        if (locked) return;
+                        // Read the CURRENT line (this can run after a
+                        // re-render, when the picker waited for a search).
+                        const cur = linesRef.current;
+                        const line = cur[i] ?? makeEmptyLine(defaultTaxTypeId);
                         // Duplicate guard: this stock is already on another
                         // line → don't create a duplicate, flash the existing
                         // row and focus its Qty cell instead. Same UX as
                         // the Order Assistant draft panel.
-                        const dupIdx = lines.findIndex(
+                        const dupIdx = cur.findIndex(
                           (l, idx) => idx !== i && l.stock_code === item.code,
                         );
                         if (dupIdx >= 0) {
@@ -743,7 +766,7 @@ export function LineItemsGrid({
                   <td className="num">{hasItem ? fmtNumber(lineDisplayed) : ""}</td>
                   <td className="num">{hasItem ? fmtNumber(lineTax) : ""}</td>
                   <td>
-                    <button className="row-remove" onClick={() => removeLineAt(i)} title="Remove line">×</button>
+                    <button className="row-remove" onClick={() => removeLineAt(i)} title="Remove line" disabled={locked}>×</button>
                   </td>
                 </tr>
               );
@@ -755,8 +778,11 @@ export function LineItemsGrid({
         <button
           className="btn btn-secondary"
           onClick={() => appendLine()}
-          disabled={!lastLineHasItem}
-          title={lastLineHasItem ? "" : "Pick an item on the last line before adding a new one"}
+          disabled={!lastLineHasItem || locked}
+          title={
+            locked ? lockedMessage ?? ""
+            : lastLineHasItem ? "" : "Pick an item on the last line before adding a new one"
+          }
         >
           + Add Line
         </button>

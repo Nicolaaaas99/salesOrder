@@ -118,9 +118,12 @@ export function ProjectPicker({
           setOpen(true);
         }}
         onKeyDown={(e) => {
-          if (e.key === "Tab" && open && isTyping && (query as string).trim() && results.length > 0) {
-            const top = results[0];
-            onSelect(top.code);
+          // Tab commits only an EXACT project code (2026-11-13, same rule
+          // as ItemPicker): the top result could be for an earlier keystroke.
+          const typed = isTyping ? (query as string).trim().toLowerCase() : "";
+          const exact = typed ? results.find((r) => r.code.trim().toLowerCase() === typed) : undefined;
+          if (e.key === "Tab" && open && exact) {
+            onSelect(exact.code);
             setQuery(null);
             setOpen(false);
           } else if (e.key === "Escape") {

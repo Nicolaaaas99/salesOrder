@@ -285,14 +285,24 @@ def list_inventory(
           AND (:category IS NULL
                OR ISNULL(Category, '') = :category)
         GROUP BY StockCode
-        ORDER BY StockCode
+        ORDER BY CASE WHEN StockCode = :exact THEN 0
+                      WHEN StockCode LIKE :prefix THEN 1
+                      ELSE 2 END,
+                 StockCode
     """
+    # Exact code first, then codes starting with what was typed, then the
+    # rest (2026-11-13). Plain StockCode order listed "0012" / "915012" /
+    # description matches ahead of "012", and the item picker's keyboard
+    # commit could land on the wrong item. The exact code also always makes
+    # the TOP (:limit) cut now.
     q_stripped = (q or "").strip()
     like = f"%{q_stripped}%" if q_stripped else None
     rows = db.execute(
         text(sql),
         {
             "like": like,
+            "exact": q_stripped or None,
+            "prefix": f"{q_stripped}%" if q_stripped else None,
             "limit": limit,
             "category": (category or "").strip() or None,
         },

@@ -25,6 +25,7 @@ import { CreditStatus } from "./CreditStatus";
 import { useAuth } from "../context/AuthContext";
 import { nextBusinessDay, today } from "../utils/date";
 import { fmtCurrency, extractErrorMsg } from "../utils/format";
+import { resolvedPriceSource } from "../utils/history";
 import { useCustomerAutoRefresh } from "../utils/useCustomerAutoRefresh";
 import {
   notifyDraftsChanged,
@@ -322,8 +323,14 @@ export function SalesOrderScreen({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [lines.map((l) => l.stock_code).join("|")]);
 
+  // Lines already on the order when the customer CHANGES were priced for
+  // the previous customer — re-price them for the new one (2026-11-13).
+  // Place order / Save draft wait until this is done.
+  const [repricing, setRepricing] = useState(false);
+
   async function onSelectCustomer(account: string) {
     try {
+      const previous = customer?.account ?? null;
       const detail = await api.getCustomer(account);
       setCustomer(detail);
 
@@ -331,6 +338,44 @@ export function SalesOrderScreen({
       setLines((prev) =>
         prev.map((l) => (l.tax_type_id == null ? { ...l, tax_type_id: newDefault } : l))
       );
+
+      const codes = [...new Set(linesRef.current.filter((l) => l.stock_code).map((l) => l.stock_code))];
+      if (previous !== detail.account && codes.length > 0) {
+        setRepricing(true);
+        try {
+          const map = await api.getCustomerPrices(detail.account, codes, sessionDate!, defaultWarehouseCode);
+          // Functional + matched by code: lines edited meanwhile keep their edits.
+          setLines((prev) =>
+            prev.map((l) => {
+              if (!l.stock_code || !codes.includes(l.stock_code)) return l;
+              const p = map[l.stock_code];
+              const excl = p?.excl_price ?? 0;
+              return {
+                ...l,
+                unit_price: excl,
+                unit_price_incl: p?.incl_price ?? 0,
+                price_source: resolvedPriceSource(l.stock_code, excl, p?.source ?? null),
+                price_locked: excl > 0,
+                is_fallback_warehouse: p?.is_fallback_warehouse ?? false,
+                price_list_broken: p?.price_list_broken ?? false,
+              };
+            }),
+          );
+        } catch {
+          // Couldn't price for the new customer: clear the old prices so the
+          // order can't be placed with the previous customer's prices.
+          setLines((prev) =>
+            prev.map((l) =>
+              l.stock_code && codes.includes(l.stock_code)
+                ? { ...l, unit_price: 0, unit_price_incl: 0, price_source: "None", price_locked: false }
+                : l,
+            ),
+          );
+          setErrorMsg("Couldn't re-price the lines for this customer — re-pick the items or try again.");
+        } finally {
+          setRepricing(false);
+        }
+      }
     } catch (e: any) {
       setErrorMsg(e?.message ?? "Failed to load customer");
     }
@@ -402,6 +447,7 @@ export function SalesOrderScreen({
     setErrorMsg(null);
 
     if (!customer) { setErrorMsg("Select a customer first."); return; }
+    if (repricing) { setErrorMsg("Still re-pricing the lines for this customer — try again in a moment."); return; }
 
     // Just-in-time refresh — the 5s poll and focus listener cover most cases,
     // but we guarantee the credit/terms check runs against live Evolution
@@ -547,6 +593,7 @@ export function SalesOrderScreen({
   async function onSaveDraft() {
     setErrorMsg(null);
     if (!customer) { setErrorMsg("Select a customer first."); return; }
+    if (repricing) { setErrorMsg("Still re-pricing the lines for this customer — try again in a moment."); return; }
     const filled = lines.filter((l) => l.stock_code);
     if (filled.length === 0) {
       setErrorMsg("Add at least one item before saving a draft.");
@@ -761,6 +808,11 @@ export function SalesOrderScreen({
         basis={saveMode}
         customerAccount={customer?.account ?? null}
         onChange={setLines}
+        lockedMessage={
+          !customer ? "Pick a customer first — the lines unlock once a customer is selected."
+          : repricing ? "Re-pricing the lines for this customer…"
+          : null
+        }
       />
 
       <section className="panel bottom-bar">

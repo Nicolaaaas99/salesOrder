@@ -115,8 +115,13 @@ export function SelectCell({
         }}
         onKeyDown={(e) => {
           if (readOnly) return;
-          if (e.key === "Tab" && open && filtered.length > 0) {
-            commit(filtered[0]);
+          // Tab never guesses (2026-11-13, same rule as ItemPicker): it
+          // commits only what was typed — an exact match, else the only
+          // match. Tabbing through without typing keeps the current value.
+          if (e.key === "Tab" && open && isTyping && trimmedLower) {
+            const exact = filtered.find((o) => o.display.toLowerCase() === trimmedLower);
+            const pick = exact ?? (filtered.length === 1 ? filtered[0] : null);
+            if (pick) commit(pick);
           } else if (e.key === "Escape") {
             e.preventDefault();
             setQuery(null);
