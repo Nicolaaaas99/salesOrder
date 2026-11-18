@@ -685,7 +685,7 @@ export type ImportLineStatus =
   | "ITEM_ISSUE"
   | "NO_PRICE"
   | "PRICE_MISMATCH"
-  | "PACK_MISMATCH"   // case sizes differ and rounding down to our crates leaves 0: fix it in Evolution
+  | "PACK_MISMATCH"   // case sizes differ and rounding down to our crates leaves 0: a supervisor decides (review)
   | "VAT_MISMATCH"
   | "PARSE_ERROR"
   | "EXCLUDED";       // crates: not charged, left off the order and the PO total
@@ -717,8 +717,10 @@ export type ImportLineResult = {
   pack_conflict?: boolean;
   /** The PO's units before that rounding. */
   qty_before_pack?: number | null;
-  /** Rounding down left nothing: blocks create. */
+  /** Rounding down left nothing: blocks create until a supervisor decides. */
   pack_blocks?: boolean;
+  /** Supervisor's decision on a line that rounds down to 0 crates. */
+  pack_decision?: ImportPackDecision | null;
   /** Units aren't whole crates of ours (warning: the order shows off-pack). */
   off_pack?: boolean;
   /** Remembered supervisor decision on THEIR pack. */
@@ -828,8 +830,14 @@ export type ImportCreateRequest = {
   dates_confirmed: boolean;
   /** Supervisor prices (incl) per line_no; ignored for agents. */
   price_overrides?: Record<number, number>;
+  /** Supervisor decisions per line_no on lines that round to 0 crates; ignored for agents. */
+  pack_decisions?: Record<number, ImportPackDecision>;
   review_id?: number | null;
 };
+
+/** ONE_CRATE: charge one crate of ours (more than the PO ordered).
+ *  OFF_PACK: bring in the PO's units as they are. */
+export type ImportPackDecision = "ONE_CRATE" | "OFF_PACK";
 
 export type ImportReviewStatus = "PENDING" | "CREATED" | "REJECTED";
 

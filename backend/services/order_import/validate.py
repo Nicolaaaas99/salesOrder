@@ -625,11 +625,14 @@ def validate_import(
     warehouse_code: Optional[str],
     price_overrides: Optional[Dict[int, float]] = None,
     can_override_prices: bool = False,
+    pack_decisions: Optional[Dict[int, str]] = None,
 ) -> ImportValidation:
-    """`price_overrides` are only applied when `can_override_prices` (the
-    caller is a SUPERVISOR / ADMIN) — an agent's overrides are ignored."""
+    """`price_overrides` and `pack_decisions` are only applied when
+    `can_override_prices` (the caller is a SUPERVISOR / ADMIN) — an agent's
+    are ignored."""
     issues: List[ImportIssue] = []
     overrides = (price_overrides or {}) if can_override_prices else {}
+    pack_choices = (pack_decisions or {}) if can_override_prices else {}
     tolerance = config.ORDER_IMPORT_TOTAL_TOLERANCE
 
     # -- document-level ------------------------------------------------------
@@ -843,14 +846,39 @@ def validate_import(
                     lr.qty_before_pack = qty
                     qty = float(rounded)
                     lr.qty = qty
-                if qty <= 0:
+                choice = pack_choices.get(pl.line_no) if qty <= 0 and pl.qty > 0 else None
+                if choice == "ONE_CRATE":
+                    # Supervisor: charge one crate of ours. More than the PO
+                    # ordered; the totals check allows for it (pack_round_incl).
+                    lr.pack_decision = choice
+                    lr.qty_before_pack = pl.qty
+                    qty = float(our_pack)
+                    lr.qty = qty
+                    lr.notes = lr.notes + [
+                        f"The PO orders {pl.qty:g} units; our crate is {our_pack}. "
+                        f"A supervisor rounded it UP to one crate ({our_pack:g} units): "
+                        "more than the PO ordered."
+                    ]
+                elif choice == "OFF_PACK":
+                    # Supervisor: bring in the PO's units as they are.
+                    lr.pack_decision = choice
+                    lr.qty_before_pack = None
+                    qty = pl.qty
+                    lr.qty = qty
+                    lr.off_pack = True
+                    lr.notes = lr.notes + [
+                        f"The PO orders {pl.qty:g} units; our crate is {our_pack}. "
+                        f"A supervisor brought it in off-pack ({pl.qty:g} units)."
+                    ]
+                elif qty <= 0:
+                    # Status set after the price checks: the agent can send
+                    # it for review only when its other problems are prices.
                     lr.pack_blocks = True
-                    if status == "OK":
-                        status = "PACK_MISMATCH"
                     line_issues.append(
                         f"The PO packs {doc_pack:g} per case and orders {pl.qty:g} units; "
                         f"our crate is {our_pack}, so rounding down leaves nothing. "
-                        "Fix the pack size in Evolution (or capture this line manually), then re-check."
+                        "Submit the order for review: a supervisor can correct their pack size, "
+                        "round it up to one crate or bring it in off-pack."
                     )
                 elif lr.qty_before_pack is not None:
                     lr.notes = lr.notes + [
@@ -915,6 +943,10 @@ def validate_import(
                     f"at {lr.tax_rate:g}% in Evolution."
                 )
 
+        if lr.pack_blocks and status in ("OK", "PRICE_MISMATCH"):
+            # Rounds to 0 and otherwise fine (or only a price to review):
+            # a supervisor decides it in review.
+            status = "PACK_MISMATCH"
         lr.status = status
         lr.issues = line_issues
         lines.append(lr)
@@ -1065,17 +1097,19 @@ def validate_import(
         and not bad_lines
         and not any(i.blocking for i in issues)
     )
-    # Only price lines stand in the way: the agent may hand it to
-    # a supervisor.
+    # Only lines a supervisor decides stand in the way (a price to set, or
+    # units that round down to 0 crates): the agent may hand it to a
+    # supervisor.
     review_lines = [
         l for l in lines
-        if l.needs_review and l.price_override is None
+        if (l.needs_review and l.price_override is None)
+        or l.status == "PACK_MISMATCH"
     ]
     can_submit_review = (
         not can_create
         and bool(review_lines)
         and all(l.status in ("OK", "EXCLUDED") or l in review_lines for l in lines)
-        and all(l.status == "PRICE_MISMATCH" for l in review_lines)
+        and all(l.status in ("PRICE_MISMATCH", "PACK_MISMATCH") for l in review_lines)
         and totals.agrees
         and not any(i.blocking and i.code != "LINES" for i in issues)
     )

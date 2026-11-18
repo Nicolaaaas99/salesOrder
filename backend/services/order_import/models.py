@@ -26,6 +26,10 @@ LineStatus = Literal[
 #   PO         the PO price (supervisor)
 #   OVERRIDE   a price the supervisor typed
 PriceChoice = Literal["PO", "EVOLUTION", "OVERRIDE"]
+# A supervisor's decision on a line whose units round down to 0 crates of
+# ours (pack_blocks): ONE_CRATE charges one crate of ours (more than the PO
+# ordered); OFF_PACK brings in the PO's units as they are (off-pack).
+PackDecision = Literal["ONE_CRATE", "OFF_PACK"]
 
 ReviewStatus = Literal["PENDING", "CREATED", "REJECTED"]
 
@@ -61,8 +65,11 @@ class ImportLineResult(BaseModel):
     pack_conflict: bool = False
     qty_before_pack: Optional[float] = None
     # Rounding down leaves nothing (1 x 4 with our crate of 6): blocks create
-    # (PACK_MISMATCH) until the pack size is fixed in Evolution.
+    # (PACK_MISMATCH). The agent can submit it for review; a supervisor
+    # corrects their pack, or sets pack_decision.
     pack_blocks: bool = False
+    # The supervisor's decision on a line that rounds to 0 (see PackDecision).
+    pack_decision: Optional[PackDecision] = None
     # The units aren't a whole number of our crates (warning only: the
     # order will show "off-pack").
     off_pack: bool = False
@@ -154,7 +161,8 @@ class ImportTotals(BaseModel):
     # Units added (+) or removed (-) by correcting a retailer's pack size:
     # the PO's printed qty total is compared after this.
     pack_adjust_qty: float = 0.0
-    # PO value of the units cut by rounding down to our crates (never positive).
+    # PO value of the units cut by rounding down to our crates (negative), or
+    # added by a supervisor's "one crate" decision (positive).
     pack_round_incl: float = 0.0
     expected_incl: Optional[float] = None   # PO total after the adjustments
     difference_incl: Optional[float] = None
@@ -237,6 +245,9 @@ class ImportValidateRequest(BaseModel):
     delivery_date: date
     # Supervisor prices (incl) per line_no. Ignored for agents.
     price_overrides: Dict[int, float] = {}
+    # Supervisor decisions per line_no on lines that round down to 0 crates.
+    # Ignored for agents.
+    pack_decisions: Dict[int, PackDecision] = {}
     # Set when a supervisor works on an order submitted for review.
     review_id: Optional[int] = None
 

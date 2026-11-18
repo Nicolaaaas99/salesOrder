@@ -178,9 +178,9 @@ def _map(state, supplier_code, stock_code, item_code=""):
 
 
 def _run(boxer, customer=CUSTOMER, delivery=date(2026, 11, 9), overrides=None,
-         supervisor=False):
+         supervisor=False, pack_decisions=None):
     return v.validate_import(None, dict(customer), boxer, delivery, "01.HOF_MAK",
-                             overrides, supervisor)
+                             overrides, supervisor, pack_decisions)
 
 
 def _line(r, code):
@@ -1169,8 +1169,8 @@ def _map_nocode(state):
                                              item_code=key, stock_code=code))
 
 
-def _spar_run(doc):
-    return _run(doc, customer=SPAR_CUSTOMER, delivery=date(2026, 11, 13))
+def _spar_run(doc, **kw):
+    return _run(doc, customer=SPAR_CUSTOMER, delivery=date(2026, 11, 13), **kw)
 
 
 def test_spar_lines_without_a_code_need_mapping_once(evo_spar, spar):
@@ -1267,14 +1267,84 @@ def test_pack_conflict_rounds_down_to_our_crates(evo_spar, spar, monkeypatch):
     assert r.totals.agrees and r.can_create, (r.totals, [i.message for i in r.issues])
 
 
-def test_pack_rounding_to_nothing_blocks(evo_spar, spar, monkeypatch):
+def test_pack_rounding_to_nothing_goes_to_review(evo_spar, spar, monkeypatch):
     _map_nocode(evo_spar)
     _our_packs(monkeypatch, {"336": 12})                # 10 units < one crate of 12
     r = _spar_run(spar)
     line = _line(r, "336")
     assert line.status == "PACK_MISMATCH" and line.pack_blocks and line.qty == 0
     assert "leaves nothing" in line.issues[0]
-    assert not r.can_create and not r.can_submit_review
+    assert not r.can_create and r.can_submit_review
+
+
+def test_agent_pack_decisions_are_ignored(evo_spar, spar, monkeypatch):
+    _map_nocode(evo_spar)
+    _our_packs(monkeypatch, {"336": 12})
+    r = _spar_run(spar, pack_decisions={_line(_spar_run(spar), "336").line_no: "ONE_CRATE"})
+    line = _line(r, "336")
+    assert line.pack_blocks and line.pack_decision is None and not r.can_create
+
+
+def _zero_line_no(spar, monkeypatch, evo_spar):
+    _map_nocode(evo_spar)
+    _our_packs(monkeypatch, {"336": 12})
+    return _line(_spar_run(spar), "336").line_no
+
+
+def test_supervisor_rounds_a_zero_line_up_to_one_crate(evo_spar, spar, monkeypatch):
+    n = _zero_line_no(spar, monkeypatch, evo_spar)
+    r = _spar_run(spar, supervisor=True, pack_decisions={n: "ONE_CRATE"})
+    line = _line(r, "336")
+    assert line.pack_decision == "ONE_CRATE" and not line.pack_blocks
+    assert line.qty == 12 and line.qty_before_pack == 10 and line.status == "OK"
+    assert any("UP to one crate" in x for x in line.notes)
+    # Two units more than the PO: the totals check allows for exactly that.
+    assert r.totals.pack_round_incl > 0 and r.totals.pack_adjust_qty == 2
+    assert r.totals.agrees and r.can_create
+
+
+def test_supervisor_brings_a_zero_line_in_off_pack(evo_spar, spar, monkeypatch):
+    n = _zero_line_no(spar, monkeypatch, evo_spar)
+    r = _spar_run(spar, supervisor=True, pack_decisions={n: "OFF_PACK"})
+    line = _line(r, "336")
+    assert line.pack_decision == "OFF_PACK" and line.off_pack and not line.pack_blocks
+    assert line.qty == 10 and line.qty_before_pack is None and line.status == "OK"
+    assert r.totals.agrees and r.can_create
+
+
+def test_pack_decision_only_applies_to_lines_that_round_to_zero(evo_spar, spar, monkeypatch):
+    _map_nocode(evo_spar)
+    _our_packs(monkeypatch, {"336": 6})                 # 10 -> 6: not zero
+    n = _line(_spar_run(spar), "336").line_no
+    r = _spar_run(spar, supervisor=True, pack_decisions={n: "ONE_CRATE"})
+    line = _line(r, "336")
+    assert line.pack_decision is None and line.qty == 6
+
+
+def test_zero_line_with_a_price_difference_goes_to_review(evo_spar, spar, monkeypatch):
+    _map_nocode(evo_spar)
+    evo_spar["price"]["336"] = 12.00                   # ours above the PO's 11.20
+    _our_packs(monkeypatch, {"336": 12})
+    r = _spar_run(spar)
+    line = _line(r, "336")
+    assert line.status == "PACK_MISMATCH" and line.needs_review
+    assert r.can_submit_review
+    # Supervisor decides the pack; the price still needs deciding.
+    r = _spar_run(spar, supervisor=True, pack_decisions={line.line_no: "ONE_CRATE"})
+    line = _line(r, "336")
+    assert line.status == "PRICE_MISMATCH" and line.qty == 12 and not r.can_create
+
+
+def test_zero_line_without_a_price_cannot_go_to_review(evo_spar, spar, monkeypatch):
+    _map_nocode(evo_spar)
+    _our_packs(monkeypatch, {"336": 12})
+    inner = v.resolve_customer_prices
+    monkeypatch.setattr(v, "resolve_customer_prices", lambda db, acc, codes, **kw: {
+        c: p for c, p in inner(db, acc, codes, **kw).items() if c != "336"})
+    r = _spar_run(spar)
+    line = _line(r, "336")
+    assert line.status == "NO_PRICE" and line.pack_blocks
+    assert not r.can_submit_review
 
 
 def test_pack_not_set_on_our_side_is_flagged_not_rounded(evo_spar, spar, monkeypatch):
@@ -1466,3 +1536,11 @@ def test_boxer_printed_pack_is_cross_checked():
     doc = parse_order_text(text.split("<<PAGE>>\n"))
     yog = next(l for l in doc.lines if l.supplier_code == "620")
     assert yog.pack_size == 12 and "Size 12 doesn't agree" in yog.parse_warning
+
+
+def test_pack_decisions_are_recorded_on_the_review(evo_spar, spar, monkeypatch):
+    n = _zero_line_no(spar, monkeypatch, evo_spar)
+    r = _spar_run(spar, supervisor=True, pack_decisions={n: "ONE_CRATE"})
+    note = router_mod._pack_decision_note(r)
+    assert note == f"Line {n} 336: rounded up to one crate (12 units, PO 10)"
+    assert router_mod._pack_decision_note(_spar_run(spar)) is None

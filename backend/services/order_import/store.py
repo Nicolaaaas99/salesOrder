@@ -190,7 +190,8 @@ def create_review(
             "descr": (description or "")[:40] or None,
             "json": document.model_dump_json(),
             "total": document.total_incl,
-            "lines": sum(1 for l in result.lines if l.needs_review),
+            "lines": sum(1 for l in result.lines
+                         if l.needs_review or l.status == "PACK_MISMATCH"),
             "user": (username or "")[:50],
             "note": (note or "").strip()[:500] or None,
         },

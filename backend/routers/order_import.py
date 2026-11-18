@@ -102,6 +102,7 @@ def _validate(db: Session, payload: ImportValidateRequest, username: str, role: 
         db, customer, payload.document, payload.delivery_date,
         _default_warehouse_for(db, username),
         payload.price_overrides, _is_supervisor(role),
+        payload.pack_decisions,
     )
     return customer, result
 
@@ -362,7 +363,8 @@ def create_imported_order(
         if result.can_submit_review:
             raise HTTPException(
                 400,
-                "Some prices differ too much from the PO. Submit the order for review.",
+                "Some lines need a supervisor (prices that differ from the PO, or units "
+                "that round down to no crates). Submit the order for review.",
             )
         problems = [i.message for i in result.issues if i.blocking]
         if not problems and not result.totals.agrees:
@@ -411,11 +413,25 @@ def create_imported_order(
         store.link_document(db, payload.document.document_id, customer["account"],
                             created.order_no)
         if review:
-            store.close_review(db, review.id, "CREATED", username, order_num=created.order_no)
+            store.close_review(db, review.id, "CREATED", username,
+                               order_num=created.order_no, note=_pack_decision_note(result))
     except Exception:  # noqa: BLE001
         db.rollback()
         logger.exception("order-import: post-create bookkeeping failed for %s", created.order_no)
     return created
+
+
+def _pack_decision_note(result) -> Optional[str]:
+    """What the supervisor decided on lines that rounded down to 0 crates,
+    kept on the review (cReviewNote) as the record of it."""
+    parts = []
+    for l in result.lines:
+        if l.pack_decision == "ONE_CRATE":
+            parts.append(f"Line {l.line_no} {l.stock_code}: rounded up to one crate "
+                         f"({l.qty:g} units, PO {l.qty_before_pack:g})")
+        elif l.pack_decision == "OFF_PACK":
+            parts.append(f"Line {l.line_no} {l.stock_code}: off-pack ({l.qty:g} units)")
+    return "; ".join(parts) or None
 
 
 # ---------------------------------------------------------------------------
@@ -431,12 +447,14 @@ def submit_review(
 ):
     # Re-checked as an agent: overrides never count towards a submission.
     payload.price_overrides = {}
+    payload.pack_decisions = {}
     customer, result = _validate(db, payload, username, "AGENT")
     if not result.can_submit_review:
         raise HTTPException(
             400,
-            "Only orders whose sole problem is a PO price that differs from ours "
-            "can be submitted for review. Fix the other items first.",
+            "Only orders whose sole problems are PO prices that differ from ours, or "
+            "units that round down to no crates, can be submitted for review. "
+            "Fix the other items first.",
         )
     if result.pending_reviews:
         raise HTTPException(
