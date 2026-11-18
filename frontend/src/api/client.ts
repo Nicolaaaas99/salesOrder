@@ -320,19 +320,6 @@ export const api = {
         review_id: reviewId,
       })
       .then((r) => r.data),
-  /** Supervisor: correct THEIR pack size for one of their items (remembered
-   *  for the group while their PO prints `doc_pack`). */
-  saveImportPackFix: (payload: {
-    customer_account: string;
-    supplier_code: string;
-    item_code: string;
-    doc_pack: number;
-    pack: number;
-    description?: string;
-    stock_code?: string | null;
-  }) => http.post<{ id: number }>("/order-import/pack-fixes", payload).then((r) => r.data),
-  deleteImportPackFix: (id: number) =>
-    http.delete(`/order-import/pack-fixes/${id}`).then(() => undefined),
   saveImportMapping: (payload: {
     customer_account: string;
     supplier_code: string;

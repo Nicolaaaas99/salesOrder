@@ -196,24 +196,18 @@ function QtyPackCell({ line: l }: { line: ImportLineResult }) {
   );
 }
 
-/** Supervisor, on a line whose units round down to 0 crates of ours:
- *  correct THEIR pack size (remembered for the group), round up to one
- *  crate, or bring it in off-pack. */
+/** Supervisor, on a line whose units round down to 0 crates of ours
+ *  (1 pack of 4 with our crate of 6): bring in one crate of ours (6), or
+ *  the PO's units off-pack (4). */
 function PackDecisionControls({
   line: l,
   disabled,
   onDecide,
-  onCorrectPack,
-  onUndoCorrection,
 }: {
   line: ImportLineResult;
   disabled: boolean;
   onDecide: (line: ImportLineResult, choice: ImportPackDecision | null) => void;
-  onCorrectPack: (line: ImportLineResult, pack: number) => void;
-  onUndoCorrection: (line: ImportLineResult) => void;
 }) {
-  const [editing, setEditing] = useState(false);
-  const [pack, setPack] = useState("");
   const ours = l.our_pack_size ?? 0;
   const poUnits = l.qty_before_pack ?? l.qty;
   const btn = "text-[11px] px-1.5 py-0.5 rounded border whitespace-nowrap disabled:opacity-50";
@@ -223,7 +217,7 @@ function PackDecisionControls({
       <div className="flex items-center justify-end gap-1 mt-1">
         <span className={`${btn} border-blue-300 bg-blue-50 text-blue-700 font-semibold`}>
           {l.pack_decision === "ONE_CRATE"
-            ? `One crate (${fmtNumber(l.qty)})`
+            ? `Our pack (${fmtNumber(l.qty)})`
             : `Off-pack (${fmtNumber(l.qty)})`}
         </span>
         <button
@@ -236,78 +230,18 @@ function PackDecisionControls({
       </div>
     );
   }
-  if (l.pack_fix === "CORRECTED" && l.pack_fix_id != null && !l.pack_blocks) {
-    return (
-      <div className="flex justify-end mt-1">
-        <button
-          className={`${btn} border-gray-300 text-gray-600 hover:bg-gray-50`}
-          disabled={disabled}
-          title="Remove the corrected pack size for this item"
-          onClick={() => onUndoCorrection(l)}
-        >
-          Undo pack correction
-        </button>
-      </div>
-    );
-  }
   if (!l.pack_blocks) return null;
 
-  if (editing) {
-    const n = Number(pack);
-    const ok = pack !== "" && Number.isInteger(n) && n >= 1 && n <= 10000;
-    const save = () => {
-      if (!ok) return;
-      setEditing(false);
-      onCorrectPack(l, n);
-    };
-    return (
-      <div className="flex items-center justify-end gap-1 mt-1">
-        <span className="text-[11px] text-gray-600">Their pack</span>
-        <input
-          autoFocus
-          className="w-14 text-right text-xs border border-gray-300 rounded px-1 py-0.5"
-          inputMode="numeric"
-          value={pack}
-          onChange={(e) => setPack(e.target.value.replace(/[^0-9]/g, ""))}
-          onKeyDown={(e) => {
-            if (e.key === "Enter") save();
-            if (e.key === "Escape") setEditing(false);
-          }}
-        />
-        <button
-          className={`${btn} border-blue-500 bg-blue-600 text-white`}
-          disabled={disabled || !ok}
-          onClick={save}
-        >
-          Save
-        </button>
-        <button className={`${btn} border-gray-300 text-gray-600`} onClick={() => setEditing(false)}>
-          Cancel
-        </button>
-      </div>
-    );
-  }
   return (
     <div className="flex flex-wrap items-center justify-end gap-1 mt-1">
-      <button
-        className={`${btn} border-blue-300 text-blue-700 hover:bg-blue-50`}
-        disabled={disabled}
-        title="The PO's pack size is wrong: read the line with the right one (remembered for this group)"
-        onClick={() => {
-          setPack(String(l.doc_pack_size ?? ""));
-          setEditing(true);
-        }}
-      >
-        Correct their pack
-      </button>
       {ours > 1 && (
         <button
           className={`${btn} border-amber-300 text-amber-800 hover:bg-amber-50`}
           disabled={disabled}
-          title={`Charge one crate of ours (${ours} units): more than the PO's ${fmtNumber(poUnits)}`}
+          title={`Bring in 1 pack of ours (${ours} units): more than the PO's ${fmtNumber(poUnits)}`}
           onClick={() => onDecide(l, "ONE_CRATE")}
         >
-          One crate ({ours})
+          Our pack ({ours})
         </button>
       )}
       <button
@@ -590,8 +524,8 @@ export function OrderImportScreen({ onBack, reviewId = null }: Props) {
     validate(customer.account, doc, deliveryDate);
   }
 
-  /** Supervisor rounds a 0-crate line up to one crate / brings it in
-   *  off-pack (choice = null undoes it). */
+  /** Supervisor brings a 0-crate line in as one pack of ours / off-pack
+   *  (choice = null undoes it). */
   function setPackDecision(line: ImportLineResult, choice: ImportPackDecision | null) {
     if (!customer || !doc) return;
     const next = { ...packDecisionsRef.current };
@@ -599,39 +533,6 @@ export function OrderImportScreen({ onBack, reviewId = null }: Props) {
     else next[line.line_no] = choice;
     packDecisionsRef.current = next;
     validate(customer.account, doc, deliveryDate);
-  }
-
-  /** Supervisor corrects THEIR pack size for this item (remembered). */
-  async function correctTheirPack(line: ImportLineResult, pack: number) {
-    if (!customer || !doc) return;
-    setBusy("checking");
-    try {
-      await api.saveImportPackFix({
-        customer_account: customer.account,
-        supplier_code: line.supplier_code,
-        item_code: line.item_code,
-        doc_pack: line.doc_pack_printed ?? line.doc_pack_size ?? 1,
-        pack,
-        description: line.description,
-        stock_code: line.stock_code,
-      });
-      await validate(customer.account, doc, deliveryDate);
-    } catch (e) {
-      setErrorMsg(extractErrorMsg(e, "Could not save the pack size"));
-      setBusy(null);
-    }
-  }
-
-  async function undoPackCorrection(line: ImportLineResult) {
-    if (!customer || !doc || line.pack_fix_id == null) return;
-    setBusy("checking");
-    try {
-      await api.deleteImportPackFix(line.pack_fix_id);
-      await validate(customer.account, doc, deliveryDate);
-    } catch (e) {
-      setErrorMsg(extractErrorMsg(e, "Could not remove the pack correction"));
-      setBusy(null);
-    }
   }
 
   function requestBody() {
@@ -1123,8 +1024,6 @@ export function OrderImportScreen({ onBack, reviewId = null }: Props) {
                               line={l}
                               disabled={!!busy}
                               onDecide={setPackDecision}
-                              onCorrectPack={correctTheirPack}
-                              onUndoCorrection={undoPackCorrection}
                             />
                           )}
                         </td>

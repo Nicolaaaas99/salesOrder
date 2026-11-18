@@ -877,8 +877,8 @@ def validate_import(
                     line_issues.append(
                         f"The PO packs {doc_pack:g} per case and orders {pl.qty:g} units; "
                         f"our crate is {our_pack}, so rounding down leaves nothing. "
-                        "Submit the order for review: a supervisor can correct their pack size, "
-                        "round it up to one crate or bring it in off-pack."
+                        f"Submit the order for review: a supervisor brings it in as one pack of "
+                        f"ours ({our_pack}) or off-pack ({pl.qty:g} units)."
                     )
                 elif lr.qty_before_pack is not None:
                     lr.notes = lr.notes + [

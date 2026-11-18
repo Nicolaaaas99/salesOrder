@@ -66,7 +66,7 @@ class ImportLineResult(BaseModel):
     qty_before_pack: Optional[float] = None
     # Rounding down leaves nothing (1 x 4 with our crate of 6): blocks create
     # (PACK_MISMATCH). The agent can submit it for review; a supervisor
-    # corrects their pack, or sets pack_decision.
+    # sets pack_decision.
     pack_blocks: bool = False
     # The supervisor's decision on a line that rounds to 0 (see PackDecision).
     pack_decision: Optional[PackDecision] = None
